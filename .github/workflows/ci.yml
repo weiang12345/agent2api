@@ -1,0 +1,50 @@
+name: ci
+
+# 合并门禁：任何进 main 的改动（包括上游同步 PR）都必须先过这一关。
+#
+# ── 为什么单独一个 workflow ───────────────────────────────────
+# build.yml 只负责「出安装包」，而且只有 workflow_dispatch（手动）。它既不跑
+# 检查，也不在 PR 上触发 —— 也就是说上游同步 PR 原先没有任何自动校验，
+# 编译不过的代码可以一路合进 main。这个 workflow 补的就是这一环。
+#
+# ── 为什么是 windows-latest ───────────────────────────────────
+# Tauri 在 Linux runner 上要先 apt 装 webkit2gtk 等一堆系统库，Windows runner
+# 的镜像里 MSVC + WebView2 已经齐了，开箱就能编。本机（Windows）的编译命令
+# 与这里一致，出问题也好复现。
+#
+# ── 为什么没有 cargo fmt --check ──────────────────────────────
+# 上游源码本身存在大量既有格式差异，`cargo fmt --check` 会一路红。等哪天做一次
+# 独立的格式化提交之后再考虑加进来，现在加只会让门禁失去意义。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # target 路径由 desktop-tauri/src-tauri/.cargo/config.toml 指到仓库根的 target/
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> ../../target
+
+      - name: 编译检查（含 bin 与 examples）
+        working-directory: desktop-tauri/src-tauri
+        run: cargo check --locked --all-targets
+
+      - name: 单元测试
+        working-directory: desktop-tauri/src-tauri
+        run: cargo test --locked --lib

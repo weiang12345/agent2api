@@ -1,0 +1,46 @@
+# 行尾规范：入库统一 LF，避免 Windows 的 core.autocrlf 把整棵树反复报成 modified。
+#
+# 背景：本仓库原先没有 .gitattributes，而本机 core.autocrlf=true —— 索引里存 LF、
+# 工作区是 CRLF，只要有任何工具按字节比对（比如 CI 的 diff 检查、脚本化的三方合并），
+# 就会得到「几百个文件被改」的假 diff。声明 text=auto 后入库一律 LF，
+# 工作区仍按平台签出，两边不再互相打架。
+* text=auto
+
+# 本文件自身固定 LF（它是规则来源，先于其它规则生效，被改写会让 diff 抖）
+/.gitattributes text eol=lf
+
+# 源码与配置：显式 LF（跨平台一致，diff 干净）
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.json5 text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.sh    text eol=lf
+*.lock  text eol=lf
+*.svg   text eol=lf
+
+# Windows 批处理与 PowerShell：CRLF（cmd.exe 与部分工具对 LF 的 .bat 处理不稳）
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制：禁止任何行尾转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+*.dmg   binary
+*.exe   binary
+*.msi   binary
+*.zip   binary
