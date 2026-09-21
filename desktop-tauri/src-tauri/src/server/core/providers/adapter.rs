@@ -808,6 +808,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 参数化，见 `cline::adapter` 的模块头）
         ProviderKind::ClineFree => &super::cline::CLINE_FREE_ADAPTER,
         ProviderKind::ClinePass => &super::cline::CLINE_PASS_ADAPTER,
+        ProviderKind::AtmCode => &super::atomcode::ATMCODE_ADAPTER,
     }
 }
 
@@ -845,6 +846,7 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::Qoder,
         ProviderKind::ClineFree,
         ProviderKind::ClinePass,
+        ProviderKind::AtmCode,
     ]
 }
 

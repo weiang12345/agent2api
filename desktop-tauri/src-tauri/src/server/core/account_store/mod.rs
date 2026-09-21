@@ -80,6 +80,7 @@
 //!   qoder_accounts.rs    Qoder 账号（地区 + userId 识别）：添加、凭证刷新回写、
 //!                Qoder 公开形态
 
+pub mod atomcode_accounts;
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
@@ -148,6 +149,11 @@ pub(crate) const CLINE_FREE_PROVIDER_ID: &str = crate::server::core::providers::
 /// Cline **订阅池** provider id（同 [`CLINE_FREE_PROVIDER_ID`] 的口径）
 pub(crate) const CLINE_PASS_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::ClinePass,
+);
+
+/// AtomCode provider id（账号存储内部多处要用）。
+pub(crate) const ATMCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::AtmCode,
 );
 
 /// 这个 provider 是不是 **Cline 系**（两个额度池之一）。

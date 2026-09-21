@@ -203,6 +203,10 @@ fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             crate::server::core::providers::cline::models::remote_refreshed(),
             crate::server::core::providers::cline::models::last_refreshed_at(),
         ),
+        ProviderKind::AtmCode => (
+            crate::server::core::providers::atomcode::models::remote_refreshed(),
+            crate::server::core::providers::atomcode::models::last_refreshed_at(),
+        ),
     }
 }
 

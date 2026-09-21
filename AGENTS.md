@@ -138,3 +138,21 @@ $response.assets[0].size
 ```text
 4BA432C1C17FE659CDC9D957465F22C2A5422B0E953FCA175C7657A16979588C
 ```
+
+## 9. AtomCode 云直连与上游合并
+
+- AtomCode 是本 fork 的专属 provider，上游没有对应实现。
+- 同步上游时必须保留：
+  - `desktop-tauri/src-tauri/src/server/core/providers/atomcode/`
+  - `desktop-tauri/src-tauri/src/server/core/account_store/atomcode_accounts.rs`
+  - `desktop-tauri/ui/add-atomcode.js`
+  - `ProviderKind::AtmCode`
+  - `adapter_for(ProviderKind::AtmCode)`
+- 上游若重构 provider 契约，优先把 AtomCode 模块迁移到新契约，不要直接删除。
+- 合并冲突时，公共层改动尽量保持“新增分支”形态，避免重排上游代码。
+- AtomCode 走云直连：
+  - OAuth：`https://acs.atomgit.com`
+  - CodingPlan：`https://api.gitcode.com/api/v5`
+  - 模型网关：`https://llm-api.atomgit.com/v1`
+- AtomCode 请求签名使用社区维护的 `atomcode-signing-v1`，上游协议变化时优先参考
+  `Atom2Api` / `atomgit-opencode-bridge` 的更新。

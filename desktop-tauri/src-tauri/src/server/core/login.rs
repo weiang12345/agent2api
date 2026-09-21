@@ -430,6 +430,124 @@ impl LoginService {
         Ok(handle)
     }
 
+    /// 发起 AtomCode OAuth 登录。
+    ///
+    /// 与 Cline 设备授权同形：先拿授权 URL，再由后台任务轮询上游，直到拿到
+    /// OAuth 凭证并落账号。区别在于 AtomCode 的授权地址由 `acs.atomgit.com`
+    /// 直接返回，后续 `auth/check` / `auth/token` 也不需要本地客户端。
+    pub async fn start_atomcode_login(
+        &self,
+        name: Option<String>,
+    ) -> Result<LoginTaskHandle, String> {
+        let login = crate::server::core::providers::atomcode::oauth::start()
+            .await
+            .map_err(|error| error.message)?;
+        let state = login.state.clone();
+        let info = resolve_edition(Some(DEFAULT_EDITION));
+        let handle = self.new_handle_for_provider(info, "atomcode");
+        handle.update(|task| {
+            task.state = Some(state.clone());
+            task.auth_url = Some(login.login_url.clone());
+        });
+        self.tasks.register(&state, handle.clone());
+        logging::log("[Login]", "发起 AtomCode 网页登录（等待 AtomGit 授权…）");
+
+        let service = self.clone();
+        let task_state = state;
+        let name = name.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+        tauri::async_runtime::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(LOGIN_TIMEOUT_MS);
+            loop {
+                if service.tasks.get(&task_state).is_none() {
+                    return;
+                }
+                if let Some(handle) = service.tasks.get(&task_state) {
+                    if handle.snapshot().canceled {
+                        return;
+                    }
+                }
+                match crate::server::core::providers::atomcode::oauth::poll_once(&task_state).await {
+                    Ok(Some(credentials)) => {
+                        // CodingPlan 领取与模型目录刷新都不阻塞登录：
+                        // 即使这里失败，账号仍先落地，用户可以在模型页手动重试。
+                        if let Err(error) =
+                            crate::server::core::providers::atomcode::models::claim(&credentials, None).await
+                        {
+                            logging::verbose(
+                                "[Login]",
+                                &format!("AtomCode CodingPlan 领取/同步失败：{}", error.message),
+                            );
+                        }
+                        let refresh_outcome = crate::server::core::providers::atomcode::models::refresh(
+                            &credentials,
+                            None,
+                            true,
+                        )
+                        .await;
+                        if let Some(error) = refresh_outcome.message {
+                            logging::verbose(
+                                "[Login]",
+                                &format!("AtomCode 模型目录刷新失败：{error}"),
+                            );
+                        }
+                        let store = service.store.clone();
+                        match store.add_atomcode_account(&credentials, name.as_deref(), "web") {
+                            Ok(account) => {
+                                let account_id = account
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let Some(handle) = service.tasks.get(&task_state) else {
+                                    return;
+                                };
+                                finish_task(
+                                    &handle,
+                                    &json!({
+                                        "account": {
+                                            "uid": account_id,
+                                            "nickname": credentials.name,
+                                        },
+                                        "edition": "",
+                                        "provider": "atomcode",
+                                    }),
+                                );
+                                logging::log("[Login]", "✅ AtomCode 登录完成");
+                                return;
+                            }
+                            Err(error) => {
+                                let Some(handle) = service.tasks.get(&task_state) else {
+                                    return;
+                                };
+                                finish_task_error(&handle, &error.message);
+                                logging::log("[Login]", &format!("❌ AtomCode 登录失败: {}", error.message));
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let Some(handle) = service.tasks.get(&task_state) else {
+                            return;
+                        };
+                        finish_task_error(&handle, &error.message);
+                        logging::log("[Login]", &format!("❌ AtomCode 登录失败: {}", error.message));
+                        return;
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    let Some(handle) = service.tasks.get(&task_state) else {
+                        return;
+                    };
+                    finish_task_error(&handle, "AtomCode 登录超时，请重试");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(LOGIN_POLL_INTERVAL_MS)).await;
+            }
+        });
+        Ok(handle)
+    }
+
     /// 等 authUrl（对应 Node 版 `/api/session/login/start` 的 15 秒等待）。
     ///
     /// 返回 `(state, authUrl, edition)`；超时或任务提前失败时返回错误原因。

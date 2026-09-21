@@ -229,6 +229,20 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
             "edition": task.edition, "provider": provider_id }));
     }
+    if kind == crate::server::core::providers::ProviderKind::AtmCode {
+        let name = payload
+            .as_ref()
+            .and_then(|payload| payload.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let handle = match state.login().start_atomcode_login(name).await {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
+            "edition": task.edition, "provider": "atomcode" }));
+    }
     // CatPaw：上游把 token **推**到我们的 loopback 回调上（见 core::login::catpaw），
     // 所以这里除了发起还要把回调基址告诉它 —— 那必须是本网关自己的监听地址，
     // 而上游的 redirect 白名单只放行 127.0.0.1 / localhost（实测）。

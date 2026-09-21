@@ -89,6 +89,7 @@
 //! 本文件仍然只做「身份与元数据」这一件事，不认识磁盘也不认识账号。
 
 pub mod adapter;
+pub mod atomcode;
 pub mod autoclaw;
 pub mod catalog;
 pub mod catpaw;
@@ -161,6 +162,8 @@ pub enum ProviderKind {
     /// `ClineAdapter` 持有一个 `Pool`，`adapter_for` 按 kind 给出该池的实例。
     /// 远程目录缓存也共用一份（`models::REMOTE`），两家只是按池过滤它。
     ClinePass,
+    /// AtomCode（AtomGit CodingPlan，云直连）。
+    AtmCode,
 }
 
 /// 一个提供商的静态元数据。
@@ -192,6 +195,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "qoder", label: "Qoder" },
     ProviderMeta { id: "cline-free", label: "Cline Free" },
     ProviderMeta { id: "cline-pass", label: "Cline Pass" },
+    ProviderMeta { id: "atomcode", label: "AtomCode" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -259,6 +263,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "qoder" => Some(ProviderKind::Qoder),
         "cline-free" => Some(ProviderKind::ClineFree),
         "cline-pass" => Some(ProviderKind::ClinePass),
+        "atomcode" => Some(ProviderKind::AtmCode),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -284,6 +289,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Qoder => "qoder",
         ProviderKind::ClineFree => "cline-free",
         ProviderKind::ClinePass => "cline-pass",
+        ProviderKind::AtmCode => "atomcode",
     }
 }
 

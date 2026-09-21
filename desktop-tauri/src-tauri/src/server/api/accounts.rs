@@ -359,6 +359,21 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 store.add_cline_account(provider_id, &payload, import_name)
             }
         }
+        Some(crate::server::core::providers::ProviderKind::AtmCode) => {
+            if import_desktop {
+                Err(AccountStoreError::bad_request(
+                    "AtomCode 请使用网页登录或手动填写 OAuth 凭证，不支持导入桌面端登录态",
+                ))
+            } else {
+                match crate::server::core::providers::atomcode::credentials::Credentials::from_payload(&payload)
+                {
+                    Ok(credentials) => {
+                        store.add_atomcode_account(&credentials, import_name, "manual")
+                    }
+                    Err(error) => Err(AccountStoreError::new(error.message, error.status_code)),
+                }
+            }
+        }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
             store.add_account(&payload, None)
         }

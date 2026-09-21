@@ -189,6 +189,7 @@
       desktopWindowsOnly: true,
     },
     window.wbQoderAddForm,
+    window.wbAtomCodeAddForm,
     // Cline 是两家（免费池 / 订阅池各占一个 provider），所以这里**展开**而不是
     // 一项：池已经是身份，界面上不再有「额度池」那一级选择（见 add-cline.js
     // 的模块头）。两份配置的 provider id 各带池名，块 id 随之天然不撞。
