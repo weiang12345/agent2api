@@ -86,6 +86,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          echo "── 诊断：token 与仓库权限 ──"
+          gh auth status || true
+          gh api "/repos/${GITHUB_REPOSITORY}" --jq '{private:.private, permissions:.permissions}' || true
+          echo "── 诊断结束 ──"
           existing=$(gh pr list --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number')
           body=$(printf '上游 %s 的 main 有新提交，本 PR 由 sync-upstream 工作流自动生成。\n\n合并前请确认：\n- [ ] CI 编译门禁通过\n- [ ] 版本号 / 更新仓库等冲突热点已按本仓库的定制意图解完\n- [ ] 本地定制未被覆盖\n' "$UPSTREAM_REPO")
           if [ -n "$existing" ]; then
