@@ -1,0 +1,140 @@
+# Agent2API 项目记忆
+
+## 1. 语言与仓库
+
+- 与用户沟通使用简体中文。
+- 本仓库是公开 fork：`weiang12345/agent2api`。
+- 上游仓库：`aimod-cc/agent2api`。
+  - `upstream` remote 指向上游。
+  - `origin` remote 指向本 fork。
+- 默认软件更新仓库必须保持为 `weiang12345/agent2api`，对应
+  `desktop-tauri/src-tauri/src/server/core/update/version.rs` 里的 `DEFAULT_REPO`。
+- 仓库保持 public。若改回 private：
+  - GitHub Release API 匿名访问会 404。
+  - 安装包下载也会失败。
+  - 必须配置 `WORKBUDDY_GITHUB_TOKEN` 或 `GITHUB_TOKEN`，否则更新功能不可用。
+
+## 2. 分支与同步
+
+- 发布基线是 `main`。
+- 不要在 `chore/sync-upstream` 分支上提交代码；同步工作流会定期重建它。
+- 上游同步流程：
+  1. 从 `upstream/main` 拉取最新代码。
+  2. 合并到本地 `main` 或单独分支。
+  3. 冲突时优先保留本 fork 的定制改动，尤其是：
+     - `DEFAULT_REPO`
+     - CatPaw JSON 深度上限
+     - 更新逻辑
+  4. 合并后必须重新跑测试和构建。
+
+## 3. 构建与测试
+
+在仓库根目录执行：
+
+```powershell
+npm --prefix desktop-tauri ci
+npm run tauri:build
+```
+
+Rust 侧验证命令：
+
+```powershell
+cd desktop-tauri/src-tauri
+cargo check --locked --all-targets
+cargo test --locked --lib
+```
+
+Windows 本机构建时，Cargo 需要清空代理并离线运行，避免代理环境导致依赖解析失败：
+
+```powershell
+$env:HTTP_PROXY=''
+$env:HTTPS_PROXY=''
+$env:ALL_PROXY=''
+$env:NO_PROXY='*'
+$env:CARGO_NET_OFFLINE='true'
+```
+
+如果 Git 访问 GitHub 需要 HTTPS 代理，可单独设置：
+
+```powershell
+$env:HTTP_PROXY='http://127.0.0.1:7890'
+$env:HTTPS_PROXY='http://127.0.0.1:7890'
+```
+
+## 4. 发布流程
+
+当前 `.github/workflows/build.yml` 只构建并上传 artifact，不自动创建 GitHub Release；
+实际发布仍按本节手动执行。
+
+发布前必须完成：
+
+1. `main` 分支干净并与 `origin/main` 同步。
+2. `cargo check --locked --all-targets` 通过。
+3. `cargo test --locked --lib` 通过。
+4. 本地 Tauri 构建成功，产物路径：
+   - Windows：`target/release/bundle/nsis/*.exe`
+   - macOS universal：`target/universal-apple-darwin/release/bundle/dmg/*.dmg`
+
+发布步骤：
+
+1. 在 GitHub 上创建 Release。
+2. Release tag 命名：
+   - 上游版本未变、只是本 fork 修复：`v{上游版本}-fork.{N}`，例如 `v2.4.5-fork.1`。
+   - 想让客户端真正检测到新版本：必须把应用版本号整体提升到更高数字，再使用对应 tag。
+3. 将构建出的安装包上传为 Release asset。
+4. Release 说明使用简体中文，写明：
+   - 同步的上游版本
+   - 本 fork 的改动
+   - 更新仓库地址
+
+## 5. 版本与更新逻辑
+
+- 更新比较逻辑只读取版本号前三段数字。
+- `v2.4.5-fork.1` 会被视为与 `2.4.5` 相同，不会提示“有新版本”。
+- 因此：
+  - 只做 fork 修补时，`-fork.N` 可以继续沿用。
+  - 需要用户更新时，必须提升 `package.json`、`desktop-tauri/package.json`、
+    `desktop-tauri/src-tauri/Cargo.toml`、`desktop-tauri/tauri.conf.json` 里的版本号。
+- 更新检查默认访问：
+
+```text
+https://api.github.com/repos/weiang12345/agent2api/releases/latest
+```
+
+## 6. 发布后验证
+
+每次发布后必须验证：
+
+1. 匿名访问 Release API 返回 200，并包含正确 tag 和资产。
+2. 匿名下载安装包成功。
+3. 安装包 SHA256 与本地构建产物一致。
+4. GitHub Actions 的 `ci` workflow 通过。
+
+示例：
+
+```powershell
+$response = Invoke-RestMethod https://api.github.com/repos/weiang12345/agent2api/releases/latest
+$response.tag_name
+$response.assets[0].name
+$response.assets[0].size
+```
+
+## 7. 禁止事项
+
+- 不要提交 `target/`、`node_modules/`、安装包或临时构建产物。
+- 不要修改上游仓库 `aimod-cc/agent2api`。
+- 不要把 `DEFAULT_REPO` 改回上游地址。
+- 不要在未跑测试的情况下发布 Release。
+- 不要假设私有仓库可以直接匿名访问 GitHub API。
+
+## 8. 当前部署基线
+
+- 当前 Release：`v2.4.5-fork.1`
+- 当前 `main` 提交：`25819b6`
+- 当前更新仓库：`weiang12345/agent2api`
+- 当前构建产物：`Agent2API_2.4.5_x64-setup.exe`
+- 当前 SHA256：
+
+```text
+4BA432C1C17FE659CDC9D957465F22C2A5422B0E953FCA175C7657A16979588C
+```
