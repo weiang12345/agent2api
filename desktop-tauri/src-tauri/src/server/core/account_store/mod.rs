@@ -81,6 +81,7 @@
 //!                Qoder 公开形态
 
 pub mod atomcode_accounts;
+pub mod trae_accounts;
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
@@ -154,6 +155,11 @@ pub(crate) const CLINE_PASS_PROVIDER_ID: &str = crate::server::core::providers::
 /// AtomCode provider id（账号存储内部多处要用）。
 pub(crate) const ATMCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::AtmCode,
+);
+
+/// Trae provider id。
+pub(crate) const TRAE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Trae,
 );
 
 /// 这个 provider 是不是 **Cline 系**（两个额度池之一）。

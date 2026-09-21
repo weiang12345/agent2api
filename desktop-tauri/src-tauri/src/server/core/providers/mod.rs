@@ -90,6 +90,7 @@
 
 pub mod adapter;
 pub mod atomcode;
+pub mod trae;
 pub mod autoclaw;
 pub mod catalog;
 pub mod catpaw;
@@ -164,6 +165,8 @@ pub enum ProviderKind {
     ClinePass,
     /// AtomCode（AtomGit CodingPlan，云直连）。
     AtmCode,
+    /// Trae SOLO 国内版（云直连）。
+    Trae,
 }
 
 /// 一个提供商的静态元数据。
@@ -196,6 +199,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "cline-free", label: "Cline Free" },
     ProviderMeta { id: "cline-pass", label: "Cline Pass" },
     ProviderMeta { id: "atomcode", label: "AtomCode" },
+    ProviderMeta { id: "trae", label: "Trae" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -264,6 +268,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "cline-free" => Some(ProviderKind::ClineFree),
         "cline-pass" => Some(ProviderKind::ClinePass),
         "atomcode" => Some(ProviderKind::AtmCode),
+        "trae" => Some(ProviderKind::Trae),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -290,6 +295,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::ClineFree => "cline-free",
         ProviderKind::ClinePass => "cline-pass",
         ProviderKind::AtmCode => "atomcode",
+        ProviderKind::Trae => "trae",
     }
 }
 

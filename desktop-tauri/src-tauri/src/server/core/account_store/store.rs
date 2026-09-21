@@ -499,6 +499,8 @@ impl AccountStore {
                 "expiresAt": expires_at,
                 "refreshExpiresAt": record.refresh_expires_at().unwrap_or(0.0),
                 "domain": record.domain(),
+                "machineId": record.get("machineId").cloned().unwrap_or(Value::Null),
+                "deviceId": record.get("deviceId").cloned().unwrap_or(Value::Null),
             },
             "account": {
                 "uid": record.uid(),

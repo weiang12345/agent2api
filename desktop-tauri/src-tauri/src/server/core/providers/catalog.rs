@@ -207,6 +207,10 @@ fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             crate::server::core::providers::atomcode::models::remote_refreshed(),
             crate::server::core::providers::atomcode::models::last_refreshed_at(),
         ),
+        ProviderKind::Trae => (
+            crate::server::core::providers::trae::models::remote_refreshed(),
+            crate::server::core::providers::trae::models::last_refreshed_at(),
+        ),
     }
 }
 

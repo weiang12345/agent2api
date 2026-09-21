@@ -217,6 +217,8 @@ impl AccountStore {
             self.to_cline_public_account(record)
         } else if record.provider() == super::ATMCODE_PROVIDER_ID {
             self.to_atomcode_public_account(record)
+        } else if record.provider() == super::TRAE_PROVIDER_ID {
+            self.to_trae_public_account(record)
         } else {
             self.to_public_account(record)
         };

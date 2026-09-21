@@ -809,6 +809,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::ClineFree => &super::cline::CLINE_FREE_ADAPTER,
         ProviderKind::ClinePass => &super::cline::CLINE_PASS_ADAPTER,
         ProviderKind::AtmCode => &super::atomcode::ATMCODE_ADAPTER,
+        ProviderKind::Trae => &super::trae::TRAE_ADAPTER,
     }
 }
 
@@ -847,6 +848,7 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::ClineFree,
         ProviderKind::ClinePass,
         ProviderKind::AtmCode,
+        ProviderKind::Trae,
     ]
 }
 

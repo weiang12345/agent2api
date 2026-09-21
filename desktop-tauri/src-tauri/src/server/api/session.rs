@@ -243,6 +243,21 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
             "edition": task.edition, "provider": "atomcode" }));
     }
+    if kind == crate::server::core::providers::ProviderKind::Trae {
+        let name = payload
+            .as_ref()
+            .and_then(|payload| payload.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let callback_base = format!("http://127.0.0.1:{}", state.port);
+        let handle = match state.login().start_trae_login(&callback_base, name).await {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
+            "edition": task.edition, "provider": "trae" }));
+    }
     // CatPaw：上游把 token **推**到我们的 loopback 回调上（见 core::login::catpaw），
     // 所以这里除了发起还要把回调基址告诉它 —— 那必须是本网关自己的监听地址，
     // 而上游的 redirect 白名单只放行 127.0.0.1 / localhost（实测）。
@@ -419,6 +434,38 @@ pub async fn login_catpaw_callback(State(state): State<ServerState>, body: Bytes
     let response = match state.login().finish_catpaw_login(&token, &task_state).await {
         Ok(()) => catpaw_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
         Err(message) => catpaw_callback_page(400, &format!("登录失败：{message}")),
+    };
+    attach_private_network_headers(response)
+}
+
+// ─── GET /api/session/login/trae-callback ───────────────────
+/// Trae 网页登录回调。浏览器跳转到本机网关，携带 refreshToken 与用户信息。
+pub async fn login_trae_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let task_state = params
+        .get("loginTraceID")
+        .or_else(|| params.get("login_trace_id"))
+        .cloned()
+        .unwrap_or_default();
+    let callback_url = {
+        let mut url = url::Url::parse("http://127.0.0.1/api/session/login/trae-callback")
+            .expect("static callback base URL");
+        {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in &params {
+                query.append_pair(key, value);
+            }
+        }
+        url.to_string()
+    };
+    let response = match state.login().finish_trae_login(&callback_url, &task_state).await {
+        Ok(_) => catpaw_callback_page(200, "Trae 登录成功，已返回网关，可以关闭此页面。"),
+        Err(error) => catpaw_callback_page(
+            error.status_code as u16,
+            &format!("Trae 登录失败：{}", error.message),
+        ),
     };
     attach_private_network_headers(response)
 }

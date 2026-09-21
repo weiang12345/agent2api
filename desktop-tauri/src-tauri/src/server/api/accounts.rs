@@ -374,6 +374,19 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 }
             }
         }
+        Some(crate::server::core::providers::ProviderKind::Trae) => {
+            if import_desktop {
+                Err(AccountStoreError::bad_request(
+                    "Trae 请使用网页登录或手动填写 OAuth 凭证，不支持导入桌面端登录态",
+                ))
+            } else {
+                match crate::server::core::providers::trae::credentials::Credentials::from_payload(&payload)
+                {
+                    Ok(credentials) => store.add_trae_account(&credentials, import_name, "manual"),
+                    Err(error) => Err(AccountStoreError::new(error.message, error.status_code)),
+                }
+            }
+        }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
             store.add_account(&payload, None)
         }
@@ -588,6 +601,9 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     // AtomCode 账号：走云直连 OAuth 的 refreshToken 续期。
     if state.store().atomcode_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::AtmCode).await;
+    }
+    if state.store().trae_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Trae).await;
     }
     match state.auth().refresh_account(&id).await {
         Ok(_) => ok_json(json!({

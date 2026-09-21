@@ -156,3 +156,21 @@ $response.assets[0].size
   - 模型网关：`https://llm-api.atomgit.com/v1`
 - AtomCode 请求签名使用社区维护的 `atomcode-signing-v1`，上游协议变化时优先参考
   `Atom2Api` / `atomgit-opencode-bridge` 的更新。
+
+## 10. Trae 云直连与上游合并
+
+- Trae 是本 fork 的专属 provider，上游没有对应实现。
+- 同步上游时必须保留：
+  - `desktop-tauri/src-tauri/src/server/core/providers/trae/`
+  - `desktop-tauri/src-tauri/src/server/core/account_store/trae_accounts.rs`
+  - `desktop-tauri/ui/add-trae.js`
+  - `ProviderKind::Trae`
+  - `adapter_for(ProviderKind::Trae)`
+- 上游若重构 provider 契约，优先把 Trae 模块迁移到新契约，不要直接删除。
+- 当前只接入国内版 Trae SOLO，不做国际版和双区域自动路由。
+- Trae 走云直连：
+  - 对话：`https://trae-api-cn.mchost.guru`
+  - OAuth：`https://api.trae.com.cn`
+  - 额度 / 签到：`https://api.trae.cn`
+- Trae 协议参考 `wangqi233/trae2api` 与 `JeffHu0912/trae2api`，上游变化时优先
+  对照这两个项目的协议更新。

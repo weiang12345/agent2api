@@ -215,7 +215,7 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // Cline 尤其要注意：它的授权页在 `authkit.cline.bot`，而确认动作可能被
         // 身份提供方接管（WorkOS AuthKit 会按账号配置跳到 Google / GitHub / SSO
         // 等不可穷举的主机）—— 与 Qoder 同一情形，白名单列不全。
-        "catpaw" | "qoder" | "cline-free" | "cline-pass" | "atomcode" => None,
+        "catpaw" | "qoder" | "cline-free" | "cline-pass" | "atomcode" | "trae" => None,
         _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
@@ -290,6 +290,7 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         "cline-free" => Ok("cline-free"),
         "cline-pass" => Ok("cline-pass"),
         "atomcode" => Ok("atomcode"),
+        "trae" => Ok("trae"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -481,6 +482,7 @@ pub async fn start(
         "cline-pass" => "Cline Pass",
         "catpaw" => "CatPaw",
         "atomcode" => "AtomCode",
+        "trae" => "Trae",
         "raccoon" => "小浣熊",
         _ => "WorkBuddy",
     };

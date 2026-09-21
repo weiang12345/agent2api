@@ -76,6 +76,8 @@ pub struct LoginTaskState {
     /// 缺省（default）为空串，`new_handle_for_provider` 会写上一家；
     /// 空串在回调侧按「不认识」拒绝，不会静默落到某一家。
     pub provider: String,
+    pub machine_id: String,
+    pub device_id: String,
     pub canceled: bool,
     finished_at: Option<i64>,
 }
@@ -286,6 +288,8 @@ impl LoginService {
                 session: None,
                 edition: info.id.to_string(),
                 provider: provider.to_string(),
+                machine_id: String::new(),
+                device_id: String::new(),
                 canceled: false,
                 finished_at: None,
             })),
@@ -546,6 +550,79 @@ impl LoginService {
             }
         });
         Ok(handle)
+    }
+
+    /// 发起 Trae 网页登录。回调由上游推到本网关的 loopback 端口。
+    pub async fn start_trae_login(
+        &self,
+        callback_base: &str,
+        name: Option<String>,
+    ) -> Result<LoginTaskHandle, String> {
+        let login = crate::server::core::providers::trae::oauth::build_login(&format!(
+            "{callback_base}/api/session/login/trae-callback"
+        ))
+        .map_err(|error| error.message)?;
+        let info = resolve_edition(Some(DEFAULT_EDITION));
+        let handle = self.new_handle_for_provider(info, "trae");
+        handle.update(|task| {
+            task.state = Some(login.state.clone());
+            task.auth_url = Some(login.auth_url.clone());
+            task.machine_id = login.machine_id.clone();
+            task.device_id = login.device_id.clone();
+        });
+        self.tasks.register(&login.state, handle.clone());
+        logging::log("[Login]", "发起 Trae 网页登录（等待授权回调…）");
+
+        let _ = name;
+        Ok(handle)
+    }
+
+    /// 完成 Trae 登录回调：解析、换凭证、落账号。
+    pub async fn finish_trae_login(
+        &self,
+        callback_url: &str,
+        task_state: &str,
+    ) -> Result<String, GatewayError> {
+        let task_state = task_state.trim();
+        let Some(handle) = self.tasks.get(task_state) else {
+            return Err(GatewayError::with_status(404, "Trae 登录任务不存在或已过期"));
+        };
+        if handle.snapshot().canceled {
+            return Err(GatewayError::with_status(400, "Trae 登录已取消，请重新发起"));
+        }
+        if handle.snapshot().done {
+            return Ok(String::new());
+        }
+        let callback = crate::server::core::providers::trae::oauth::parse_callback(callback_url, task_state)?;
+        let snapshot = handle.snapshot();
+        let machine_id = snapshot.machine_id;
+        let device_id = snapshot.device_id;
+        let credentials = crate::server::core::providers::trae::oauth::exchange(
+            callback,
+            &machine_id,
+            &device_id,
+        )
+        .await?;
+        let account = self.store.add_trae_account(&credentials, None, "web").map_err(|error| {
+            GatewayError::with_status(error.status_code, error.message)
+        })?;
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        finish_task(
+            &handle,
+            &json!({
+                "account": {
+                    "uid": account_id,
+                    "nickname": credentials.nickname,
+                },
+                "edition": "",
+                "provider": "trae",
+            }),
+        );
+        Ok(account_id)
     }
 
     /// 等 authUrl（对应 Node 版 `/api/session/login/start` 的 15 秒等待）。
