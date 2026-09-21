@@ -1,0 +1,117 @@
+name: sync-upstream
+
+# 定时把上游 aimod-cc/agent2api 的 main 合进本仓库，并开一个 PR 等人审。
+#
+# ── 为什么用 PR 而不是直接推 main ─────────────────────────────
+# 本仓库的定位是「上游 + 本地定制」。上游改动与定制代码可能碰同一批文件
+# （版本号、Cargo.toml、tauri.conf.json 都是固定冲突热点），自动合并后
+# 直接推 main 等于让一个没人看过的结果成为事实标准 —— 出了问题是静默的。
+# 走 PR 则：CI 先跑一遍编译，人再决定合不合、怎么解冲突。
+#
+# ── 冲突了怎么办 ──────────────────────────────────────────────
+# 自动合并只在「干净合并」时才开 PR。有冲突时本工作流**不动仓库**，
+# 改为开一个 issue 提醒手工处理 —— 让机器硬解冲突只会产出更难查的半成品。
+# 手工解完后，下一次定时运行会自动恢复正常。
+#
+# ── 为什么不 fetch --unshallow ────────────────────────────────
+# 本仓库的历史是完整的（本地已 unshallow 后连历史一起推上来的），
+# 三方合并所需的共同祖先都在，直接 fetch 即可。
+
+on:
+  schedule:
+    # 每天 UTC 18:10（北京时间次日 02:10）跑一次。避开整点：
+    # GitHub 的定时任务在整点最拥挤，延迟可能到几十分钟。
+    - cron: '10 18 * * *'
+  workflow_dispatch:
+
+# 需要写 contents（推同步分支）、pull-requests（开同步 PR）与 issues（冲突时报警）
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: aimod-cc/agent2api
+  SYNC_BRANCH: chore/sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 用自带 token 推同步分支；它不会触发新的 workflow 运行，
+          # 正好避免「同步 PR 又触发一轮同步」的回环。
+          fetch-depth: 0
+
+      - name: 拉取上游
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+
+      - name: 判断是否有新提交
+        id: check
+        run: |
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+          if [ "$behind" = "0" ]; then
+            echo "上游没有新提交，本次跳过。"
+          else
+            echo "上游有 ${behind} 个新提交。"
+          fi
+
+      - name: 尝试合并
+        id: merge
+        if: steps.check.outputs.behind != '0'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$SYNC_BRANCH"
+          if git merge --no-edit upstream/main; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 推送同步分支
+        if: steps.merge.outputs.clean == 'true'
+        # 这个分支完全由本工作流拥有，每次都是从 main 重置后重建，
+        # 所以用 --force 而不是 --force-with-lease：PR 合并后分支会被删除，
+        # 此时本地没有对应的 origin/<branch> 跟踪引用，lease 会判成 stale 而失败。
+        run: git push --force origin "$SYNC_BRANCH"
+
+      - name: 开或更新 PR
+        if: steps.merge.outputs.clean == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing=$(gh pr list --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number')
+          body=$(printf '上游 %s 的 main 有新提交，本 PR 由 sync-upstream 工作流自动生成。\n\n合并前请确认：\n- [ ] CI 编译门禁通过\n- [ ] 版本号 / 更新仓库等冲突热点已按本仓库的定制意图解完\n- [ ] 本地定制未被覆盖\n' "$UPSTREAM_REPO")
+          if [ -n "$existing" ]; then
+            echo "PR #$existing 已存在，本次只更新分支内容。"
+          else
+            gh pr create \
+              --base main \
+              --head "$SYNC_BRANCH" \
+              --title "chore: 同步上游 ${UPSTREAM_REPO}" \
+              --body "$body"
+          fi
+
+      - name: 冲突时开 issue
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+        run: |
+          # 标题带一个 ASCII 标记，专门给下面的去重搜索用
+          # （中文 + 全角冒号在 GitHub 的搜索语法里不可靠）
+          marker="[upstream-sync]"
+          title="${marker} 上游同步冲突：需要手工合并"
+          existing=$(gh issue list --state open --search "${marker} in:title" --json number --jq '.[0].number')
+          body=$(printf '上游 %s 的 main 有 %s 个新提交，但自动合并有冲突，工作流已放弃合并（仓库未被改动）。\n\n本地处理：\n\n```bash\ngit fetch upstream main\ngit checkout main\ngit merge upstream/main\n# 解冲突后\ngit commit\ngit push origin main\n```\n' "$UPSTREAM_REPO" "$BEHIND")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "又一轮同步仍有冲突（上游新增 ${BEHIND} 个提交）。"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
