@@ -585,6 +585,10 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
              然后在本页重新导入桌面端登录态（或重新粘贴新的登录凭证）",
         );
     }
+    // AtomCode 账号：走云直连 OAuth 的 refreshToken 续期。
+    if state.store().atomcode_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::AtmCode).await;
+    }
     match state.auth().refresh_account(&id).await {
         Ok(_) => ok_json(json!({
             "refreshedId": id,
