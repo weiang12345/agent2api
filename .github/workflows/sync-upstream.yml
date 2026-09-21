@@ -86,20 +86,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "── 诊断：token 与仓库权限 ──"
-          gh auth status || true
-          gh api "/repos/${GITHUB_REPOSITORY}" --jq '{private:.private, permissions:.permissions}' || true
-          echo "── 诊断结束 ──"
-          existing=$(gh pr list --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number')
+          owner="${GITHUB_REPOSITORY%%/*}"
+          # 走 REST 而不是 gh pr create：后者优先用 GraphQL 的 createPullRequest
+          # mutation，GITHUB_TOKEN 在部分仓库配置下会被拒（Resource not accessible
+          # by integration），而 REST 的 POST /pulls 走的是同一套 pull-requests 权限。
+          existing=$(gh api "/repos/${GITHUB_REPOSITORY}/pulls?head=${owner}:${SYNC_BRANCH}&state=open" --jq '.[0].number')
           body=$(printf '上游 %s 的 main 有新提交，本 PR 由 sync-upstream 工作流自动生成。\n\n合并前请确认：\n- [ ] CI 编译门禁通过\n- [ ] 版本号 / 更新仓库等冲突热点已按本仓库的定制意图解完\n- [ ] 本地定制未被覆盖\n' "$UPSTREAM_REPO")
           if [ -n "$existing" ]; then
             echo "PR #$existing 已存在，本次只更新分支内容。"
           else
-            gh pr create \
-              --base main \
-              --head "$SYNC_BRANCH" \
-              --title "chore: 同步上游 ${UPSTREAM_REPO}" \
-              --body "$body"
+            gh api --method POST "/repos/${GITHUB_REPOSITORY}/pulls" \
+              -f title="chore: 同步上游 ${UPSTREAM_REPO}" \
+              -f head="$SYNC_BRANCH" \
+              -f base=main \
+              -f body="$body" \
+              --jq '.html_url'
           fi
 
       - name: 冲突时开 issue
@@ -112,10 +113,12 @@ jobs:
           # （中文 + 全角冒号在 GitHub 的搜索语法里不可靠）
           marker="[upstream-sync]"
           title="${marker} 上游同步冲突：需要手工合并"
-          existing=$(gh issue list --state open --search "${marker} in:title" --json number --jq '.[0].number')
+          existing=$(gh api "/search/issues?q=repo:${GITHUB_REPOSITORY}+is:issue+is:open+in:title+%22${marker}%22" --jq '.items[0].number')
           body=$(printf '上游 %s 的 main 有 %s 个新提交，但自动合并有冲突，工作流已放弃合并（仓库未被改动）。\n\n本地处理：\n\n```bash\ngit fetch upstream main\ngit checkout main\ngit merge upstream/main\n# 解冲突后\ngit commit\ngit push origin main\n```\n' "$UPSTREAM_REPO" "$BEHIND")
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "又一轮同步仍有冲突（上游新增 ${BEHIND} 个提交）。"
+            gh api --method POST "/repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" \
+              -f body="又一轮同步仍有冲突（上游新增 ${BEHIND} 个提交）。"
           else
-            gh issue create --title "$title" --body "$body"
+            gh api --method POST "/repos/${GITHUB_REPOSITORY}/issues" \
+              -f title="$title" -f body="$body" --jq '.html_url'
           fi
