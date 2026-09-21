@@ -7,8 +7,16 @@
 
 use serde_json::Value;
 
-/// 默认仓库（本项目的上游）；fork 后可自行覆盖（Node 版 DEFAULT_REPO）
-pub const DEFAULT_REPO: &str = "aimod-cc/agent2api";
+/// 默认仓库（**本 fork**，不是上游 aimod-cc/agent2api）。
+///
+/// 更新检查与安装包下载都从这里的 Release 走：指向 fork 才能拿到本仓库
+/// 自己打包的产物，否则会自动装回上游版本、把本地定制覆盖掉。
+/// 仍可用 `WORKBUDDY_UPDATE_REPO` 环境变量覆盖（见 `UpdateManager::new`）。
+///
+/// 注意：本 fork 是私有仓库时，匿名请求 `releases/latest` 会拿到 404
+/// （GitHub 对私有仓库一律回 404，不泄露存在性），表现为「始终无更新」。
+/// 需要把仓库设为公开，或给程序设置 `WORKBUDDY_GITHUB_TOKEN` / `GITHUB_TOKEN`。
+pub const DEFAULT_REPO: &str = "weiang12345/agent2api";
 
 /// GitHub API 根（Node 版 GITHUB_API）
 pub const GITHUB_API: &str = "https://api.github.com";
