@@ -4,16 +4,19 @@ pub mod credentials;
 pub mod models;
 pub mod oauth;
 pub mod protocol;
+pub mod stream;
 
 use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::egress;
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
 use crate::server::core::providers::ProviderKind;
 use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution, ResolvedProxy};
+use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
@@ -32,7 +35,7 @@ impl ProviderAdapter for TraeAdapter {
     }
 
     fn is_stateful(&self) -> bool {
-        false
+        true
     }
 
     fn list_models(&self) -> Vec<Value> {
@@ -139,6 +142,7 @@ impl ProviderAdapter for TraeAdapter {
         true
     }
 
+
     fn query_usage<'a>(
         &'a self,
         store: &'a AccountStore,
@@ -186,7 +190,139 @@ impl ProviderAdapter for TraeAdapter {
     }
 
     fn sse_model_rewrite(&self) -> bool {
-        true
+        false
+    }
+
+    fn forward_conversation<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        body: &'a Value,
+        _client_headers: &'a HeaderMap,
+        proxy: Option<crate::server::core::proxies::ResolvedProxy>,
+        stream: bool,
+        _telemetry: &'a std::sync::Arc<RequestTelemetry>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                Output = Result<crate::server::core::upstream::ForwardOutcome, GatewayError>,
+            > + Send
+            + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let credentials = credentials_for(store, account_id)?;
+            let credentials = refresh_if_needed(store, account_id, &credentials, false).await?;
+            let plan = self.chat_plan(&credentials, body)?;
+            let mut builder = egress::client_for(proxy.as_ref())
+                .post(plan.url)
+                .body(serde_json::to_vec(&plan.body).map_err(|_| {
+                    GatewayError::with_status(500, "Trae 请求体序列化失败")
+                })?);
+            for (key, value) in plan.headers {
+                builder = builder.header(key, value);
+            }
+            let response = builder.send().await.map_err(|error| {
+                GatewayError::with_status(
+                    502,
+                    format!(
+                        "Trae 上游请求失败：{}",
+                        egress::describe_error_detail(&error)
+                    ),
+                )
+            })?;
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let text = response.text().await.unwrap_or_default();
+                return Err(GatewayError::with_status(
+                    i32::from(status),
+                    format!("Trae 上游返回 {status}: {}", text.chars().take(300).collect::<String>()),
+                ));
+            }
+
+            let mut parser = stream::SoloSseParser::default();
+            let mut translator = stream::Translator::new(&plan.model);
+            let mut source = response.bytes_stream();
+            let mut frames: Vec<Value> = Vec::new();
+            while let Some(chunk) = futures::StreamExt::next(&mut source).await {
+                let chunk = chunk.map_err(|error| {
+                    GatewayError::with_status(
+                        502,
+                        format!(
+                            "Trae 上游流中断：{}",
+                            egress::describe_error_detail(&error)
+                        ),
+                    )
+                })?;
+                for event in parser.push(&chunk) {
+                    frames.extend(translator.consume(event)?);
+                }
+            }
+            for event in parser.finish() {
+                frames.extend(translator.consume(event)?);
+            }
+            frames.extend(translator.finish_frames());
+
+            if stream {
+                let (sender, receiver) =
+                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+                tokio::spawn(async move {
+                    for frame in frames {
+                        let text = stream::sse_frame(&frame);
+                        if sender.send(Ok(bytes::Bytes::from(text))).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = sender
+                        .send(Ok(bytes::Bytes::from(stream::sse_done())))
+                        .await;
+                });
+                return Ok(crate::server::core::upstream::ForwardOutcome::Stream {
+                    status: 200,
+                    stream: Box::new(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+                });
+            }
+            Ok(crate::server::core::upstream::ForwardOutcome::Completion {
+                body: translator.completion(),
+            })
+        })
+    }
+}
+
+struct TraeChatPlan {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Value,
+    model: String,
+}
+
+impl TraeAdapter {
+    fn chat_plan(
+        &self,
+        credentials: &Credentials,
+        body: &Value,
+    ) -> Result<TraeChatPlan, GatewayError> {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(protocol::DEFAULT_MODEL)
+            .to_string();
+        let prepared = protocol::prepare_body(body, true)?;
+        let headers = protocol::solo_headers(
+            &credentials.access_token,
+            &credentials.user_id,
+            &credentials.machine_id,
+            &credentials.device_id,
+            true,
+        );
+        Ok(TraeChatPlan {
+            url: format!("{}/api/agent/v3/llm_utils_chat", protocol::AGENT_HOST),
+            headers,
+            body: prepared,
+            model,
+        })
     }
 }
 

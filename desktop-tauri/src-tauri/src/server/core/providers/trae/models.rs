@@ -116,6 +116,71 @@ pub async fn usage(
     }))
 }
 
+pub async fn checkin_status(
+    credentials: &Credentials,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<Value, GatewayError> {
+    ug_request(
+        "POST",
+        "/trae/api/v2/ug/checkin_credits/status",
+        Some(&json!({})),
+        credentials,
+        proxy,
+    )
+    .await
+}
+
+pub async fn claim_checkin(
+    credentials: &Credentials,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<Value, GatewayError> {
+    ug_request(
+        "POST",
+        "/trae/api/v2/ug/checkin_credits/claim",
+        Some(&json!({ "req_source": 2 })),
+        credentials,
+        proxy,
+    )
+    .await
+}
+
+pub async fn checkin(
+    credentials: &Credentials,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<Value, GatewayError> {
+    let status = checkin_status(credentials, proxy).await?;
+    let checked_in = status
+        .get("checked_in")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if checked_in {
+        return Ok(json!({
+            "success": false,
+            "alreadyCompleted": true,
+            "msg": "今日已签到",
+            "raw": status,
+        }));
+    }
+    let claim = claim_checkin(credentials, proxy).await?;
+    let code = claim.get("code").and_then(Value::as_i64).unwrap_or(0);
+    if code == 0 {
+        return Ok(json!({
+            "success": true,
+            "msg": "签到成功",
+            "raw": claim,
+        }));
+    }
+    Ok(json!({
+        "success": false,
+        "msg": claim
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| claim.get("msg").and_then(Value::as_str))
+            .unwrap_or("签到未领取"),
+        "raw": claim,
+    }))
+}
+
 fn parse_models(payload: &Value) -> Vec<Value> {
     let Some(list) = payload.get("config_info_list").and_then(Value::as_array) else {
         return Vec::new();
@@ -209,6 +274,54 @@ async fn request(
     response
         .payload
         .ok_or_else(|| GatewayError::with_status(502, "Trae 接口未返回有效 JSON"))
+}
+
+async fn ug_request(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    credentials: &Credentials,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<Value, GatewayError> {
+    let mut headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+        ("User-Agent".to_string(), format!("Trae/{}", super::protocol::IDE_VERSION)),
+        (
+            "Authorization".to_string(),
+            format!("Cloud-IDE-JWT {}", credentials.access_token),
+        ),
+        ("X-User-Region".to_string(), "CN".to_string()),
+        ("X-Device-Id".to_string(), credentials.device_id.clone()),
+    ];
+    headers.push(("X-Uid".to_string(), credentials.user_id.clone()));
+    let response = crate::server::core::auth_http::send_request_via(
+        method,
+        &format!("{UG_HOST}{path}"),
+        body,
+        &headers,
+        proxy,
+        Some(REQUEST_TIMEOUT_MS),
+    )
+    .await
+    .map_err(|error| {
+        GatewayError::with_status(502, format!("Trae 签到请求失败：{error}"))
+    })?;
+    if !response.ok {
+        let message = response
+            .payload
+            .as_ref()
+            .and_then(|value| value.get("message").or_else(|| value.get("msg")))
+            .and_then(Value::as_str)
+            .unwrap_or("上游返回非 2xx");
+        return Err(GatewayError::with_status(
+            i32::from(response.status),
+            format!("Trae 签到失败：{message}"),
+        ));
+    }
+    response
+        .payload
+        .ok_or_else(|| GatewayError::with_status(502, "Trae 签到接口未返回有效 JSON"))
 }
 
 async fn request_raw(

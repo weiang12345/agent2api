@@ -204,6 +204,29 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "trae" => {
+            let claim = async {
+                let credentials =
+                    crate::server::core::providers::trae::credentials_for(store, &id)?;
+                let credentials =
+                    crate::server::core::providers::trae::refresh_if_needed(
+                        store,
+                        &id,
+                        &credentials,
+                        false,
+                    )
+                    .await?;
+                let proxy = crate::server::core::providers::trae::account_proxy(store, &id)?;
+                crate::server::core::providers::trae::models::checkin(
+                    &credentials,
+                    proxy.as_ref(),
+                )
+                .await
+            }
+            .await
+            .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         _ => {
             let Some(entry) = store.get_session_by_id(&id) else {
                 return json!({
