@@ -2,6 +2,7 @@
 use std::sync::{OnceLock, RwLock};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::server::core::auth_http::{send_request_via, ApiResponse};
 use crate::server::core::providers::adapter::ModelRefreshOutcome;
@@ -116,39 +117,24 @@ pub async fn usage(
     }))
 }
 
-pub async fn checkin_status(
+pub async fn checkin(
     credentials: &Credentials,
+    generation: u64,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<Value, GatewayError> {
-    ug_request(
+    let device_id = checkin_device_id(&credentials.user_id, generation);
+    let status = checkin_request(
+        credentials,
+        &device_id,
         "POST",
         "/trae/api/v2/ug/checkin_credits/status",
         Some(&json!({})),
-        credentials,
         proxy,
     )
-    .await
-}
-
-pub async fn claim_checkin(
-    credentials: &Credentials,
-    proxy: Option<&ResolvedProxy>,
-) -> Result<Value, GatewayError> {
-    ug_request(
-        "POST",
-        "/trae/api/v2/ug/checkin_credits/claim",
-        Some(&json!({ "req_source": 2 })),
-        credentials,
-        proxy,
-    )
-    .await
-}
-
-pub async fn checkin(
-    credentials: &Credentials,
-    proxy: Option<&ResolvedProxy>,
-) -> Result<Value, GatewayError> {
-    let status = checkin_status(credentials, proxy).await?;
+    .await?;
+    if status.get("code").and_then(Value::as_i64) == Some(9074) {
+        return Ok(checkin_busy(&status));
+    }
     let checked_in = status
         .get("checked_in")
         .and_then(Value::as_bool)
@@ -161,7 +147,15 @@ pub async fn checkin(
             "raw": status,
         }));
     }
-    let claim = claim_checkin(credentials, proxy).await?;
+    let claim = checkin_request(
+        credentials,
+        &device_id,
+        "POST",
+        "/trae/api/v2/ug/checkin_credits/claim",
+        Some(&json!({})),
+        proxy,
+    )
+    .await?;
     let code = claim.get("code").and_then(Value::as_i64).unwrap_or(0);
     if code == 0 {
         return Ok(json!({
@@ -169,6 +163,9 @@ pub async fn checkin(
             "msg": "签到成功",
             "raw": claim,
         }));
+    }
+    if code == 9074 {
+        return Ok(checkin_busy(&claim));
     }
     Ok(json!({
         "success": false,
@@ -179,6 +176,81 @@ pub async fn checkin(
             .unwrap_or("签到未领取"),
         "raw": claim,
     }))
+}
+
+fn checkin_busy(raw: &Value) -> Value {
+    json!({
+        "success": false,
+        "code": 9074,
+        "msg": "签到人数过多，稍后再试",
+        "raw": raw,
+    })
+}
+
+fn checkin_device_id(identity: &str, generation: u64) -> String {
+    if identity.is_empty() {
+        return String::new();
+    }
+    let material = if generation == 0 {
+        identity.to_string()
+    } else {
+        format!("{identity}#gen{generation}")
+    };
+    let digest: [u8; 32] = Sha256::digest(material.as_bytes()).into();
+    let modulus: u64 = 10_000_000_000_000_000;
+    let mut remainder: u64 = 0;
+    for byte in digest {
+        remainder = (remainder << 8) | u64::from(byte);
+        remainder %= modulus;
+    }
+    format!("{remainder:016}")
+}
+
+async fn checkin_request(
+    credentials: &Credentials,
+    device_id: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<Value, GatewayError> {
+    let headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        (
+            "Authorization".to_string(),
+            format!("Cloud-IDE-JWT {}", credentials.access_token),
+        ),
+        ("X-Device-Id".to_string(), device_id.to_string()),
+        ("X-Device-Brand".to_string(), "Apple".to_string()),
+        ("X-Device-Type".to_string(), "windows".to_string()),
+    ];
+    let response = crate::server::core::auth_http::send_request_via(
+        method,
+        &format!("{UG_HOST}{path}"),
+        body,
+        &headers,
+        proxy,
+        Some(REQUEST_TIMEOUT_MS),
+    )
+    .await
+    .map_err(|error| {
+        GatewayError::with_status(502, format!("Trae 签到请求失败：{error}"))
+    })?;
+    if !response.ok {
+        let message = response
+            .payload
+            .as_ref()
+            .and_then(|value| value.get("message").or_else(|| value.get("msg")))
+            .and_then(Value::as_str)
+            .unwrap_or("上游返回非 2xx");
+        return Err(GatewayError::with_status(
+            i32::from(response.status),
+            format!("Trae 签到失败：{message}"),
+        ));
+    }
+    response
+        .payload
+        .ok_or_else(|| GatewayError::with_status(502, "Trae 签到接口未返回有效 JSON"))
 }
 
 fn parse_models(payload: &Value) -> Vec<Value> {
@@ -276,54 +348,6 @@ async fn request(
         .ok_or_else(|| GatewayError::with_status(502, "Trae 接口未返回有效 JSON"))
 }
 
-async fn ug_request(
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-    credentials: &Credentials,
-    proxy: Option<&ResolvedProxy>,
-) -> Result<Value, GatewayError> {
-    let mut headers = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-        ("Accept".to_string(), "application/json".to_string()),
-        ("User-Agent".to_string(), format!("Trae/{}", super::protocol::IDE_VERSION)),
-        (
-            "Authorization".to_string(),
-            format!("Cloud-IDE-JWT {}", credentials.access_token),
-        ),
-        ("X-User-Region".to_string(), "CN".to_string()),
-        ("X-Device-Id".to_string(), credentials.device_id.clone()),
-    ];
-    headers.push(("X-Uid".to_string(), credentials.user_id.clone()));
-    let response = crate::server::core::auth_http::send_request_via(
-        method,
-        &format!("{UG_HOST}{path}"),
-        body,
-        &headers,
-        proxy,
-        Some(REQUEST_TIMEOUT_MS),
-    )
-    .await
-    .map_err(|error| {
-        GatewayError::with_status(502, format!("Trae 签到请求失败：{error}"))
-    })?;
-    if !response.ok {
-        let message = response
-            .payload
-            .as_ref()
-            .and_then(|value| value.get("message").or_else(|| value.get("msg")))
-            .and_then(Value::as_str)
-            .unwrap_or("上游返回非 2xx");
-        return Err(GatewayError::with_status(
-            i32::from(response.status),
-            format!("Trae 签到失败：{message}"),
-        ));
-    }
-    response
-        .payload
-        .ok_or_else(|| GatewayError::with_status(502, "Trae 签到接口未返回有效 JSON"))
-}
-
 async fn request_raw(
     method: &str,
     url: &str,
@@ -377,5 +401,12 @@ mod tests {
             ]
         });
         assert_eq!(parse_usage(&raw), (75, 100, 25, 1));
+    }
+
+    #[test]
+    fn checkin_device_id_matches_reference_vector() {
+        assert_eq!(checkin_device_id("u1", 0), "4302850041909017");
+        assert_ne!(checkin_device_id("u1", 1), checkin_device_id("u1", 0));
+        assert_eq!(checkin_device_id("", 0), "");
     }
 }

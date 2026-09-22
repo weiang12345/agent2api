@@ -116,6 +116,47 @@ impl AccountStore {
         Ok(self.public_account(&record))
     }
 
+    pub fn trae_checkin_generation(&self, account_id: &str) -> u64 {
+        self.trae_account_record(account_id)
+            .and_then(|record| {
+                record
+                    .get("checkinGeneration")
+                    .cloned()
+                    .and_then(|value| value.as_u64())
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn bump_trae_checkin_generation(&self, account_id: &str) -> u64 {
+        let Some(record) = self.trae_account_record(account_id) else {
+            return 0;
+        };
+        let Some(id) = record
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        else {
+            return 0;
+        };
+        let guard = self.guard();
+        let Some(mut stored) = self
+            .record_by_id(&guard, &id)
+            .filter(|item| item.provider() == PROVIDER)
+        else {
+            return 0;
+        };
+        let next = stored
+            .get("checkinGeneration")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            .saturating_add(1);
+        stored.set("checkinGeneration", json!(next));
+        stored.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &stored))
+            .ok();
+        next
+    }
+
     pub fn update_trae_credentials_if_current(
         &self,
         expected: &Value,

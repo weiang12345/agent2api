@@ -52,12 +52,13 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///   - **WorkBuddy**：腾讯的每日签到接口；
 ///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
-///     （`providers::autoclaw::checkin`）。
+///     （`providers::autoclaw::checkin`）；
+///   - **Trae**：`checkin_credits/status` 与 `checkin_credits/claim`。
 ///
 /// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw / Qoder 有积分
 /// 查询但没有签到，因此不在此列 —— 它们的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 3] = ["workbuddy", "raccoon", "autoclaw"];
+pub const CHECKIN_PROVIDERS: [&str; 4] = ["workbuddy", "raccoon", "autoclaw", "trae"];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {

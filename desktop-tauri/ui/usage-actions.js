@@ -274,7 +274,7 @@
   async function checkinAll() {
     if (checkinBusy) return;
     const targets = checkinableAccounts(accounts());
-    if (!targets.length) { toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版 / 小浣熊 / AutoClaw）', 'err'); return; }
+    if (!targets.length) { toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版 / 小浣熊 / AutoClaw / Trae）', 'err'); return; }
     if (!(await window.wbConfirm?.ask?.({
       title: '批量签到',
       html: `将对 <strong>${targets.length}</strong> 个账号串行签到，可能需要一点时间。继续？`,

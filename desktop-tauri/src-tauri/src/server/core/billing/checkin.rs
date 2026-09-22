@@ -217,14 +217,25 @@ pub async fn checkin_for(
                     )
                     .await?;
                 let proxy = crate::server::core::providers::trae::account_proxy(store, &id)?;
+                let generation = store.trae_checkin_generation(&id);
                 crate::server::core::providers::trae::models::checkin(
                     &credentials,
+                    generation,
                     proxy.as_ref(),
                 )
                 .await
             }
             .await
             .map_err(|error| error.message);
+            if let Ok(value) = &claim {
+                if value.get("code").and_then(Value::as_i64) == Some(9074) {
+                    let generation = store.bump_trae_checkin_generation(&id);
+                    logging::log(
+                        "[Accounts]",
+                        &format!("Trae 账号 {display}: 签到设备已轮换到第 {generation} 代"),
+                    );
+                }
+            }
             claim_result(id, name, &display, true, claim)
         }
         _ => {

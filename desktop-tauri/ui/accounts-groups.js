@@ -44,8 +44,9 @@
    * 凭证（token2），没配置时后端返回可识别的「未配置」、面板显示成中性提示
    * （见 usage-panel.js）—— 所以它的按钮照样渲染，用户才有「去配置」的入口。
    * checkin 是**有签到活动**的家：workbuddy（腾讯每日签到）、raccoon（桌面登录
-   * 积分发放）、autoclaw（通用任务接口的 daily_signin 任务）。CatPaw / Qoder /
-   * Cline 有积分但确实没有签到，所以是 false —— 这个字段决定批量签到的目标集合与
+   * 积分发放）、autoclaw（通用任务接口的 daily_signin 任务）、trae（checkin_credits）。
+   * CatPaw / Qoder / AtomCode / Cline 有积分但确实没有签到，所以是 false ——
+   * 这个字段决定批量签到的目标集合与
    * 卡片上的签到按钮，报错的家不该出现在这里。
    * edition 决定卡片是否显示国内版 / 国际版徽章与组内二级分组；
    * identifier / expiry 是「账号标识」与「有效期」在记录里的键名
@@ -67,6 +68,8 @@
     qoder: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt' },
     'cline-free': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
     'cline-pass': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
+    atomcode: { usage: true, checkin: false, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+    trae: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
   };
 
   /**
