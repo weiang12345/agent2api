@@ -11,7 +11,7 @@ use super::sql;
 use super::state::StoredAccount;
 use super::store::{AccountStore, AccountStoreError};
 use super::store_util::{token_tail_of, truncate_chars};
-use super::{CredentialWrite, MAX_ACCOUNTS};
+use super::CredentialWrite;
 
 const PROVIDER: &str = kind_id(ProviderKind::Trae);
 
@@ -43,11 +43,6 @@ impl AccountStore {
             .records_for_provider(&guard, PROVIDER)
             .into_iter()
             .find(|record| record.uid() == credentials.user_id);
-        if existing.is_none()
-            && self.with_conn(&guard, |conn| sql::count_all(conn))? as usize >= MAX_ACCOUNTS
-        {
-            return Err(AccountStoreError::bad_request(format!("最多保存 {MAX_ACCOUNTS} 个账号")));
-        }
         let id = existing
             .as_ref()
             .map(|record| record.id().to_string())
