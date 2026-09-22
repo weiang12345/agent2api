@@ -27,6 +27,12 @@
      - 更新逻辑
   4. 合并后必须重新跑测试和构建。
 
+- 上游 `2.4.6` 起，内容脱敏已改为出站指纹脱敏：
+  - 配置键：`sanitizeBlacklistFingerprints`
+  - 入口：`/api/sanitize`
+  - 核心实现：`desktop-tauri/src-tauri/src/server/core/sanitize.rs`
+  - 旧词表、远程同步和独立脱敏页已删除，不要再按旧方案恢复。
+
 ## 3. 构建与测试
 
 在仓库根目录执行：
