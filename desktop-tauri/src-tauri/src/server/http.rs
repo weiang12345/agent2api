@@ -79,6 +79,10 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/api/session/login/trae-callback",
             get(api::session::login_trae_callback),
+        )
+        .route(
+            "/authorize",
+            get(api::session::login_trae_callback),
         );
 
     // 需鉴权：Node 版对这些路径都调用了 checkApiKey

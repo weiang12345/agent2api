@@ -361,10 +361,10 @@ mod tests {
 
     #[test]
     fn builds_login_url_and_parses_callback() {
-        let login = build_login("http://127.0.0.1:1234/api/session/login/trae-callback")
+        let login = build_login("http://127.0.0.1:1234/authorize")
             .expect("build login");
         assert!(login.auth_url.starts_with("https://www.trae.cn/authorization?"));
-        assert!(login.auth_url.contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A1234%2Fapi%2Fsession%2Flogin%2Ftrae-callback"));
+        assert!(login.auth_url.contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A1234%2Fauthorize"));
         assert_eq!(login.machine_id.len(), 32);
         assert_eq!(login.device_id.len(), 16);
         assert!(login.device_id.chars().all(|ch| ch.is_ascii_digit()));
@@ -378,7 +378,7 @@ mod tests {
         let user_jwt_json = serde_json::json!({ "Token": "jwt-token" }).to_string();
         let user_jwt: String = url::form_urlencoded::byte_serialize(user_jwt_json.as_bytes()).collect();
         let callback_url = format!(
-            "http://127.0.0.1:1234/api/session/login/trae-callback?refreshToken=refresh&userInfo={}&userJwt={}&loginTraceID={}",
+            "http://127.0.0.1:1234/authorize?refreshToken=refresh&userInfo={}&userJwt={}&loginTraceID={}",
             user_info, user_jwt, login.state
         );
         let callback = parse_callback(&callback_url, &login.state).expect("parse callback");

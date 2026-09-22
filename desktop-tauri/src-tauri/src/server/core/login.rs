@@ -559,7 +559,7 @@ impl LoginService {
         name: Option<String>,
     ) -> Result<LoginTaskHandle, String> {
         let login = crate::server::core::providers::trae::oauth::build_login(&format!(
-            "{callback_base}/api/session/login/trae-callback"
+            "{callback_base}/authorize"
         ))
         .map_err(|error| error.message)?;
         let info = resolve_edition(Some(DEFAULT_EDITION));

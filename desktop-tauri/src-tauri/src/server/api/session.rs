@@ -450,7 +450,7 @@ pub async fn login_trae_callback(
         .cloned()
         .unwrap_or_default();
     let callback_url = {
-        let mut url = url::Url::parse("http://127.0.0.1/api/session/login/trae-callback")
+        let mut url = url::Url::parse("http://127.0.0.1/authorize")
             .expect("static callback base URL");
         {
             let mut query = url.query_pairs_mut();
