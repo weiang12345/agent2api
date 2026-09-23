@@ -135,14 +135,14 @@ $response.assets[0].size
 
 ## 8. 当前部署基线
 
-- 当前 Release：`v2.4.6-fork.1`
-- 当前 `main` 提交：`2ccfc4b`
+- 当前 Release：`v2.7.1-fork.1`
+- 当前 `main` 提交：`504c874`
 - 当前更新仓库：`weiang12345/agent2api`
-- 当前构建产物：`Agent2API_2.4.6_x64-setup.exe`
+- 当前构建产物：`Agent2API_2.7.1_x64-setup.exe`
 - 当前 SHA256：
 
 ```text
-81297C374A2199AA8124567851CBCB6013421F54882A34E296DCDFCE380C4851
+0A5BD7C94679A6495F5510D2EF881DAE6D07953A45040BB6F93FE72EDAFE3ACE
 ```
 
 ## 9. AtomCode 云直连与上游合并
@@ -167,7 +167,7 @@ $response.assets[0].size
 
 - Trae 是本 fork 的专属 provider，上游没有对应实现。
 - 同步上游时必须保留：
-  - `desktop-tauri/server/src/server/core/providers/trae/`
+  - `desktop-tauri/src-tauri/server/src/server/core/providers/trae/`
   - `desktop-tauri/src-tauri/server/src/server/core/account_store/trae_accounts.rs`
   - `desktop-tauri/ui/add-trae.js`
   - `ProviderKind::Trae`
