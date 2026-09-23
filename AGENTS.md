@@ -8,7 +8,7 @@
   - `upstream` remote 指向上游。
   - `origin` remote 指向本 fork。
 - 默认软件更新仓库必须保持为 `weiang12345/agent2api`，对应
-  `desktop-tauri/src-tauri/src/server/core/update/version.rs` 里的 `DEFAULT_REPO`。
+  `desktop-tauri/src-tauri/server/src/server/core/update/version.rs` 里的 `DEFAULT_REPO`。
 - 仓库保持 public。若改回 private：
   - GitHub Release API 匿名访问会 404。
   - 安装包下载也会失败。
@@ -30,7 +30,7 @@
 - 上游 `2.4.6` 起，内容脱敏已改为出站指纹脱敏：
   - 配置键：`sanitizeBlacklistFingerprints`
   - 入口：`/api/sanitize`
-  - 核心实现：`desktop-tauri/src-tauri/src/server/core/sanitize.rs`
+  - 核心实现：`desktop-tauri/src-tauri/server/src/server/core/sanitize.rs`
   - 旧词表、远程同步和独立脱敏页已删除，不要再按旧方案恢复。
 
 ## 3. 构建与测试
@@ -46,8 +46,8 @@ Rust 侧验证命令：
 
 ```powershell
 cd desktop-tauri/src-tauri
-cargo check --locked --all-targets
-cargo test --locked --lib
+cargo check --locked --workspace --all-targets
+cargo test --locked --workspace --lib
 ```
 
 Windows 本机构建时，Cargo 需要清空代理并离线运行，避免代理环境导致依赖解析失败：
@@ -149,8 +149,8 @@ $response.assets[0].size
 
 - AtomCode 是本 fork 的专属 provider，上游没有对应实现。
 - 同步上游时必须保留：
-  - `desktop-tauri/src-tauri/src/server/core/providers/atomcode/`
-  - `desktop-tauri/src-tauri/src/server/core/account_store/atomcode_accounts.rs`
+  - `desktop-tauri/src-tauri/server/src/server/core/providers/atomcode/`
+  - `desktop-tauri/src-tauri/server/src/server/core/account_store/atomcode_accounts.rs`
   - `desktop-tauri/ui/add-atomcode.js`
   - `ProviderKind::AtmCode`
   - `adapter_for(ProviderKind::AtmCode)`
@@ -167,8 +167,8 @@ $response.assets[0].size
 
 - Trae 是本 fork 的专属 provider，上游没有对应实现。
 - 同步上游时必须保留：
-  - `desktop-tauri/src-tauri/src/server/core/providers/trae/`
-  - `desktop-tauri/src-tauri/src/server/core/account_store/trae_accounts.rs`
+  - `desktop-tauri/server/src/server/core/providers/trae/`
+  - `desktop-tauri/src-tauri/server/src/server/core/account_store/trae_accounts.rs`
   - `desktop-tauri/ui/add-trae.js`
   - `ProviderKind::Trae`
   - `adapter_for(ProviderKind::Trae)`

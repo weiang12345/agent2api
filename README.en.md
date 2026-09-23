@@ -32,8 +32,8 @@ OpenAI client / any SDK
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Docker Deployment](#docker-deployment)
 - [Screenshots](#screenshots)
-- [Data Storage](#data-storage)
 - [Project Layout](#project-layout)
 - [Development & Build](#development--build)
 - [Usage Notice](#usage-notice)
@@ -45,10 +45,8 @@ OpenAI client / any SDK
 
 Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\Program Files\Agent2API` by default, and needs administrator approval during setup), then launch it — **no Node or any other runtime required**.
 
-1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If an older version's data directory or data files are found, a dialog walks you through the migration (see [Data Storage](#data-storage) for details).
+1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If an older version's data directory or data files are found, a dialog walks you through the migration.
 2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw domestic / AutoClaw international / Qoder / Cline), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again).
-
-> **The two AutoClaw regions sign in differently**: the domestic build only offers SMS code; the international build only offers Zai / Google OAuth web authorization — pick "web login (Zai / Google)" in the add-account dialog and complete one slider check first (the risk-control step the vendor requires, handled by the vendor's own captcha component running locally), after which the official login page opens. You can choose how it opens: **embedded window** or **system default browser** (the latter reuses the Zai / Google account already signed in there). The international build does not offer SMS-code login (the official client does not either, and most international accounts have no phone number bound); if you have already signed in with the desktop client, "import desktop login state" is the quickest route, or paste credentials directly.
 3. Set your OpenAI client's `base_url` to `http://127.0.0.1:3065/v1` and put anything in `api_key` (for example `sk-local`; the server does not check it while authentication is disabled).
 
 Closing the window only minimizes to the tray by default, and the gateway keeps forwarding in the background; to quit for real, right-click the tray icon and choose "Exit".
@@ -83,6 +81,46 @@ print(resp.choices[0].message.content)
 
 ---
 
+## Docker Deployment
+
+```bash
+docker run -d --name agent2api --restart unless-stopped \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+Open `http://<host>:3065` in a browser — the first visit walks you through **registering the admin account**; log in and create an API key in the "Gateway Keys" page for your clients — `http://<host>:3065/v1` is the OpenAI-compatible endpoint (it refuses to forward until the first key exists, then recovers automatically). All state (SQLite database / config / logs) lives in the `./data` volume.
+
+Compose users (this is the whole `docker-compose.yml`; images are published for amd64 and arm64):
+
+```yaml
+services:
+  agent2api:
+    image: aimodcc/agent2api:latest
+    container_name: agent2api
+    restart: unless-stopped
+    ports:
+      - "3065:3065"
+    volumes:
+      - ./data:/data
+```
+
+Environment variables (all optional — nothing needs to be preset):
+
+| Variable | Description |
+| --- | --- |
+| `AGENT2API_ADMIN_USER` + `AGENT2API_ADMIN_PASSWORD` | Preset the admin account & password (password in plain text, hashed automatically at startup). Leave unset to register in the panel |
+| `AGENT2API_PANEL_PORT` | Serve the panel (UI + `/api/*`) on its own port; map only the main port publicly to keep the management plane internal (bind the panel port as `127.0.0.1:3066:3066`) |
+| `AGENT2API_HOST` / `AGENT2API_PROXY_PORT` | Listen address (default `0.0.0.0`) / port (default `3065`) |
+| `AGENT2API_ALLOW_NO_KEY` | Set to `1` to serve `/v1` without any key — private networks only |
+| `AGENT2API_CAPTCHA_ENABLED` | Login-page human verification widget: `1` enabled (default), `0` disabled |
+
+Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
+
+**Web panel capability notes** (all differences stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; AutoClaw / CatPaw web-login callbacks hit the machine's own port, so from a remote panel use pasted credentials instead; Raccoon web login and "import desktop login state" are unavailable (use pasted credentials).
+
+---
+
 ## Screenshots
 
 ### Accounts
@@ -113,18 +151,6 @@ Background tasks are managed on one page: toggle, interval, last result and next
 
 ---
 
-## Data Storage
-
-Everything lives in **a single SQLite database**: `~/.agent2api/agent2api.db` (the config directory can be overridden with the `AGENT2API_PROXY_HOME` environment variable). Inside, data is split by purpose — `accounts`, `logs` (system events), `requests` / `request_daily` (per-request records and daily aggregates), `debug_traffic` (raw upstream payloads captured in debug mode), and `kv` (gateway config plus assorted small state). Settings → General → Data Storage shows the database path, its size, and the row count of each table.
-
-The database runs in WAL mode, so while the app is running you will also see `agent2api.db-wal` and `agent2api.db-shm` next to it. Include them when backing up (or quit the app first — it checkpoints the WAL back into the main file on exit).
-
-> **Upgrading from an older version**: earlier versions scattered data across JSON / JSONL files (`accounts.json`, `config.json`, `logs.jsonl`, `requests.jsonl`, `request-daily.jsonl`, `debug-traffic.jsonl`, `desktop-settings.json`). On first launch the new version **detects** them and shows a dialog explaining that storage has moved to SQLite; the import only starts after you press "Upgrade" in that dialog. Choosing "Later" skips the import for this run (accounts and history stay unavailable, and the dialog appears again on the next launch).
->
-> After a successful import the old files are **renamed** to `name.migrated` (for example `accounts.json.migrated`) and kept in place as backups — they are **never deleted**. You can open them at any time to roll back or cross-check your data; rename one back and restart to be prompted to upgrade again.
-
----
-
 ## Project Layout
 
 Both the gateway and the desktop app live under `desktop-tauri/`: the backend is a Rust in-process HTTP server under `src-tauri/`, the frontend is plain HTML/CSS/JS under `ui/`.
@@ -132,10 +158,12 @@ Both the gateway and the desktop app live under `desktop-tauri/`: the backend is
 ```
 agent2api/
 ├─ desktop-tauri/
-│  ├─ src-tauri/src/
-│  │  ├─ server/                 Gateway implementation (Rust, in-process HTTP server)
-│  │  │  ├─ mod.rs               Service assembly: ServerState, start, stop, startup migration
-│  │  │  ├─ http.rs              Route table, CORS, API key middleware, body limits
+│  ├─ src-tauri/
+│  │  ├─ server/                 Gateway crate (agent2api-server, built independently:
+│  │  │                          shared by the desktop app and the headless binary;
+│  │  │                          src/server/ and bin/agent2api-server.rs have no GUI deps)
+│  │  │  ├─ mod.rs               Service assembly: ServerState, startup, shutdown, startup migration
+│  │  │  ├─ http.rs              Route table, CORS, API Key middleware, body limit, headless static hosting
 │  │  │  ├─ config.rs / logging.rs / logs_store.rs / errors.rs
 │  │  │  ├─ config_migration.rs  1.x config directory migration (~/.workbuddy-proxy → ~/.agent2api, first startup step)
 │  │  │  ├─ request_stats.rs + request_stats/   Statistics time windows, writes, aggregation and trimming
@@ -196,6 +224,8 @@ agent2api/
 │  └─ src-tauri/tauri.conf.json  Bundle configuration (NSIS)
 ├─ build/make-icon.mjs           Generates the app icon source image
 ├─ assets/screenshots/           Images used by the READMEs (UI screenshots)
+├─ Dockerfile / .dockerignore    Headless image (multi-stage build: gateway + panel only)
+├─ docker-compose.yml / .env.example   Deployment (single container: panel + gateway on one port)
 └─ package.json                  Build script entry points (tauri:dev / tauri:build / build:icon)
 ```
 
@@ -251,3 +281,16 @@ This project is provided "as is"; the author makes no promise about its availabi
 This project is released under the [MIT License](./LICENSE); you may use, modify and distribute it freely as long as the copyright notice is retained.
 
 One caveat: the LICENSE file carries a **Usage Notice** after the MIT text, whose clause 3 **adds restrictions on top of** MIT (no commercial use, no reselling redistributions, no bulk account operation). This project is therefore **not** pure MIT — **the MIT terms and the Usage Notice together form the complete license**, and where the two reach different conclusions on the same act, the stricter one governs. That is also why `Cargo.toml` points `license-file` at the LICENSE file instead of declaring the SPDX identifier `"MIT"`.
+
+---
+
+## Star History
+
+<a href="https://star-history.com/#aimod-cc/agent2api&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
+  </picture>
+</a>
+
