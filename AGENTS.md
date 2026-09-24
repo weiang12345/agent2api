@@ -35,6 +35,8 @@
 
 ## 3. 构建与测试
 
+本 fork 只构建和发布 Windows 版本，不构建 macOS 安装包。
+
 在仓库根目录执行：
 
 ```powershell
@@ -69,7 +71,7 @@ $env:HTTPS_PROXY='http://127.0.0.1:7890'
 
 ## 4. 发布流程
 
-当前 `.github/workflows/build.yml` 只构建并上传 artifact，不自动创建 GitHub Release；
+当前 `.github/workflows/build.yml` 只构建 Windows 并上传 artifact，不自动创建 GitHub Release；
 实际发布仍按本节手动执行。
 
 发布前必须完成：
@@ -77,9 +79,8 @@ $env:HTTPS_PROXY='http://127.0.0.1:7890'
 1. `main` 分支干净并与 `origin/main` 同步。
 2. `cargo check --locked --all-targets` 通过。
 3. `cargo test --locked --lib` 通过。
-4. 本地 Tauri 构建成功，产物路径：
+4. 本地 Windows Tauri 构建成功，产物路径：
    - Windows：`target/release/bundle/nsis/*.exe`
-   - macOS universal：`target/universal-apple-darwin/release/bundle/dmg/*.dmg`
 
 发布步骤：
 
@@ -87,7 +88,7 @@ $env:HTTPS_PROXY='http://127.0.0.1:7890'
 2. Release tag 命名：
    - 上游版本未变、只是本 fork 修复：`v{上游版本}-fork.{N}`，例如 `v2.4.5-fork.1`。
    - 想让客户端真正检测到新版本：必须把应用版本号整体提升到更高数字，再使用对应 tag。
-3. 将构建出的安装包上传为 Release asset。
+3. 将构建出的 Windows 安装包上传为 Release asset。
 4. Release 说明使用简体中文，写明：
    - 同步的上游版本
    - 本 fork 的改动
@@ -114,7 +115,7 @@ https://api.github.com/repos/weiang12345/agent2api/releases/latest
 1. 匿名访问 Release API 返回 200，并包含正确 tag 和资产。
 2. 匿名下载安装包成功。
 3. 安装包 SHA256 与本地构建产物一致。
-4. GitHub Actions 的 `ci` workflow 通过。
+4. GitHub Actions 的 `ci` 与 Windows `build` workflow 通过。
 
 示例：
 
