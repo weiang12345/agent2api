@@ -135,14 +135,14 @@ $response.assets[0].size
 
 ## 8. 当前部署基线
 
-- 当前 Release：`v2.7.1-fork.1`
-- 当前 `main` 提交：`504c874`
+- 当前 Release：`v2.7.5-fork.1`
+- 当前 `main` 提交：`bdcced7`
 - 当前更新仓库：`weiang12345/agent2api`
-- 当前构建产物：`Agent2API_2.7.1_x64-setup.exe`
+- 当前构建产物：`Agent2API_2.7.5_x64-setup.exe`
 - 当前 SHA256：
 
 ```text
-0A5BD7C94679A6495F5510D2EF881DAE6D07953A45040BB6F93FE72EDAFE3ACE
+2B4205F568A921B7D4F954F30643355FA6FAF4E74EEA5980E62A82D1F8E77401
 ```
 
 ## 9. AtomCode 云直连与上游合并
