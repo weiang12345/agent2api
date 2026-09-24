@@ -1,5 +1,5 @@
 /* Agent2API · 请求日志面板（网关转发明细 · 筛选 / 分页 / 自动刷新） */
-/* global workbuddyDesktop, wbApp, wbRequestHover, wbRequestDetail */
+/* global workbuddyDesktop, wbApp, wbRequestHover, wbRequestDetail, wbRequestPhase */
 
 /**
  * 「请求日志」页的自持面板：网关每次转发到上游的请求日志。
@@ -58,7 +58,7 @@
     { key: 'time', label: '时间', sel: '.req-time', track: '92px' },
     { key: 'target', label: '提供商 / 账号', sel: '.req-target', track: 'minmax(0, 1.1fr)' },
     { key: 'retry', label: '重试', sel: '.req-retry', track: '52px' },
-    { key: 'status', label: '状态', sel: '.req-status', track: '68px' },
+    { key: 'status', label: '状态', sel: '.req-status', track: '96px' },
     { key: 'model', label: '模型', sel: '.req-model', track: 'minmax(0, 1.3fr)' },
     { key: 'dur', label: '用时', sel: '.req-dur', track: '96px', align: 'right' },
     { key: 'usage', label: '用量', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
@@ -147,6 +147,16 @@
   }
 
   let range = readRange();
+  /**
+   * 三个下拉筛选（状态 / 提供商 / 模型）的跨次启动记忆。空串 = 「全部」。
+   * 状态下拉的选项是静态 HTML，启动即可回填；提供商 / 模型的候选清单是异步
+   * 拉的（refreshFilterOptions），回填走 fillFilterSelect 的 desired 入参 ——
+   * 提前给 select.value 赋值在选项还不存在时会被浏览器丢弃。
+   */
+  const FILTERS_KEY = 'workbuddy-desktop-requests-filters';
+  const savedFilters = window.wbFilterMemory
+    ? window.wbFilterMemory.load(FILTERS_KEY, { status: '', provider: '', model: '' })
+    : { status: '', provider: '', model: '' };
   let entries = [];
   let total = 0;      // 明细总量（未过滤）
   let matched = 0;    // 命中筛选条件的条数
@@ -260,13 +270,38 @@
     return (Number(entry?.status) || 0) === 0 && !entry?.error;
   }
 
+  /**
+   * 状态列。
+   *
+   * ── 进行中为什么不是一枚徽章而是「徽章 + 阶段计时」两行（本次改造）──
+   * 改造前这里只有一枚「进行中」：它只回答「跑没跑完」，用户盯着一条卡住的
+   * 请求时真正要问的是**卡在哪一步**（连上游 / 等模型出首字 / 正在刷内容 /
+   * 正在重试换号），四个阶段的排查方向完全不同。现在第一行是阶段徽章
+   * （文案与配色见 `request-phase.js`，对标 OmniProxy 的四个阶段标签），
+   * 第二行是**当前阶段**已经持续了多久（`phaseElapsedMs`，服务端现算）——
+   * 与用时列的「总用时 + 首响」两行结构同一手法，两列各答一个问题。
+   *
+   * 没有阶段可读（旧行、更早版本写入的在途行）时徽章回落成「进行中」、
+   * 第二行整行省掉 —— 那时确实没有更细的事实可说。
+   */
   function statusCell(entry) {
     // 进行中：不走「失败」的红徽章 —— 它不是失败，只是还没收尾。
-    // 徽章带一枚呼吸的圆点（.req-live-dot，动画见 page-requests.css），
-    // 1 秒轮询每拍重绘时已用时也会跟着走，这个徽章就是「活着」的信号。
+    // 1 秒轮询每拍重绘，阶段计时这个数自然一秒一跳（与用时列的「已用时」同一手法）。
     if (isRunning(entry)) {
-      return `<span class="req-status"><span class="badge tag running" title="请求正在转发中，用时列显示的是已用时">`
-        + `<span class="req-live-dot" aria-hidden="true"></span>进行中</span></span>`;
+      // 阶段模块没就绪时回落成改造前的静态徽章（与重试列对 request-hover 的
+      // 可选链同一手法）：加载顺序本就是硬要求，但真出问题时整列不该空着
+      const phase = window.wbRequestPhase;
+      if (!phase) {
+        return '<span class="req-status"><span class="badge tag running"'
+          + ' title="请求正在转发中，用时列显示的是已用时">'
+          + '<span class="req-live-dot" aria-hidden="true"></span>进行中</span></span>';
+      }
+      const badge = phase.badgeHtml(entry);
+      const elapsed = phase.elapsedLineHtml(entry);
+      return '<span class="req-status">'
+        + `<span class="req-status-badge">${badge}</span>`
+        + (elapsed ? `<span class="req-status-line">${elapsed}</span>` : '')
+        + '</span>';
     }
     const status = Number(entry.status) || 0;
     const ok = isOk(entry);
@@ -305,9 +340,11 @@
    * 表头已经收窄成「重试」（见 headHtml 的说明），这一列只有 52px 宽：
    * 「敏感词」三个字会把标签撑得比「重试 N」还宽，两枚标签竖排时右边留一大块
    * 空白、列也容易被挤到换行。命中是**有没有**的问题，不是**几个字**的问题，
-   * 所以缩成一个「敏」字，完整含义交给两个既有出口：`title` 悬停提示与
-   * 点击/聚焦弹出的富文本面板（那里面仍然逐词列出命中明细，一个字都没少）。
+   * 所以缩成一个「敏」字，完整含义交给点击/聚焦弹出的富文本面板
+   * （那里面仍然逐词列出命中明细，一个字都没少）。
    * `aria-label` 补上完整说法，读屏软件不会只念出一个孤零零的「敏」。
+   * 两枚标签都不挂 `title`：面板已经给出完整明细，原生提示会与它叠在一起
+   * 重复一层（同一处同时冒出两个说明框）。
    *
    * ── 为什么标签是 button ──────────────────────────────────────
    * `cursor: help` 只对鼠标有意义；做成 button 之后键盘能 Tab 到、聚焦即弹出
@@ -331,8 +368,7 @@
       // 那个数字来自重试链（两者都读不到时退回不带次数）。
       const count = attempts > 1 ? attempts : countRetries(entry);
       tags.push(`<button type="button" class="badge tag warn req-hover-tag"`
-        + ` data-req-hover="chain" data-req-id="${esc(key)}"`
-        + ` title="查看每次尝试的提供商、账号与重试原因">`
+        + ` data-req-hover="chain" data-req-id="${esc(key)}">`
         + `重试${count > 1 ? ` ${count}` : ''}</button>`);
     }
     // 敏感词命中：判据是「命中表非空」（后端 sensitiveHits 字段）。
@@ -341,7 +377,7 @@
     if (Array.isArray(entry.sensitiveHits) && entry.sensitiveHits.length) {
       tags.push(`<button type="button" class="badge tag req-hover-tag sensitive"`
         + ` data-req-hover="sensitive" data-req-id="${esc(key)}"`
-        + ` title="命中了敏感词，点击查看明细" aria-label="命中了敏感词">敏</button>`);
+        + ` aria-label="命中了敏感词">敏</button>`);
     }
     if (!tags.length) return '<span class="req-none">-</span>';
     return `<span class="req-retry">${tags.join('')}</span>`;
@@ -419,6 +455,15 @@
    * 不一致（映射 / 备援按家改写发生过）→ 两行：
    *   ⬆️ 上游实际收到的模型名（主读数，在上）
    *   ⬇️ 下游请求的模型名（次读数，淡一档，在下）
+   *
+   * 推理等级：模型名后带 `(等级)` 后缀，如 `glm-5.3-flash(max)` ——
+   *   - 上游行 = upstreamReasoning（实际随上游请求发出的等级：映射绑定的
+   *     或客户端显式指定的，经承载家归一后的值）
+   *   - 下游行 = clientReasoning（客户端请求体里显式指定的等级）
+   *   - 单行（无映射）时两者指同一个模型，优先显示上游等级（它是真正发出去
+   *     的档位），没有（客户端没指定且映射没绑 / 承载家不接）回退下游等级
+   *   - 两键都为空串 = 无等级随行，只显示模型名（与既有显示一致）；
+   *     旧数据没有这两个键，同样落到这里
    * 双名缺失时退回单行：`model` 缺失或旧数据没有 clientModel / upstreamModel
    * （这两个键是后加的），请求没走到上游的那次失败也没有上游名。
    */
@@ -426,12 +471,18 @@
     const client = String(entry.clientModel ?? '').trim();
     const upstream = String(entry.upstreamModel ?? '').trim();
     const shown = String(entry.model ?? '').trim();
+    const clientLevel = String(entry.clientReasoning ?? '').trim();
+    const upstreamLevel = String(entry.upstreamReasoning ?? '').trim();
+    const tag = (name, level) => (level ? `${name}(${level})` : name);
     if (!client || !upstream || upstream.toLowerCase() === client.toLowerCase()) {
-      return `<span class="req-model" title="${esc(shown)}">${esc(shown || '—')}</span>`;
+      const text = tag(shown, upstreamLevel || clientLevel);
+      return `<span class="req-model" title="${esc(text)}">${esc(text || '—')}</span>`;
     }
+    const upText = tag(upstream, upstreamLevel);
+    const downText = tag(client, clientLevel);
     return `<span class="req-model req-model-split">`
-      + `<span class="req-model-line" title="转发到上游的模型名">⬆️ ${esc(upstream)}</span>`
-      + `<span class="req-model-line sub" title="下游请求的模型名">⬇️ ${esc(client)}</span></span>`;
+      + `<span class="req-model-line" title="${esc(`转发到上游的模型：${upText}`)}">⬆️ ${esc(upText)}</span>`
+      + `<span class="req-model-line sub" title="${esc(`下游请求的模型：${downText}`)}">⬇️ ${esc(downText)}</span></span>`;
   }
 
   /**
@@ -600,6 +651,23 @@
   }
 
   /**
+   * 整表重绘列表：替换 `innerHTML` 前后通知悬停面板，让它把锚点迁到新节点上
+   * （见 request-hover.js 的 beforeListRedraw / afterListRedraw）。
+   *
+   * ── 为什么重绘要通知面板（本次修复）─────────────────────────
+   * 本页默认 1 秒一拍自动刷新，每次响应都整表重绘：旧标签全部脱离文档。
+   * 而悬停面板的打开有 150ms 延迟 —— 重绘恰好落在延迟窗口里时，面板会拿
+   * 游离节点当锚点：位置量成全 0、落在视口左上角，而且游离节点收不到
+   * pointerout，开了就不会自己关。通知之后，面板按「标签种类 + 行身份键」
+   * 找回新节点，位置与内容都跟着新一屏走；这一行被挤出当前页才收起。
+   */
+  function paintList(list, html) {
+    window.wbRequestHover?.beforeListRedraw?.();
+    list.innerHTML = html;
+    window.wbRequestHover?.afterListRedraw?.();
+  }
+
+  /**
    * 渲染请求日志。errorText 有值时列表位置显示错误文案，**不动**计数与页码 ——
    * 那组读数是上一次成功加载的结果，写 0 会让人以为明细被删了；
    * 徽标退成「—」表示「现在这个读数不可信」，比给一个假数字诚实。
@@ -610,17 +678,17 @@
     if (errorText) {
       const badge = $('req-badge');
       if (badge) { badge.className = 'badge'; badge.textContent = '—'; }
-      list.innerHTML = `<div class="log-empty">${esc(errorText)}</div>`;
+      paintList(list, `<div class="log-empty">${esc(errorText)}</div>`);
       return;
     }
     renderBadge();
     renderSummary();
     renderPager();
     if (!entries.length) {
-      list.innerHTML = `<div class="log-empty">${esc(emptyText())}</div>`;
+      paintList(list, `<div class="log-empty">${esc(emptyText())}</div>`);
       return;
     }
-    list.innerHTML = headHtml() + entries.map(rowHtml).join('');
+    paintList(list, headHtml() + entries.map(rowHtml).join(''));
   }
 
   // ─── 筛选下拉（提供商 / 模型）─────────────
@@ -637,10 +705,12 @@
    * 第一项（「全部提供商」/「全部模型」）由 HTML 声明，原样保留 ——
    * 它的文案是页面的一部分，不在数据里。
    */
-  function fillFilterSelect(id, items) {
+  function fillFilterSelect(id, items, desired) {
     const select = $(id);
     if (!select) return;
-    const current = select.value;
+    // desired（记忆恢复的值）优先于 DOM 当前值：候选清单是异步填的，
+    // 启动时先给 select 赋过一次值，在选项不存在时并不会被记住
+    const current = desired === undefined ? select.value : desired;
     const head = select.options[0];
     const headHtml = head ? head.outerHTML : '<option value="">全部</option>';
     const labels = new Map(items.map(item => [String(item.value), String(item.label)]));
@@ -679,12 +749,12 @@
       fillFilterSelect('req-provider', providers.map(item => ({
         value: String(item?.id || ''),
         label: String(item?.label || item?.id || ''),
-      })));
+      })), savedFilters.provider);
       const models = Array.isArray(filters?.models) ? filters.models : [];
       fillFilterSelect('req-model', models.map(name => ({
         value: String(name || ''),
         label: String(name || ''),
-      })));
+      })), savedFilters.model);
     } catch (error) {
       console.warn('读取请求日志筛选清单失败，筛选项退化为「全部」:', error.message);
     }
@@ -877,6 +947,10 @@
     item.classList.toggle('active', item.dataset.range === range);
   });
 
+  // 状态下拉的选项是静态 HTML，存过的值直接回填（提供商 / 模型两个下拉
+  // 的候选是异步的，走 fillFilterSelect 的 desired 入参，见 savedFilters）
+  if ($('req-status')) $('req-status').value = savedFilters.status;
+
   $('req-range')?.addEventListener('click', event => {
     const item = event.target.closest('.seg-item[data-range]');
     if (!item) return;
@@ -921,9 +995,14 @@
   });
 
   // 四个筛选维度都会换掉结果集，页码必须回到第 1 页，否则停的位置没有意义。
-  // 三个下拉共用一条绑定（它们的语义完全一致，逐个写三遍只会多三处要同步的地方）
+  // 三个下拉共用一条绑定（它们的语义完全一致，逐个写三遍只会多三处要同步的地方）；
+  // 变更同时落盘 —— 下次启动按同一批条件恢复（见 savedFilters 的说明）。
   for (const id of ['req-status', 'req-provider', 'req-model']) {
-    $(id)?.addEventListener('change', () => load({ resetPage: true }));
+    $(id)?.addEventListener('change', () => {
+      savedFilters[id.slice(4)] = $(id)?.value || '';
+      window.wbFilterMemory?.save(FILTERS_KEY, savedFilters);
+      void load({ resetPage: true });
+    });
   }
 
   // ─── 详情弹窗（上游原始报文）─────────────────

@@ -339,7 +339,7 @@
       + `<div class="rel-note-body"><div class="md-body">${html || '<p class="md-body-empty">这个版本没有填写发布说明。</p>'}</div>`
       + (pageUrl
         ? `<div class="rel-foot"><a href="${esc(pageUrl)}" data-external="${esc(pageUrl)}"`
-          + ' target="_blank" rel="noopener">在 GitHub 查看完整说明</a></div>'
+          + ` target="_blank" rel="noopener">在 GitHub 查看完整说明</a></div>`
         : '')
       + '</div></div>';
   }

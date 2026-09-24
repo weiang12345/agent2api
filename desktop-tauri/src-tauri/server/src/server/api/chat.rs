@@ -49,6 +49,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
 use crate::server::errors::GatewayError;
@@ -56,6 +57,7 @@ use crate::server::http::raw_json;
 use crate::server::logging;
 use crate::server::ServerState;
 
+use super::disconnect_guard::DisconnectGuard;
 use super::pipeline::{
     self, json_response, model_field_text, record_early_failure, record_entry, sse_response,
     write_debug_files, RecordContext, RecordingStream,
@@ -80,7 +82,7 @@ pub async fn chat_completions(
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(&state, started_at, "", &error);
+        record_early_failure(&state, started_at, "", "", &error);
         return error.payload_response();
     };
     // ② messages 必须是数组
@@ -91,7 +93,8 @@ pub async fn chat_completions(
     {
         let error = GatewayError::bad_request("缺少 messages 数组");
         let model = model_field_text(&payload);
-        record_early_failure(&state, started_at, &model, &error);
+        let reasoning = pipeline::client_reasoning_of(&payload);
+        record_early_failure(&state, started_at, &model, &reasoning, &error);
         return error.payload_response();
     }
 
@@ -113,10 +116,19 @@ pub async fn chat_completions(
     //    请求日志的「下游模型」显示的是客户端发来的名字，不是解析后的。
     //    第三参是这把 Key 的可用模型白名单（None = 不限制）
     let client_model = model_field_text(&payload);
+    // 下游等级与下游模型名同一时机采集（payload 被就地改写前；改写只动 model，
+    // 两边前后一致，见 client_reasoning_of 的说明）
+    let client_reasoning = pipeline::client_reasoning_of(&payload);
     let requested_model = match pipeline::resolve_model(&state, &mut payload, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &model_field_text(&payload), &error);
+            record_early_failure(
+                &state,
+                started_at,
+                &model_field_text(&payload),
+                &client_reasoning,
+                &error,
+            );
             return error.payload_response();
         }
     };
@@ -142,7 +154,25 @@ pub async fn chat_completions(
     let telemetry_id = telemetry.snapshot().id;
     state
         .request_stats()
-        .record_started(&telemetry_id, started_at, &requested_model, &client_model);
+        .record_started(
+            &telemetry_id,
+            started_at,
+            &requested_model,
+            &client_model,
+            &client_reasoning,
+        );
+    // ── 手动终止的取消令牌（本次新增）────────────────────────────
+    // 登记在进程级注册表里（键 = 上面这个 id），详情页的「终止请求」按它
+    // 找到这条在途请求；转发链的每个等待点 select 它。注销见
+    // `DisconnectGuard` 的两条出口（普通路径 / 流式路径的 settle）。
+    if let Some(token) = cancellation::register(&telemetry_id) {
+        telemetry.set_cancel_token(token);
+    }
+    // ── 断线兜底守卫（本次新增）──────────────────────────────────
+    // 客户端在响应产生前断开时 axum 会直接取消 handler，收尾记账走不到 ——
+    // 守卫的 Drop 补一条 408 终态（详见 `DisconnectGuard` 的说明）。
+    // 正常路径必须显式调 `complete()` / `handoff()`，见下面的三个出口。
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
     // 在途回写：选路一定就把「谁在承载」、发送体一定稿就把「上游真名」写进这条
     // 进行中行（连同尝试链、首响、脱敏命中）—— 列表页 1 秒轮询，于是这些读数在
     // 转发期间就能看到，不必等收尾。接线在这里、core 只持有闭包，理由见
@@ -181,6 +211,7 @@ pub async fn chat_completions(
                 started_at,
                 model: requested_model.clone(),
                 client_model: client_model.clone(),
+                client_reasoning: client_reasoning.clone(),
                 status: i64::from(status.as_u16()),
                 // 请求侧正文已抄好；响应侧由 RecordingStream 在流结束时定稿
                 raw_request,
@@ -188,6 +219,9 @@ pub async fn chat_completions(
             };
             // 收尾帧特征取 Chat 的：客户端读到 `data: [DONE]` 就停是常态写法，
             // 那时连接会被立刻关掉、`Drop` 不会被拉到 EOF（见 `RecordingStream`）
+            // 收尾移交给响应流：守卫不再兜底（流的 Drop 有自己的 settle），
+            // 取消令牌保持登记到流结束（长流仍可被「终止请求」终止）
+            guard.handoff();
             sse_response(
                 status,
                 Box::new(RecordingStream::with_terminals(
@@ -209,12 +243,15 @@ pub async fn chat_completions(
                     started_at,
                     model: requested_model.clone(),
                     client_model: client_model.clone(),
+                    client_reasoning: client_reasoning.clone(),
                     status: 200,
                     raw_request,
                     raw_response,
                 },
                 None,
             );
+            // 记账已完成：解除断线兜底并注销取消令牌（请求不再在途）
+            guard.complete();
             json_response(body)
         }
         Err(error) => {
@@ -233,6 +270,7 @@ pub async fn chat_completions(
                     started_at,
                     model: requested_model.clone(),
                     client_model: client_model.clone(),
+                    client_reasoning: client_reasoning.clone(),
                     status,
                     // 请求侧正文照存（失败请求的请求体同样是排障材料）；
                     // 响应体由网关自己生成（error 摘要已在明细里），不另存
@@ -241,6 +279,8 @@ pub async fn chat_completions(
                 },
                 Some(message),
             );
+            // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
+            guard.complete();
             error.payload_response()
         }
     }

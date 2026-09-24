@@ -168,6 +168,7 @@
       loadSettings(),
       loadRetention(),
       loadRetry(),
+      loadTimeouts(),
       loadDebug(),
       loadSanitize(),
       loadPrompt(),
@@ -256,8 +257,11 @@
       const result = await api.exportAccounts();
       if (result?.canceled) { toast('已取消导出'); return; }
       const count = Number(result?.count) || 0;
-      if (!count) { toast('没有可导出的账号', 'err'); return; }
-      toast(`✅ 已导出 ${count} 个账号${result?.file ? ` 到 ${result.file}` : ''}`);
+      const providers = Number(result?.customProviders) || 0;
+      if (!count && !providers) { toast('没有可导出的账号', 'err'); return; }
+      // v2 导出文件附带自定义提供商定义：账号为 0 但有定义时同样值得导
+      const providerNote = providers ? `、${providers} 个自定义提供商` : '';
+      toast(`✅ 已导出 ${count} 个账号${providerNote}${result?.file ? ` 到 ${result.file}` : ''}`);
     });
   }
 
@@ -272,18 +276,30 @@
       const skipped = Number(result?.skipped) || 0;
       const failed = Number(result?.failed) || 0;
       const errors = Array.isArray(result?.errors) ? result.errors : [];
+      const custom = result?.customProviders ?? {};
+      const customAdded = Number(custom.added) || 0;
+      const customUpdated = Number(custom.updated) || 0;
 
       const extras = [];
       if (skipped) extras.push(`跳过 ${skipped} 个`);
       if (failed) extras.push(`失败 ${failed} 个`);
       const suffix = extras.length ? `，${extras.join('、')}` : '';
-      const summary = `新增 ${added} 个、更新 ${updated} 个${suffix}`;
+      const providerNote = (customAdded || customUpdated)
+        ? `，自定义提供商新增 ${customAdded} 个、更新 ${customUpdated} 个`
+        : '';
+      const summary = `新增 ${added} 个、更新 ${updated} 个${suffix}${providerNote}`;
 
       if (failed) {
         toast(`导入完成：${summary}`, 'err');
-        // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致
+        // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致；
+        // 定义警告（customProvider 标记）没有账号语义，展示时注明归属
         const detail = errors.slice(0, 3)
-          .map(item => `${item?.id ?? '未知账号'}（${item?.message ?? '未知原因'}）`)
+          .map(item => {
+            const label = item?.customProvider
+              ? `自定义提供商 ${item?.id || '(无 id)'}`
+              : (item?.id ?? '未知账号');
+            return `${label}（${item?.message ?? '未知原因'}）`;
+          })
           .join('；');
         setIoResult(`<span style="color:var(--danger)">失败 ${failed} 个：${esc(detail)}${
           errors.length > 3 ? ' 等' : ''}</span>`);
@@ -291,8 +307,9 @@
         toast(`✅ 导入完成：${summary}`);
       }
 
-      // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数等
-      await wbApp.refresh?.();
+      // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数等；
+      // 自定义提供商定义有变化时同样要刷（分组名、模型清单都会变）
+      if (added || updated || customAdded || customUpdated) await wbApp.refresh?.();
     });
   }
 
@@ -554,137 +571,295 @@
     { key: 'retryIntervalSeconds', inputId: 'settings-retry-interval', label: '重试间隔', min: 0, max: 300 },
   ];
 
-  /** 最近一次从后端读到的生效值；为 null 表示后端不可用（此时输入框保持禁用） */
-  let retry = null;
+  // ─── 指定错误码直接换号（标签输入）────────────
+  //
+  // GitHub Topics 同款交互：框里是已添加的状态码徽章 + 一个行内输入框，
+  // 回车添加、点 × 删除（输入框为空时退格删最后一枚）。每次增删立即 PUT
+  // —— 与三个数字框「改完即存」的节奏一致，不做「再点一次保存」。
+  const NO_RETRY_CODES_KEY = 'noRetryStatusCodes';
+  const TAG_BOX_ID = 'settings-retry-no-codes';
+  const TAG_FIELD_ID = 'settings-retry-no-codes-input';
+  /** 状态码的合法范围与名单上限：与后端 retry_api.rs 的校验逐字同源 */
+  const RETRY_CODE_MIN = 100;
+  const RETRY_CODE_MAX = 599;
+  const RETRY_MAX_CODES = 50;
 
-  function retryInputs() {
-    return RETRY_FIELDS.map(field => $(field.inputId)).filter(Boolean);
-  }
+  /** 最近一次从后端拿到的名单（数字数组）；整个重试设置不可用时为 null */
+  let noRetryCodes = null;
 
-  /**
-   * 按后端返回值回填（与 renderRetention 同一套口径）：传 null 整块标
-   * 「不可用」并锁住输入；传对象只采纳范围内的整数，缺字段沿用上一轮的
-   * 有效值；正在编辑的那一项不回填，避免冲掉用户敲到一半的数字。
-   */
-  function renderRetry(data) {
-    const badge = $('retry-badge');
-    const inputs = retryInputs();
-    if (!badge || inputs.length !== RETRY_FIELDS.length) return;
+  // ─── 数字型设置面板的通用壳（请求重试 / 请求超时共用）────────
+  //
+  // 一个「后端存一份全量值 + 页面上若干数字输入框」的面板壳：加载回填、
+  // 逐框保存、失败回滚、后端不可用时整块禁用。请求重试与请求超时的交互
+  // **逐字相同**（都是「多字段 + 允许部分更新 + 返回全量值」那类端点），
+  // 两处各写一份必然漂。数据保留（retention）不并入 —— 它有二次确认与
+  // 清理数据的副作用，语义不同。
+  //
+  // `syncExtras(data | null)`：本壳只管数字框；同一面板里还有别的控件的
+  // （重试面板的「指定错误码直接换号」标签输入）由各自的页面代码实现，在
+  // 数据到达 / 不可用时被回调一次。
+  function numericPanel({ fields, badgeId, consoleLabel, get, save, syncExtras }) {
+    /** 最近一次读到的生效值；null = 后端不可用（此时输入框保持禁用） */
+    let values = null;
 
-    if (!data || typeof data !== 'object') {
-      retry = null;
-      badge.className = 'badge bad';
-      badge.textContent = '不可用';
-      inputs.forEach(input => { input.value = ''; input.disabled = true; });
-      return;
+    const inputs = () => fields.map(field => $(field.inputId)).filter(Boolean);
+
+    /** 回滚到已知的生效值；从未成功读到过就留空，不编一个假值填回去 */
+    function revert(field) {
+      const input = $(field.inputId);
+      if (!input) return;
+      const known = values?.[field.key];
+      input.value = Number.isInteger(known) ? String(known) : '';
     }
 
-    const next = { ...(retry || {}) };
-    RETRY_FIELDS.forEach(field => {
-      const value = Number(data[field.key]);
-      if (Number.isInteger(value) && value >= field.min && value <= field.max) {
-        next[field.key] = value;
+    /**
+     * 按后端返回值回填（与数据保留同一套口径）：传 null 整块标「不可用」并
+     * 锁住输入；传对象只采纳范围内的整数，缺字段沿用上一轮的有效值；
+     * 正在编辑的那一项不回填，避免冲掉用户敲到一半的数字。
+     */
+    function render(data) {
+      const badge = $(badgeId);
+      const boxes = inputs();
+      if (!badge || boxes.length !== fields.length) return;
+
+      if (!data || typeof data !== 'object') {
+        values = null;
+        syncExtras?.(null);
+        badge.className = 'badge bad';
+        badge.textContent = '不可用';
+        boxes.forEach(input => { input.value = ''; input.disabled = true; });
+        return;
       }
-    });
 
-    // 三项都拿不到有效值（换壳后接口形状变了之类）：按不可用处理，
-    // 不让两只空输入框留在页面上
-    if (!RETRY_FIELDS.some(field => Number.isInteger(next[field.key]))) {
-      renderRetry(null);
-      return;
-    }
-
-    retry = next;
-    RETRY_FIELDS.forEach((field, index) => {
-      const input = inputs[index];
-      const value = next[field.key];
-      if (!Number.isInteger(value)) return;
-      input.disabled = false;
-      if (document.activeElement !== input) input.value = String(value);
-    });
-    badge.className = 'badge ok';
-    badge.textContent = '已生效';
-  }
-
-  async function loadRetry() {
-    try {
-      renderRetry(await api.getRetry());
-    } catch (error) {
-      console.warn('读取请求重试设置失败:', error.message);
-      renderRetry(null);
-    }
-  }
-
-  /** 回滚到已知的生效值；从未成功读到过就留空，不编一个假值填回去 */
-  function revertRetryInput(field) {
-    const input = $(field.inputId);
-    if (!input) return;
-    const known = retry?.[field.key];
-    input.value = Number.isInteger(known) ? String(known) : '';
-  }
-
-  /**
-   * 前端校验：0–max 的整数（后端也会挡，这里先挡省一次往返）。
-   * 与 parseRetentionDays 同一写法：用 /^\d+$/ 而不是 Number()，
-   * 把 "1e2" / "0x10" 这类非直觉输入直接判非法。
-   */
-  function parseRetryValue(field, raw) {
-    const text = String(raw ?? '').trim();
-    if (!text) return { ok: false, message: `${field.label}不能为空（可填 ${field.min}–${field.max}）` };
-    if (!/^\d+$/.test(text)) return { ok: false, message: `${field.label}必须是整数` };
-    const value = Number(text);
-    if (value < field.min || value > field.max) {
-      return { ok: false, message: `${field.label}必须在 ${field.min}–${field.max} 之间（当前填的是 ${text}）` };
-    }
-    return { ok: true, value };
-  }
-
-  /** 单个输入框的提交流程：校验 → 提交，失败回滚原值（保留期同款，少一道确认） */
-  async function saveRetryField(field, input) {
-    if (panelBusy) { revertRetryInput(field); return; }
-
-    const parsed = parseRetryValue(field, input.value);
-    if (!parsed.ok) {
-      toast(parsed.message, 'err');
-      revertRetryInput(field);
-      return;
-    }
-
-    const known = retry?.[field.key];
-    // 值与后端一致就不发请求：数字框里换个写法（如 05）也会触发 change
-    if (Number.isInteger(known) && parsed.value === known) { input.value = String(known); return; }
-
-    panelBusy = true;
-    // 乐观写入待保存的值（理由同 commitRetention：disabled 触发的 blur 可能
-    // 补发 change，不先记新值会看到「刚改的数字闪回旧值」）
-    if (retry) retry = { ...retry, [field.key]: parsed.value };
-    const inputs = retryInputs();
-    inputs.forEach(element => { element.disabled = true; });
-    try {
-      const saved = await api.saveRetry({ [field.key]: parsed.value });
-      // PUT 契约上返回生效后的**三项**值（见 retry_api.rs 的 put_retry），
-      // 正常情况下用响应刷新即可，不必再跑一趟 GET
-      renderRetry(saved);
-      // 显式回填一次做规范化（用户可能敲了 "05" 或带空格）：renderRetry 会
-      // 跳过正在编辑的输入框，而失败时焦点多半还在这个框上
-      const applied = retry?.[field.key];
-      if (Number.isInteger(applied)) input.value = String(applied);
-      toast(`✅ 已保存：${field.label} ${applied ?? parsed.value}`);
-    } catch (error) {
-      // 400 的 message（点名哪个字段、超出多少）比自造一句更指向具体问题
-      toast(`保存失败：${error.message}`, 'err');
-      await loadRetry(); // 回滚到后端的真实值
-      revertRetryInput(field);
-    } finally {
-      panelBusy = false;
-      // 逐个按「有没有已知值」解禁：后端不可用时 renderRetry 会把它们留在禁用态
-      RETRY_FIELDS.forEach(item => {
-        if (Number.isInteger(retry?.[item.key])) {
-          const element = $(item.inputId);
-          if (element) element.disabled = false;
+      const next = { ...(values || {}) };
+      fields.forEach(field => {
+        const value = Number(data[field.key]);
+        if (Number.isInteger(value) && value >= field.min && value <= field.max) {
+          next[field.key] = value;
         }
       });
+
+      // 一项有效值都拿不到（换壳后接口形状变了之类）：按不可用处理，
+      // 不让一排空输入框留在页面上
+      if (!fields.some(field => Number.isInteger(next[field.key]))) {
+        render(null);
+        return;
+      }
+
+      values = next;
+      syncExtras?.(data);
+      fields.forEach((field, index) => {
+        const input = boxes[index];
+        const value = next[field.key];
+        if (!Number.isInteger(value)) return;
+        input.disabled = false;
+        if (document.activeElement !== input) input.value = String(value);
+      });
+      badge.className = 'badge ok';
+      badge.textContent = '已生效';
     }
+
+    async function load() {
+      try {
+        render(await get());
+      } catch (error) {
+        console.warn(`${consoleLabel}失败:`, error.message);
+        render(null);
+      }
+    }
+
+    /**
+     * 前端校验：min–max 的整数（后端也会挡，这里先挡省一次往返）。
+     * 与 parseRetentionDays 同一写法：用 /^\d+$/ 而不是 Number()，
+     * 把 "1e2" / "0x10" 这类非直觉输入直接判非法。
+     */
+    function parse(field, raw) {
+      const text = String(raw ?? '').trim();
+      if (!text) return { ok: false, message: `${field.label}不能为空（可填 ${field.min}–${field.max}）` };
+      if (!/^\d+$/.test(text)) return { ok: false, message: `${field.label}必须是整数` };
+      const value = Number(text);
+      if (value < field.min || value > field.max) {
+        return { ok: false, message: `${field.label}必须在 ${field.min}–${field.max} 之间（当前填的是 ${text}）` };
+      }
+      return { ok: true, value };
+    }
+
+    /** 单个输入框的提交流程：校验 → 提交，失败回滚原值（保留期同款，少一道确认） */
+    async function saveField(field, input) {
+      if (panelBusy) { revert(field); return; }
+
+      const parsed = parse(field, input.value);
+      if (!parsed.ok) {
+        toast(parsed.message, 'err');
+        revert(field);
+        return;
+      }
+
+      const known = values?.[field.key];
+      // 值与后端一致就不发请求：数字框里换个写法（如 05）也会触发 change
+      if (Number.isInteger(known) && parsed.value === known) { input.value = String(known); return; }
+
+      panelBusy = true;
+      // 乐观写入待保存的值（理由同 commitRetention：disabled 触发的 blur 可能
+      // 补发 change，不先记新值会看到「刚改的数字闪回旧值」）
+      if (values) values = { ...values, [field.key]: parsed.value };
+      inputs().forEach(element => { element.disabled = true; });
+      try {
+        const saved = await save({ [field.key]: parsed.value });
+        // PUT 契约返回生效后的全量值（见后端各 *_api.rs 的 put_*），
+        // 正常情况下用响应刷新即可，不必再跑一趟 GET
+        render(saved);
+        // 显式回填一次做规范化（用户可能敲了 "05" 或带空格）：render 会跳过
+        // 正在编辑的输入框，而失败时焦点多半还在这个框上
+        const applied = values?.[field.key];
+        if (Number.isInteger(applied)) input.value = String(applied);
+        toast(`✅ 已保存：${field.label} ${applied ?? parsed.value}`);
+      } catch (error) {
+        // 400 的 message（点名哪个字段、超出多少）比自造一句更指向具体问题
+        toast(`保存失败：${error.message}`, 'err');
+        await load(); // 回滚到后端的真实值
+        revert(field);
+      } finally {
+        panelBusy = false;
+        // 逐个按「有没有已知值」解禁：后端不可用时 render 会把它们留在禁用态
+        fields.forEach(item => {
+          if (Number.isInteger(values?.[item.key])) {
+            const element = $(item.inputId);
+            if (element) element.disabled = false;
+          }
+        });
+      }
+    }
+
+    /** 面板自己的事件绑定：change 提交、回车等价失焦（与保留期同一交互） */
+    function bind() {
+      fields.forEach(field => {
+        const input = $(field.inputId);
+        if (!input) return;
+        input.addEventListener('change', event => saveField(field, event.target));
+        input.addEventListener('keydown', event => {
+          if (event.key === 'Enter') input.blur();
+        });
+      });
+    }
+
+    return { load, render, revert, saveField, bind };
+  }
+
+  /** 请求重试面板（数字部分）。标签输入由下面 renderNoRetryCodes 那一段负责 */
+  const retryPanel = numericPanel({
+    fields: RETRY_FIELDS,
+    badgeId: 'retry-badge',
+    consoleLabel: '读取请求重试设置',
+    get: () => api.getRetry(),
+    save: patch => api.saveRetry(patch),
+    syncExtras: data => {
+      // 「指定错误码直接换号」的名单：只收 100–599 的整数项（后端已排序去重，
+      // 这里不再排序 —— 顺序就是后端给的）。键缺失（旧后端）时沿用上一轮的值，
+      // 不误判成「清空」；data 为 null（整块不可用）时清掉并锁住输入框。
+      if (data === null) {
+        noRetryCodes = null;
+        renderNoRetryCodes();
+        return;
+      }
+      if (Array.isArray(data[NO_RETRY_CODES_KEY])) {
+        noRetryCodes = data[NO_RETRY_CODES_KEY].filter(code =>
+          Number.isInteger(code) && code >= RETRY_CODE_MIN && code <= RETRY_CODE_MAX);
+      }
+      renderNoRetryCodes();
+    },
+  });
+
+  // 读取入口与「按响应重画」：标签输入那一段（保存名单后按后端响应重画）
+  // 与页面加载 / 刷新按钮共用这两个名字
+  const loadRetry = () => retryPanel.load();
+  const renderRetry = data => retryPanel.render(data);
+
+  // ─── 请求超时：四个阶段的等待上限 ──────────────
+  //
+  // 字段名必须与后端 config.rs 的 KEY_TIMEOUT_* **指向的 JSON 键**完全一致
+  // （大小写也一样），否则 PUT 会被当成「不认识的键」静默忽略 ——
+  // 界面提示保存成功，值却没变。四项的语义与默认值见 index.html 那段 tooltip。
+  const TIMEOUT_FIELDS = [
+    { key: 'connectTimeoutSeconds', inputId: 'settings-timeout-connect', label: '连接中超时', min: 1, max: 3600 },
+    { key: 'headersTimeoutSeconds', inputId: 'settings-timeout-headers', label: '等待响应超时', min: 1, max: 3600 },
+    { key: 'streamIdleTimeoutSeconds', inputId: 'settings-timeout-stream-idle', label: '流式响应空闲超时', min: 1, max: 3600 },
+    { key: 'bodyTimeoutSeconds', inputId: 'settings-timeout-body', label: '非流式响应超时', min: 1, max: 3600 },
+  ];
+
+  const timeoutsPanel = numericPanel({
+    fields: TIMEOUT_FIELDS,
+    badgeId: 'timeouts-badge',
+    consoleLabel: '读取请求超时设置',
+    get: () => api.getTimeouts(),
+    save: patch => api.saveTimeouts(patch),
+  });
+
+  /** 读取入口：加载时与各「刷新」按钮、保存失败回滚时调 */
+  const loadTimeouts = () => timeoutsPanel.load();
+
+  /**
+   * 「指定错误码直接换号」的界面：把 `noRetryCodes` 画成一排徽章（状态码 + ✕），
+   * 行内输入框永远留在最后（GitHub Topics 的形态）。徽章是动态的，
+   * 每次增删整排重画 —— 几十枚的量级，重建比逐个增删节点省心。
+   */
+  function renderNoRetryCodes() {
+    const box = $(TAG_BOX_ID);
+    const field = $(TAG_FIELD_ID);
+    if (!box || !field) return;
+    box.querySelectorAll('.tag-chip').forEach(node => node.remove());
+    for (const code of noRetryCodes || []) {
+      const chip = document.createElement('span');
+      chip.className = 'tag-chip';
+      chip.innerHTML = `<span class="v">${code}</span>`
+        + `<button type="button" class="tag-x" data-code="${code}" title="删除 ${code}" aria-label="删除状态码 ${code}">✕</button>`;
+      box.insertBefore(chip, field);
+    }
+    const disabled = noRetryCodes === null;
+    field.disabled = disabled;
+    box.classList.toggle('disabled', disabled);
+    field.placeholder = disabled ? '—' : '输入状态码，回车添加';
+  }
+
+  /** 增删后的统一提交：乐观更新本地值 → PUT → 用响应里的生效值重画 */
+  async function saveNoRetryCodes(codes) {
+    if (panelBusy) { renderNoRetryCodes(); return; }
+    noRetryCodes = codes;
+    renderNoRetryCodes();
+    panelBusy = true;
+    const field = $(TAG_FIELD_ID);
+    if (field) field.disabled = true;
+    try {
+      const saved = await api.saveRetry({ [NO_RETRY_CODES_KEY]: codes });
+      // PUT 契约返回生效后的全量值（含三个数字项），交给 renderRetry 统一回填，
+      // 顺带把徽章重画成后端确认的形态（排序去重后的结果）
+      renderRetry(saved);
+      toast('✅ 已保存：指定错误码直接换号');
+    } catch (error) {
+      toast(`保存失败：${error.message}`, 'err');
+      await loadRetry(); // 回滚到后端的真实值
+    } finally {
+      panelBusy = false;
+      renderNoRetryCodes();
+    }
+  }
+
+  /** 校验并添加一枚：整数、100–599、去重、限量（口径与后端 400 文案同源） */
+  function addNoRetryCode(raw) {
+    if (noRetryCodes === null) return;
+    const text = String(raw ?? '').trim();
+    if (!text) return;
+    if (!/^\d+$/.test(text) || Number(text) < RETRY_CODE_MIN || Number(text) > RETRY_CODE_MAX) {
+      toast(`状态码必须是 ${RETRY_CODE_MIN}–${RETRY_CODE_MAX} 的整数（收到: ${text}）`, 'err');
+      return;
+    }
+    const code = Number(text);
+    if (noRetryCodes.includes(code)) { toast(`状态码 ${code} 已在名单里`); return; }
+    if (noRetryCodes.length >= RETRY_MAX_CODES) {
+      toast(`名单最多 ${RETRY_MAX_CODES} 个状态码`, 'err');
+      return;
+    }
+    void saveNoRetryCodes([...noRetryCodes, code]);
   }
 
   // ─── 数据存储概况（只读） ──────────────────────
@@ -880,17 +1055,44 @@
 
   $('btn-retention-refresh')?.addEventListener('click', () => loadRetention().then(() => toast('保留天数已刷新')));
 
-  // 重试设置与保留天数同一交互：change 提交、回车等价失焦（理由见上）
-  RETRY_FIELDS.forEach(field => {
-    const input = $(field.inputId);
-    if (!input) return;
-    input.addEventListener('change', event => saveRetryField(field, event.target));
-    input.addEventListener('keydown', event => {
-      if (event.key === 'Enter') input.blur();
-    });
-  });
+  // 重试 / 超时设置与保留天数同一交互：change 提交、回车等价失焦（理由见上）。
+  // 绑定在各自的面板壳里（结构一致，新增一项只改字段表一处）
+  retryPanel.bind();
+  timeoutsPanel.bind();
 
   $('btn-retry-refresh')?.addEventListener('click', () => loadRetry().then(() => toast('重试设置已刷新')));
+  $('btn-timeouts-refresh')?.addEventListener('click', () => loadTimeouts().then(() => toast('超时设置已刷新')));
+
+  // 「指定错误码直接换号」标签输入：回车添加、空输入框上退格删最后一枚、
+  // 点 ×（或点框任意处聚焦输入框）。徽章是动态渲染的，删除走事件委托。
+  {
+    const box = $(TAG_BOX_ID);
+    const field = $(TAG_FIELD_ID);
+    box?.addEventListener('click', event => {
+      const remove = event.target.closest('.tag-x');
+      if (remove) {
+        const code = Number(remove.dataset.code);
+        if (noRetryCodes && noRetryCodes.includes(code)) {
+          void saveNoRetryCodes(noRetryCodes.filter(item => item !== code));
+        }
+        return;
+      }
+      // 点框体空白处 = 聚焦输入框（整框是一个输入控件的观感）
+      field?.focus();
+    });
+    field?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        addNoRetryCode(field.value);
+        field.value = '';
+        return;
+      }
+      // 与 GitHub Topics 一致：输入框为空时退格删掉最后一枚
+      if (event.key === 'Backspace' && !field.value && noRetryCodes?.length) {
+        void saveNoRetryCodes(noRetryCodes.slice(0, -1));
+      }
+    });
+  }
 
   // ─── 调试模式（上游原始报文的采集开关）──────────────────────
 
@@ -1189,12 +1391,15 @@
   // 改过配置目录后能立刻重读一次，不必重开程序。
   $('btn-storage-refresh')?.addEventListener('click', () => loadStorage().then(() => toast('存储概况已刷新')));
 
-  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderSanitize, renderPrompt, renderStorage };
+  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderSanitize, renderPrompt, renderStorage, showCategory };
 
-  // 重试设置同样在首次读到后端值之前保持禁用：空输入框既能被误改，
-  // 也会让「值与后端是否一致」的判断失真。读成功后由 renderRetry 解禁，
+  // 重试 / 超时设置同样在首次读到后端值之前保持禁用：空输入框既能被误改，
+  // 也会让「值与后端是否一致」的判断失真。读成功后由各自面板的 render 解禁，
   // 读失败则维持禁用并挂上「不可用」徽标
-  retryInputs().forEach(input => { input.disabled = true; });
+  for (const field of [...RETRY_FIELDS, ...TIMEOUT_FIELDS]) {
+    const input = $(field.inputId);
+    if (input) input.disabled = true;
+  }
   // 调试模式开关同理：读到后端值之前不许切（否则会出现「切了但不知道
   // 后端原本是什么」的状态，回滚也没依据）
   {

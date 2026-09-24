@@ -174,6 +174,12 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/stats/requests/raw",
             get(api::stats_api::stats_request_raw),
         )
+        // 手动终止一条在途请求（详情弹窗的「终止请求」按钮）。POST 且同样
+        // 排在通配之前 —— 顺序理由与上面两条相同
+        .route(
+            "/api/stats/requests/terminate",
+            post(api::stats_api::stats_request_terminate),
+        )
         // 清理弹窗的预览统计（将删明细数 / 带报文数 / 库占用 / 压缩状态）
         .route(
             "/api/stats/requests/clear-preview",
@@ -205,6 +211,13 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/retry",
             get(api::retry_api::get_retry).put(api::retry_api::put_retry),
+        )
+        // 上游请求超时（四项）：GET 读、PUT（允许部分字段）更新。
+        // 与 /api/retry 同一模式、同一理由独立成端点：保存后对下一个请求
+        // 立即生效（连接超时经由出网客户端，其余三项在各阶段自己的计时器上）。
+        .route(
+            "/api/timeouts",
+            get(api::timeouts_api::get_timeouts).put(api::timeouts_api::put_timeouts),
         )
         // ── 调试模式（设置页「通用 → 调试模式」）──
         // GET/PUT 开关；traffic 是按 id 取原始报文的详情端点（列表接口不返回

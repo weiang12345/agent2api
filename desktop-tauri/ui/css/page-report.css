@@ -142,7 +142,8 @@
    并排（每张约 450px 内宽），只有一维时剩下一张铺满整行（约 1000px 内宽）。
    前者给 200px 就得让条剩一百多像素；后者给 200px 则是白白浪费 —— 明明有
    一千像素，这一列还是把邮箱截掉，而它存在的全部意义就是让人认出账号。
-   所以按卡片宽度分档：窄卡（< 700px）200px，宽卡 300px。
+   所以按卡片宽度分档：窄卡（< 700px）200px，宽卡 420px（账号卡的名字前还有
+   一枚提供商徽章，上限按「徽章 + 名字」的总和给，理由写在容器查询那头）。
    用 container query 而不是媒体查询：要看的是**卡片**多宽，不是窗口多宽 ——
    窗口宽时两张卡各占一半，窗口窄时它们换行后各占满宽，同一个窗口宽度下
    卡片的实际宽度并不固定，只有问卡片自己才问得准。
@@ -202,10 +203,22 @@
   white-space: nowrap;
 }
 
+/* Top 账号行名字前的提供商徽章：与账号页「提供商」列同一枚（pbadge 的
+   样式住在 page-accounts-table.css，全局加载，这里只做行内适配）——
+   徽章比文字行盒高，基线对齐会显得下沉，改居中；右缘留一道与名字的间距。
+   名字过长被省略号截断时徽章完整保留，截的只是名字本身。 */
+.rank-row .name .pbadge {
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
 /* 卡片铺满整行时（另一维没数据、被隐藏）给名字列更宽的上限。
-   查询的是具名容器 rank，也就是卡片本身（见上面 .report-rank-grid > .panel）。 */
+   查询的是具名容器 rank，也就是卡片本身（见上面 .report-rank-grid > .panel）。
+   420px 的量级：徽章一枚就占 ~140px，账号名多是登录邮箱（20~30 字符 ≈ 230px），
+   300px 时徽章后只剩一百多像素，邮箱还是放不下 —— 上限要按「徽章 + 名字」
+   的总和给，账号名才有展示完整的余地。 */
 @container rank (min-width: 700px) {
-  .rank-row .name { max-width: 300px; }
+  .rank-row .name { max-width: 420px; }
 }
 
 /* 轨道：定高 + 圆角，与热力图格子同一档观感（都是「一格量化数据」） */
@@ -569,5 +582,5 @@
 
 /* 窄窗口（与侧栏收起同断点）：四个缓存窗口退成两列，页头筛选整行铺开 */
 @media (max-width: 900px) {
-  .page[data-page="overview"] .page-head .head-actions { flex-basis: 100%; margin-left: 0; justify-content: flex-start; }
+  .page[data-page="overview"] .panel-head .head-actions { flex-basis: 100%; margin-left: 0; justify-content: flex-start; }
 }

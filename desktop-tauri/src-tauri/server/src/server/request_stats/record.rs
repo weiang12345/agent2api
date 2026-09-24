@@ -181,6 +181,22 @@ pub struct RequestEntry {
     /// 「模型用量」里拆成「真名 + 各家别名」好几行。
     #[serde(rename = "upstreamModel", default)]
     pub upstream_model: String,
+    /// **下游请求体里**客户端显式指定的思考等级（如 `max`；空串 = 没指定，
+    /// 或该行来自还没有此列的旧版本）。识别键与归一规则见
+    /// `core::model_rules::reasoning::read_client_level`。
+    ///
+    /// 请求日志的模型列用它给下游模型名带上 `(等级)` 后缀；与 `upstream_reasoning`
+    /// 分开记，是因为「客户端要的档位」与「实际发给上游的档位」是两个读数
+    /// （客户端没指定时映射绑定可以补一个；承载家也可能归并档位）。
+    #[serde(rename = "clientReasoning", default)]
+    pub client_reasoning: String,
+    /// **实际随上游请求发出**的思考等级（空串 = 没有等级随行：客户端没指定且
+    /// 映射没绑、「关闭思考」档、或一次都没发出去就失败了；或该行来自还没有
+    /// 此列的旧版本）。客户端显式指定的等级字段原样随发送体上行（网关不删
+    /// 客户端字段），对每一家都算「实际随请求发出的等级」。采集口径见
+    /// `core::upstream::payload::send_body` —— 与 `upstream_model` 同点同时采集。
+    #[serde(rename = "upstreamReasoning", default)]
+    pub upstream_reasoning: String,
     /// **每一次上游尝试的明细**（`[{provider, status, error}]`，按发生顺序）。
     ///
     /// ── 与 `attempts` 的关系（这是本字段存在的全部理由）────────────
@@ -228,6 +244,34 @@ pub struct RequestEntry {
     /// 模式的原始报文（请求日志的「详情」列）比看那行日志更完整。
     #[serde(rename = "sensitiveHits", default)]
     pub sensitive_hits: Vec<SensitiveHit>,
+    /// **在途请求当前所处的转发阶段**（`connecting` / `waiting` / `streaming` /
+    /// `retrying`；空串 = 不在途 —— 终态行、旧行、转发前就失败的行）。
+    ///
+    /// 取值是 `core::upstream::usage::LogPhase::as_str()` 的字面量，与 OmniProxy
+    /// 的 `LogPhase` 逐字相同；前端按它选文案（连接中 / 等待响应 / 响应中 /
+    /// 重试中）与配色。
+    ///
+    /// ── 为什么与 status=0 同进同退 ──────────────────────────────
+    /// 阶段只在转发期间存在：收尾（成功、失败、断连兜底、僵尸清扫）一律把它
+    /// 清成空串。所以「有没有阶段」可以当「这一行还在跑」的第二个读数，但
+    /// 判据仍是 `status` 那一列（前端 `isRunning`）—— 阶段是**读数**，不是判据：
+    /// 库里万一出现「status=0 而阶段为空」的行（更早的版本写入），展示层回落成
+    /// 通用的「进行中」，不会因此把它当成终态。
+    ///
+    /// ── 为什么在结构体末尾 ──────────────────────────────────────
+    /// 与 `REQUEST_COLUMNS` / `decode_request` 的列序一致：这两个字段是 schema v6
+    /// 加的列，只有排在最后才不牵动前面所有 `row.get(n)` 的序号（那条纪律见
+    /// sql.rs 的列常量说明）。
+    #[serde(default)]
+    pub phase: String,
+    /// **进入当前阶段**的时刻（毫秒时间戳，与 `ts` 同一口径；None = 不在途）。
+    ///
+    /// 本身不直接展示：`/api/stats/requests` 的响应里带的是**派生字段**
+    /// `phaseElapsedMs`（现算「现在 - 这里」，见 `report::entry_json`，
+    /// 与 `providerLabel` 同一手法）—— 让阶段计时与服务端时钟同源，
+    /// 浏览器时钟偏了也不会算出离谱的读数。
+    #[serde(rename = "phaseStartedAt", default)]
+    pub phase_started_at: Option<i64>,
 }
 
 /// 一个被命中的敏感词及其次数（存储契约）。
@@ -375,6 +419,11 @@ pub struct NewRequestEntry {
     pub client_model: String,
     /// 实际发给上游的模型名（空串 = 一次都没发出去 / 未记录）
     pub upstream_model: String,
+    /// 下游请求显式指定的思考等级（空串 = 没指定；见 `RequestEntry::client_reasoning`）
+    pub client_reasoning: String,
+    /// 实际随上游请求发出的思考等级（空串 = 没有等级随行；见
+    /// `RequestEntry::upstream_reasoning`）
+    pub upstream_reasoning: String,
     /// 每一次上游尝试的明细（见 `RequestEntry::attempt_details`）。
     /// 空表 = 一次都没发出去（转发前就失败）或采集侧没记上。
     pub attempt_details: Vec<AttemptDetail>,
@@ -403,6 +452,8 @@ impl NewRequestEntry {
             provider: None,
             client_model: String::new(),
             upstream_model: String::new(),
+            client_reasoning: String::new(),
+            upstream_reasoning: String::new(),
             id: String::new(),
             // 两条都是「有采集才有值」：转发前就失败的请求走 `record_early_failure`，
             // 那里构造的 telemetry 是空的，于是两个空表如实表达「没发生过尝试 /
@@ -461,6 +512,9 @@ impl NewRequestEntry {
             // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去
             client_model: self.client_model.trim().to_string(),
             upstream_model: self.upstream_model.trim().to_string(),
+            // 两个等级列同一口径：trim 后透传，空串 = 没有等级
+            client_reasoning: self.client_reasoning.trim().to_string(),
+            upstream_reasoning: self.upstream_reasoning.trim().to_string(),
             // ── 两个明细字段的归一（本次改造）───────────────────────
             // 都做「清掉空项 + 夹到合理形状」，让读侧（SQL false 编码、前端渲染）
             // 拿到的永远是可直接消费的表：
@@ -506,6 +560,11 @@ impl NewRequestEntry {
                 })
                 .filter(|hit| !hit.word.is_empty())
                 .collect(),
+            // 终态行的两个阶段列恒为空：阶段是**在途**读数（合法值只有
+            // `LogPhase` 的四个字面量），一条已经收尾的行没有「当前阶段」——
+            // 写入侧不给值，读侧也就不必为「终态行带着阶段」写分支
+            phase: String::new(),
+            phase_started_at: None,
         }
     }
 }
@@ -544,11 +603,25 @@ pub struct RunningProgress {
     pub account_name: String,
     /// 实际发给上游的模型名（发送体定稿后才有值，空串 = 还没发出去）
     pub upstream_model: String,
+    /// 实际随上游请求发出的思考等级（与 `upstream_model` 同点同时采集，
+    /// 空串 = 还没有等级随行；口径见 `RequestEntry::upstream_reasoning`）
+    pub upstream_reasoning: String,
     /// 到此刻为止**已经发出去**的账号数（口径同 `TelemetrySnapshot::attempts`，
     /// 恒 ≥1；前端「重试」列的标签与悬停面板的「共 N 次尝试」读它）
     pub attempts: i64,
     /// 首响：上游首帧到达相对请求开始的毫秒数（None = 首帧还没到）
     pub first_response_ms: Option<i64>,
+    /// 当前阶段（`connecting` / `waiting` / `streaming` / `retrying`，
+    /// 见 `RequestEntry::phase`）—— 转发链路每换一个阶段回写一次。
+    ///
+    /// 为什么回收写**一定**带阶段：阶段是「现在在哪一步」的读数，它必须跟着
+    /// 同一次状态变化一起落库；拆成两次写（先写阶段的几列、再写别的）会让读侧
+    /// 有机会看到「上一轮的数据 + 这一轮的阶段」这种不存在的组合。
+    pub phase: String,
+    /// 进入当前阶段的时刻（毫秒时间戳）。除「连接中」之外，每次换阶段都有值；
+    /// 「连接中」的起点是**请求开始时刻**，由在途回写用记账点的 `started_at`
+    /// 兜底（见 `api::pipeline::live_row_sink`）。
+    pub phase_started_at: Option<i64>,
     /// 到此刻为止的尝试明细（含**还没定局**的那一轮：`status` / `error` 都为空
     /// —— 前端据此把最后一条渲染成「进行中」，见 `ui/request-hover.js`）
     pub attempt_details: Vec<AttemptDetail>,

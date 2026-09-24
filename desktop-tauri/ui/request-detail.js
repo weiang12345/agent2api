@@ -1,5 +1,5 @@
 /* Agent2API · 请求日志的详情弹窗（请求详情 / 预览对话 / 原始报文 · 三标签） */
-/* global workbuddyDesktop, wbApp, wbConversationPreview */
+/* global workbuddyDesktop, wbApp, wbConversationPreview, wbRequestPhase */
 
 /**
  * 「请求日志」页的**详情弹窗**，三个标签（参考 OmniProxy 的
@@ -29,6 +29,13 @@
  * 委托之外的**所有**弹窗逻辑都在本文件（它独占 #req-detail-modal 那组 DOM）。
  * 列表的格式化函数（时间 / 耗时 / 状态徽章等）是那个 IIFE 的私有成员，这里
  * 按同一口径各有一份小实现 —— 两边的判据注释里互相指认，改口径时一起改。
+ *
+ * ── 终止请求（本次新增，参考 OmniProxy 的 RequestLogs 终止按钮）────
+ * 行仍处于进行中（`isRunning`）时，弹窗底部显示「终止请求」：确认后调
+ * `terminateStatsRequest(id)` 让后端置位这条请求的取消令牌，转发链会立即
+ * 断开上游并按「请求已被手动终止」收尾（408）。本文件**不做乐观更新** ——
+ * 列表的自动刷新会把那一行刷成终态，弹窗只负责禁掉按钮并在 hint 里说明；
+ * 不在进行中（或来自上次启动的遗留行）时后端给 404，hint 如实展示原因。
  */
 (() => {
   const api = workbuddyDesktop;
@@ -98,6 +105,54 @@
     return typeof value === 'object' && value !== null && !Array.isArray(value);
   }
 
+  // ─── 终止请求（底部按钮，仅进行中的行可见）────
+
+  /**
+   * 同步「终止请求」按钮的可见性：只有行仍处于进行中时才显示 ——
+   * 已结束的行点了只会拿到后端的 404，提前藏起来比让用户白点一次好。
+   * 每次 open 调用一次；终止受理成功后只置 disabled（不重画，见 terminateCurrent）。
+   */
+  function syncTerminateButton() {
+    const button = $('req-detail-terminate');
+    if (!button) return;
+    button.hidden = !isRunning(view?.row);
+    button.disabled = false;
+    button.textContent = '终止请求';
+  }
+
+  /**
+   * 终止当前这条进行中的请求：确认 → 调后端置位取消令牌。
+   *
+   * **不做乐观更新**：真正的收尾（断开上游、把明细写成 408「请求已被手动
+   * 终止」）由转发链完成，列表的 1 秒轮询会把那一行刷成终态；这里受理成功
+   * 就把按钮禁掉（防连点），并在 hint 里说明接下来会发生什么。
+   * 失败（404 = 已结束 / 上次启动遗留的行；网络错误）如实展示原因并放开按钮。
+   */
+  async function terminateCurrent() {
+    const button = $('req-detail-terminate');
+    const hint = $('req-detail-hint');
+    const id = view?.id;
+    if (!id || !isRunning(view?.row)) return;
+    // 危险操作走自绘确认弹窗（原生 confirm 在 Tauri WebView 里不弹窗，见 app.js）
+    const ok = await window.wbConfirm?.ask?.({
+      title: '终止请求',
+      html: '确定终止这条正在转发的请求？<br>上游连接会立即断开，明细将记为「请求已被手动终止」。',
+      okText: '终止',
+      okClass: 'danger',
+    });
+    if (!ok) return;
+    if (button) button.disabled = true;
+    try {
+      await api.terminateStatsRequest(id);
+      if (hint) {
+        hint.textContent = '已受理终止：上游连接已断开，列表稍后刷新为「请求已被手动终止」';
+      }
+    } catch (error) {
+      if (button) button.disabled = false;
+      if (hint) hint.textContent = `终止失败：${error?.message || error}`;
+    }
+  }
+
   // ─── 标签定义与状态 ──────────────────────────
 
   /**
@@ -160,12 +215,22 @@
   // ─── 标签 ①：请求详情（数据全部来自 row）──────
 
   /**
-   * 状态徽章：与列表 statusCell 同款（进行中带呼吸点、2xx 带摘要给 title）。
-   * 判据（isRunning / isOk）是上面那两个镜像函数，文案与结构逐字同源。
+   * 状态徽章：与列表 statusCell 同款 —— 进行中交给 `request-phase.js`
+   * （阶段徽章：连接中 / 等待响应 / 响应中 / 重试中，没有阶段时回落「进行中」，
+   * 后面缀一段当前阶段的计时），2xx 带摘要时给 title 说明失败在响应体阶段。
+   * 判据（isRunning / isOk）是上面那两个镜像函数，结构与列表逐字同源。
    */
   function statusBadgeHtml(row) {
     if (isRunning(row)) {
-      return `<span class="badge tag running"><span class="req-live-dot" aria-hidden="true"></span>进行中</span>`;
+      const phase = window.wbRequestPhase;
+      if (!phase) {
+        return '<span class="badge tag running"'
+          + ' title="请求正在转发中，用时列显示的是已用时">'
+          + '<span class="req-live-dot" aria-hidden="true"></span>进行中</span>';
+      }
+      const elapsed = phase.elapsedLineHtml(row);
+      return `${phase.badgeHtml(row)}`
+        + (elapsed ? `<span class="req-detail-sub">${elapsed}</span>` : '');
     }
     const status = Number(row.status) || 0;
     const ok = isOk(row);
@@ -178,17 +243,24 @@
   /**
    * 模型：与列表 modelCell 同口径 —— 下游 / 上游双名齐全且不同时两行
    * （⬆️ 上游实际收到的 / ⬇️ 下游请求的），否则回落 `model` 单行。
+   * 推理等级同列表：模型名带 `(等级)` 后缀（上游 = 实际发出的等级，
+   * 下游 = 客户端指定的等级；空串 = 无等级随行，与旧行为一致）。
    */
   function modelHtml(row) {
     const client = String(row.clientModel ?? '').trim();
     const upstream = String(row.upstreamModel ?? '').trim();
     const shown = String(row.model ?? '').trim();
+    const clientLevel = String(row.clientReasoning ?? '').trim();
+    const upstreamLevel = String(row.upstreamReasoning ?? '').trim();
+    const tag = (name, level) => (level ? `${name}(${level})` : name);
     if (!client || !upstream || upstream.toLowerCase() === client.toLowerCase()) {
-      return esc(shown || '—');
+      return esc(tag(shown, upstreamLevel || clientLevel) || '—');
     }
+    const upText = tag(upstream, upstreamLevel);
+    const downText = tag(client, clientLevel);
     return `<span class="req-detail-model-split">`
-      + `<span title="转发到上游的模型名">⬆️ ${esc(upstream)}</span>`
-      + `<span class="sub" title="下游请求的模型名">⬇️ ${esc(client)}</span></span>`;
+      + `<span title="转发到上游的模型：${esc(upText)}">⬆️ ${esc(upText)}</span>`
+      + `<span class="sub" title="下游请求的模型：${esc(downText)}">⬇️ ${esc(downText)}</span></span>`;
   }
 
   /** 令牌一行：输入 / 输出 / 总计 / 缓存读（0 显示 0 —— 与列表的数字格式一致） */
@@ -227,7 +299,14 @@
         ? `↻ ${retries.length} 次`
         : '-';
       const retryTitle = retries.length
-        ? retries.map((retry, i) => `第 ${i + 1} 次：${String(retry?.reason || '未知原因')}`).join('\n')
+        ? retries.map((retry) => {
+            const reason = String(retry?.reason || '未知原因');
+            const delayMs = Number(retry?.delayMs);
+            const delay = Number.isFinite(delayMs) && delayMs > 0
+              ? `，${delayMs >= 1000 ? `${Math.round(delayMs / 1000)}秒` : `${Math.round(delayMs)}毫秒`}后重试`
+              : '';
+            return `${reason}${delay}`;
+          }).join('\n')
         : '';
       const notice = String(item?.notice ?? '').trim();
       return `<tr>`
@@ -457,6 +536,7 @@
     modal.classList.add('open');
     document.addEventListener('keydown', onKeydown);
     renderAll();
+    syncTerminateButton();
     // 两个数据源并行拉，谁到了渲染谁（各自只动自己的 pane）
     void loadRaw(id, token);
     void loadDebug(id, token);
@@ -469,6 +549,10 @@
 
   $('req-detail-close')?.addEventListener('click', close);
   $('req-detail-cancel')?.addEventListener('click', close);
+  // 终止请求（底部按钮，静态 DOM —— 直接绑，不走委托）
+  $('req-detail-terminate')?.addEventListener('click', () => {
+    void terminateCurrent();
+  });
   $('req-detail-modal')?.addEventListener('click', event => {
     // 点遮罩关闭（与确认弹窗同一交互）
     if (event.target === $('req-detail-modal')) close();

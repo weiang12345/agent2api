@@ -352,8 +352,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         // 两个地区走**同一份实现**、按地区参数化（`autoclaw::region`）：账号集合
         // 按 provider 隔离，因此这里的 kind → region 必须逐字对应，不能让国际版
         // 落进国内版的记录里（那会让两家的账号在同一分组里混着，选路也按错误的
-        // 域名发请求）。`importDesktop` 只对国内版有意义 —— 那个文件没有地区
-        // 标记，国际版分支会在存储层明确拒绝（见 `import_autoclaw_desktop_account`）。
+        // 域名发请求）。`importDesktop` 两地都给：桌面端那个 auth.json 没有地区
+        // 标记、两个构建共用，**地区由用户选的那一项决定**（见
+        // `import_autoclaw_desktop_account` 与 `region.rs` 的完整讨论）。
         Some(kind @ (crate::server::core::providers::ProviderKind::AutoClaw
             | crate::server::core::providers::ProviderKind::AutoClawIntl)) => {
             let region = crate::server::core::providers::autoclaw::Region::from_kind(kind)
@@ -447,10 +448,28 @@ pub async fn import_accounts(state: &ServerState, body: &Bytes) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
+    // 兼容管理 API 的 `{ success, data }` 信封壳：网页端此前的「导出」把整个
+    // 信封存成了文件，顶层没有 accounts。这类文件导回时在这里下钻一层 ——
+    // 已发出的旧文件不作废；标准导出文件（顶层就是 accounts）不受影响。
+    let payload = match envelope_data(&payload) {
+        Some(data) => data,
+        None => payload,
+    };
     match crate::server::core::account_transfer::import_accounts(state.store(), &payload) {
         Ok(result) => ok_json(result),
         Err(error) => store_error(error),
     }
+}
+
+/// 若 `payload` 是「信封壳」（对象、顶层无 accounts、`data` 字段是含 accounts
+/// 的对象）则返回内层 data 的克隆，否则 None。
+fn envelope_data(payload: &Value) -> Option<Value> {
+    let object = payload.as_object()?;
+    if object.contains_key("accounts") {
+        return None;
+    }
+    let data = object.get("data")?;
+    data.get("accounts").is_some().then(|| data.clone())
 }
 
 // ─── POST /api/accounts/current ─────────────────────────────

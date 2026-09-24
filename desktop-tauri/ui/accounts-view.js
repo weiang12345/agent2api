@@ -67,6 +67,12 @@
    * 重绘期间把它置真、结束置假，commitPriority 见真就跳过。
    */
   let rendering = false;
+  /**
+   * 代理列出口列表的自愈节流（见 render 尾部）：读取失败后要等一段时间再试。
+   * 没有它，「失败 → 重画 → 又拉」会变成死循环；有它，Clash / IPC 恢复后
+   * 最多半分钟列表自己补上（读取结果缓存在 proxy-form 的模块级缓存里）。
+   */
+  let clashRetryAt = 0;
   /** accountId -> 活跃请求数（只留 >0 的；见下方「连接数（实时）」一节） */
   const connectionsMap = new Map();
 
@@ -199,6 +205,26 @@
     // renderBatchBar 里那次同步发生在 innerHTML 赋值之前，只能改到上一版表格里的
     // 那个复选框（此刻已被换掉），所以这里补一次。
     syncSelectAllBoxes(lastVisibleIds);
+
+    // 代理列的下拉选项来自 Clash 出口列表（proxy-form 的模块级缓存）：还没就绪
+    // 就补拉（并发由 proxy-form 合并，失败不缓存）。成功重画一次，把出口补进
+    // 所有行；失败也重画一次——把「读取失败」的说明项画出来（否则用户只看到
+    // 「直连 / 自定义代理…」两项，根本不知道少了一批），随后按 30 秒节流再试，
+    // 避免「失败 → 重画 → 又拉」的死循环。
+    if (!window.wbProxyForm?.clashSnapshot?.() && Date.now() >= clashRetryAt) {
+      clashRetryAt = Date.now() + 30_000;
+      const loader = window.wbProxyForm?.clashOptions;
+      if (typeof loader === 'function') {
+        void loader()
+          .then(() => { clashRetryAt = 0; render(); })
+          .catch(() => render());
+      } else {
+        // 工具模块没挂上（加载失败等）：本页面会话内不再尝试，并告警一次 ——
+        // 别让「代理列静默地少一批选项」成为无迹可查的现象
+        clashRetryAt = Infinity;
+        console.warn('[accounts] wbProxyForm 未提供 clashOptions：代理列的 Clash 出口列表不可用');
+      }
+    }
   }
 
   /**
@@ -261,15 +287,6 @@
       box.closest('tr.acct-row')?.classList.toggle('selected', picked);
     });
     renderBatchBar(accounts(), lastVisibleIds);
-  }
-
-  /** 导航上的账号数徽标（总数：这是「我总共有几个登录态」，与家数无关） */
-  function renderNavCount() {
-    const all = accounts();
-    const badge = $('nav-count-accounts');
-    if (!badge) return;
-    badge.textContent = String(all.length);
-    badge.classList.toggle('muted', all.length === 0);
   }
 
   /** 清掉已删除账号的本地缓存（缓存本体在 usage-actions.js，展开态在本文件） */
@@ -572,6 +589,14 @@
       }
       closeMoreMenu();
 
+      // 表头那颗眼睛：切换「账号名显示为星号」，整表重绘一次到位
+      // （表头图标与每行的名字都随重绘换到新状态）
+      if (action === 'toggle-names') {
+        table.toggleNamesHidden();
+        render();
+        return;
+      }
+
       if (action === 'move-up' || action === 'move-down') {
         button.disabled = true;
         try {
@@ -593,7 +618,7 @@
         // 点「余额」按钮即展开明细；已展开时再点则收起（当成开关用）。
         // 这颗按钮本次改造从余额列挪进了操作列（见 accounts-table.js 的
         // actionsCell），但**这里一行都不用改** —— 委托靠 data-action 匹配，
-        // 与它渲染在哪一格无关。批量那颗「查询积分」走的是
+        // 与它渲染在哪一格无关。批量那颗「查询余额」走的是
         // usage-actions.js 的 queryAllUsage，两处的展开态判据是同一份
         // （openPanels，见那边「唯一判据来源」的说明）。
         const wasOpen = panelOpen(id, 'usage');
@@ -646,6 +671,44 @@
         toast(`操作失败：${message}`, 'err');
         // 失败时把开关拨回去：界面上不能留一个「已改」的假象
         void wbApp.refresh?.();
+      }
+    }
+
+    /**
+     * 代理下拉的保存（change 委托调它；列与两个特殊值的定义见 accounts-table 的
+     * proxyCell）。值只有两种：空串 = 直连（proxy 传 null），否则是 Clash 出口
+     * uid（`{source:'clash', listenerUid}`）——「自定义代理…」不是值而是动作：
+     * 把下拉恢复成原选中，再打开账号设置弹窗（完整代理表单在那里；保存后
+     * account-panel 自己刷新列表）。与开关同一条链：updateAccount 只传 proxy
+     * 一个字段，后端 apply_patch 只改它，成功后 refresh 重画（toast 直接用
+     * 后端回报的变更说明，与后端文案保持一份事实）。
+     */
+    async function applyProxyPick(select) {
+      const id = select.dataset.proxyPick;
+      const value = select.value;
+      if (value === table.PROXY_CUSTOM_EDIT) {
+        // 动作项：先恢复原值再开弹窗 —— 否则下拉会停在一个不存在的配置上
+        select.value = select.dataset.proxySelected || '';
+        window.wbApp.runAccountAction?.('settings', id);
+        return;
+      }
+      // 当前自定义配置的显示项：选它自己不是一次修改
+      if (value === table.PROXY_CUSTOM_CURRENT) return;
+      select.disabled = true;
+      try {
+        const proxy = value ? { source: 'clash', listenerUid: value } : null;
+        const result = await api.updateAccount(id, { proxy });
+        const change = Array.isArray(result?.changes) && result.changes.length
+          ? result.changes[0]
+          : '代理已更新';
+        toast(`✅ ${change}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        toast(`保存失败：${message}`, 'err');
+      } finally {
+        // 成败都重拉：成功让这格显示落库后的值，失败把下拉拨回原值
+        // （disabled 状态随重画一起被换掉）
+        await wbApp.refresh?.();
       }
     }
 
@@ -727,6 +790,9 @@
       }
       const toggle = event.target.closest('input[data-toggle]');
       if (toggle) void toggleAccountEnabled(toggle.dataset.toggle, toggle.checked);
+      // 代理列的下拉：选中即保存（见 applyProxyPick）
+      const proxyPick = event.target.closest('select[data-proxy-pick]');
+      if (proxyPick) void applyProxyPick(proxyPick);
     });
 
     // 全选 / 全不选：只作用于当前筛选结果（批量栏与表头两个入口同一条链）
@@ -766,7 +832,6 @@
 
   window.wbAccountsView = {
     render,
-    renderNavCount,
     refreshCaches,
     openPanels: openPanelsFor,
     // 批量「开着没」的两个判据与「收起」入口一并导出：余额批量动作的那条链

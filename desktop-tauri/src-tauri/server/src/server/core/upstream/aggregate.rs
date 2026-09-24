@@ -27,6 +27,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::errors::GatewayError;
 
+use super::cancellation;
 use super::sse::ModelRewrite;
 use super::usage::RequestTelemetry;
 
@@ -78,10 +79,48 @@ pub async fn aggregate_sse_completion(
 /// reqwest::Response 换成已翻译的帧流。telemetry / model_rewrite 的语义
 /// 与那个函数完全一致（见它的说明）。
 pub async fn aggregate_frame_stream(
-    mut stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
     model_rewrite: Option<ModelRewrite>,
 ) -> Result<AggregatedCompletion, GatewayError> {
+    // 非流式响应总超时（设置页「请求超时」第四项）：**一次性计时、不重置**
+    // —— 与流式的空闲超时是两种语义（那是「两次数据之间」，这里读完整份
+    // 响应体的总预算，对应 OmniProxy 的 readBodyWithStallGuard）。
+    // 超时中止整个聚合：非流式客户端此时还没收到任何响应，收尾记账不会丢，
+    // 错误原样返回（502 + 明确文案）。
+    let budget = std::time::Duration::from_millis(
+        crate::server::config::timeout_settings().body_ms(),
+    );
+    match tokio::time::timeout(budget, aggregate_frame_stream_inner(stream, telemetry, model_rewrite))
+        .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(GatewayError::with_status(
+            502,
+            format!("非流式响应超时({}秒)", budget.as_secs()),
+        )),
+    }
+}
+
+/// [`aggregate_frame_stream`] 的主体（总超时由外层套上，见那里的说明）。
+async fn aggregate_frame_stream_inner(
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
+    telemetry: Arc<RequestTelemetry>,
+    model_rewrite: Option<ModelRewrite>,
+) -> Result<AggregatedCompletion, GatewayError> {
+    // ── 手动终止的旁路流（与 `ForwardStream::from_translated` 同一手法）──
+    // 聚合是 `while let Some(item) = stream.next().await` 的拉取循环：没有
+    // 旁路流时，取消要等下一个上游分片（上游停滞时可能等很久）。把令牌的
+    // 等待合进流里，置位后下一轮 await 立刻拿到 Err，由下面的 map_err 折成
+    // 408 的网关错误（非流式客户端此时还没收到任何响应，收尾记账会把它记成
+    // 「请求已被手动终止」）。放在本函数而不是 `aggregate_sse_completion`：
+    // 自定义家的翻译协议流也走这里（聚合规则共用），两处都要覆盖。
+    //
+    // 合成器用 `cancellation::cancellable` 而**不是** `stream::select`：
+    // 后者的收尾判据是「两条都结束」，旁路流在上游正常结束时永不产出，于是
+    // 下面这个 `while let` 永不退出 —— 聚合明明已经读到上游 EOF，却要空转到
+    // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
+    let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
     let mut buffer = String::new();
     let mut acc = CompletionAccumulator { rewrite: model_rewrite, ..Default::default() };
     // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
@@ -91,9 +130,20 @@ pub async fn aggregate_frame_stream(
     let mut first_chunk_seen = false;
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(|error| {
+            // 手动终止的旁路流给的就是原文（见上面的说明）：折成 408 的
+            // 网关错误，不加「上游流式传输中断」前缀 —— 它不是上游的问题
+            let text = error.to_string();
+            if text == cancellation::MANUAL_TERMINATED {
+                return cancellation::cancelled_error();
+            }
+            // 空闲超时是保护性判定不是中断：自带完整文案（含设定秒数），
+            // 直接用（与 `ForwardStream` 的错误帧同一处理）
+            if text.starts_with(super::stall::IDLE_TIMEOUT_PREFIX) {
+                return GatewayError::with_status(502, text);
+            }
             // 错误描述已在构造时折进 io::Error（reqwest 直连在
             // `aggregate_sse_completion`、翻译流在 `ProtocolTranslateStream`）
-            GatewayError::with_status(502, format!("上游流中断: {error}"))
+            GatewayError::with_status(502, format!("上游流式传输中断: {error}"))
         })?;
         if !first_chunk_seen {
             first_chunk_seen = true;

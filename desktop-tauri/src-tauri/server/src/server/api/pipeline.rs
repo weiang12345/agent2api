@@ -285,6 +285,19 @@ pub fn model_field_text(payload: &Value) -> String {
     }
 }
 
+/// 下游请求体里客户端显式指定的思考等级（请求日志「下游等级」；空串 = 没指定）。
+///
+/// 与 [`model_field_text`] 同一采集时机（入口 handler 在解析出 payload 后取一次，
+/// 随 [`RecordContext`] 一路带到记账点）。读取器是
+/// `model_rules::reasoning::read_client_level` —— 那是**两家的并集链、只服务
+/// 显示**：转发时「客户端指定了没有」由各家适配器自己的 resolver 判，两边
+/// 口径的差异（CatPaw 空串会 400、Qoder 链到第一个键为止）不影响这里要显示
+/// 的意图值。注意 payload 传入前可能已被 [`resolve_model`] 就地改写 —— 但它只
+/// 动 `model` 字段，等级键不受影响，前后取值一致。
+pub fn client_reasoning_of(payload: &Value) -> String {
+    crate::server::core::model_rules::read_client_level(payload).unwrap_or_default()
+}
+
 /// JS 真值判定（`Boolean(x)`）
 pub fn value_is_truthy(value: &Value) -> bool {
     match value {
@@ -328,6 +341,12 @@ pub struct RecordContext {
     /// 客户端没点名时为空串）。请求日志用它和上游名（telemetry 的
     /// `upstream_model`）分两行展示「请求的什么 → 转发的什么」。
     pub client_model: String,
+    /// **下游请求体里**客户端显式指定的思考等级（`max` 等；空串 = 没指定）。
+    /// 请求日志给下游模型名带 `(等级)` 后缀；与上游侧的
+    /// `snapshot.upstream_reasoning` 分开记 —— 「客户端要的档位」与「实际发出的
+    /// 档位」是两个读数（客户端没指定时映射绑定可补一个，承载家也可能归并）。
+    /// 采集时机与 [`Self::client_model`] 相同（入口解析出 payload 后取一次）。
+    pub client_reasoning: String,
     /// 下发给客户端的 HTTP 状态码
     pub status: i64,
     /// **下游原始请求体文本**（`request_raw` 表的请求侧；已按
@@ -369,12 +388,19 @@ pub fn raw_body_text(bytes: &[u8]) -> Option<String> {
 ///
 /// 为什么这几条也要记：`model_not_found` 是客户端配置错误最常见的形态，
 /// 不记的话用户在报表里看不到「请求全在失败」，只会以为统计漏了。
-pub fn record_early_failure(state: &ServerState, started_at: i64, model: &str, error: &GatewayError) {
+pub fn record_early_failure(
+    state: &ServerState,
+    started_at: i64,
+    model: &str,
+    client_reasoning: &str,
+    error: &GatewayError,
+) {
     let context = RecordContext {
         stats: state.request_stats(),
         telemetry: Arc::new(RequestTelemetry::new()),
         started_at,
         client_model: model.to_string(),
+        client_reasoning: client_reasoning.to_string(),
         model: model.to_string(),
         // 与 `payload_response` 同一口径：非法状态码会被归一成 500
         status: i64::from(error.http_status().as_u16()),
@@ -416,10 +442,19 @@ pub fn live_row_sink(
                 account_id: snapshot.account_id.clone(),
                 account_name: snapshot.account_name.clone(),
                 upstream_model: snapshot.upstream_model.clone(),
+                upstream_reasoning: snapshot.upstream_reasoning.clone(),
                 // 与收尾同口径：一次都没发出去（0）按 1 次算，理由见
                 // `TelemetrySnapshot::attempts` 的说明
                 attempts: snapshot.attempts.max(1),
                 first_response_ms: snapshot.first_response_at.map(|at| (at - started_at).max(0)),
+                // 阶段与阶段起点：起点为 None 只可能是「还停在初始阶段（连接中）、
+                // 一次都没切换过」——那个阶段的起点就是**请求开始时刻**（下面这个
+                // started_at，与插入在途行时写进 phase_started_at 的值同源），
+                // 所以用 started_at 兜底。不兜的话这一列会写进 NULL，
+                // 而状态列的第二行按它算「连接中已持续多久」会算出个负数或
+                // 干脆没有 —— 两种都不该出现在「已受理但还没发出去」的请求上
+                phase: snapshot.phase.as_str().to_string(),
+                phase_started_at: snapshot.phase_started_at.or(Some(started_at)),
                 attempt_details: stored_attempt_details(&snapshot.attempts_detail),
                 sensitive_hits: stored_sensitive_hits(&snapshot.sensitive_hits),
             },
@@ -508,6 +543,10 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // 前端回落显示 model 一行 —— 旧数据没有这两个键，同一口径。
     entry.client_model = context.client_model.clone();
     entry.upstream_model = snapshot.upstream_model;
+    // 等级双端透传（与上面两行同源）：下游等级来自入口采集（context），
+    // 上游等级来自发送体定稿处的采集（telemetry 快照）
+    entry.client_reasoning = context.client_reasoning.clone();
+    entry.upstream_reasoning = snapshot.upstream_reasoning;
     // 两个明细字段（本次改造）：都是「有采集才有值」的旁路数据，采集点在
     // 转发链路上（`core::upstream::usage` 槽），这里只负责搬运。
     //   · attemptDetails：每次上游尝试的（provider / 账号 / 状态码 / 错误摘要
@@ -722,6 +761,10 @@ impl RecordingStream {
             // 若未来有入口想预填响应正文，那它不该再走流式包装（自相矛盾的约定）
             context.raw_response = self.raw.into_text();
             record_entry(&context, fallback_error);
+            // 手动终止的令牌在此注销：流的结束点 = 请求不再在途（与
+            // DisconnectGuard::complete 同一条生命周期；settle 由 Drop 兜底
+            // 调用，所以「客户端断开」「流跑完」「服务退出」三条路都会走到这里）
+            crate::server::core::upstream::cancellation::unregister(&context.telemetry.id());
         }
     }
 

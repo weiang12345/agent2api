@@ -452,6 +452,24 @@ impl AccountStore {
         })
     }
 
+    /// 指定 id 的账号会话（模型目录刷新按用户在「获取模型」弹窗里点名的账号走这条）。
+    ///
+    /// 判据与 [`Self::current_entry_for_provider`] 逐条相同（启用 + 有凭证），
+    /// 差别只有「按 id 直取而不是取队首」：**用户点名了就不再替他挑** ——
+    /// 取不到返回 None，由调用方给出「这条账号不存在或不可用」的明确文案，
+    /// 而不是悄悄回落到队首（那会变成「选了 A、用的是 B」的静默错误）。
+    pub fn session_for_account(&self, account_id: &str) -> Option<CurrentEntry> {
+        let _guard = self.guard();
+        let record = self.record_by_id(&_guard, account_id)?;
+        if !record.enabled() || !record.has_credentials() {
+            return None;
+        }
+        Some(CurrentEntry {
+            id: record.id().to_string(),
+            session: self.session_from_record(&record),
+        })
+    }
+
     /// 账号记录 → auth 模块的会话形态（端点/prefixPath/platform 按 edition 兜底）。
     ///
     /// `proxy` 是该账号解析出的出口（null = 直连），计费/签到等「拿着 session
@@ -582,12 +600,18 @@ impl AccountStore {
 ///
 /// ── 两家桌面态（W4b-T-c2 起）────────────────────────────────
 /// 小浣熊（`raccoon-desktop`，读 `~/.box-agent/config/auth.json`）与
-/// AutoClaw（`autoclaw-desktop`，读 `%APPDATA%/AutoClaw/auth.json` 的
-/// **safeStorage 密文**并走 DPAPI + AES-GCM 解密）都是「记录里不落 token、
-/// 凭证实时读」的形态，因此都要在这里填进会话 —— 否则转发链路的
-/// `build_chat_request` 从 `auth.accessToken` 取到空串，稳定 401。
+/// AutoClaw（`autoclaw-desktop` / `autoclaw-intl-desktop`，读
+/// `%APPDATA%/AutoClaw/auth.json` 的 **safeStorage 密文**并走 DPAPI +
+/// AES-GCM 解密）都是「记录里不落 token、凭证实时读」的形态，因此都要在这里
+/// 填进会话 —— 否则转发链路的 `build_chat_request` 从 `auth.accessToken`
+/// 取到空串，稳定 401。
 /// AutoClaw 的解密结果由 `autoclaw::credentials` 的进程级 mtime 缓存兜住，
 /// 每个请求都做一次 DPAPI 是被缓存挡住的那件贵事，不是本函数重复做的。
+///
+/// AutoClaw 的**两个地区**都要走这一支：那个 auth.json 两地共用（没有地区
+/// 标记），地区只能从**记录自己的 provider** 取（`autoclaw` → 国内版、
+/// `autoclaw-intl` → 国际版）—— 写死国内版会让国际版桌面账号拿不到 token，
+/// 表现为「导入成功但转发时报账号缺少 accessToken」。
 ///
 /// CatPaw 不在这里：它的凭证不是 Bearer（Cookie 形态的 `X-Passport-Token` +
 /// 独立 uid），会话的 `auth.accessToken` 装不下它，由
@@ -597,10 +621,15 @@ impl AccountStore {
 /// `autoclaw_accounts.rs`）也要用它 —— 桌面端账号的展示字段（token 尾号/过期
 /// 时间/能否刷新）必须来自同一份实时值，否则界面与转发看到的就是两个状态。
 pub(crate) fn live_desktop_credentials(record: &StoredAccount) -> Option<(String, String, f64)> {
-    if record.provider() == super::AUTOCLAW_PROVIDER_ID && record.is_desktop() {
-        // 国内版专用来源（桌面端文件没有地区标记），因此这里显式传 `Cn`
+    if super::is_autoclaw_family(&record.provider()) && record.is_desktop() {
+        // 地区取记录自己的 provider（两地共用一个文件，见上方说明）；
+        // 认不出的 id 退回国内版 —— 与 `to_autoclaw_public_account` 同一兜底口径
+        let region = crate::server::core::providers::autoclaw::Region::from_provider_id(
+            &record.provider(),
+        )
+        .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
         let credentials = crate::server::core::providers::autoclaw::credentials::local_credentials(
-            crate::server::core::providers::autoclaw::Region::Cn,
+            region,
         )
         .ok()?;
         return Some((

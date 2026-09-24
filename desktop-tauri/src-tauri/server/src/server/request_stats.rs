@@ -396,14 +396,14 @@ impl RequestStats {
     /// 同 id 已有进行中行时跳过（重复调用不产生第二行）；库不可用时静默跳过
     /// —— 这一步的失败只是「列表里晚一点才看到这条请求」，与统计整体的
     /// 「少记不影响请求」同一取向。
-    pub fn record_started(&self, id: &str, ts: i64, model: &str, client_model: &str) {
+    pub fn record_started(&self, id: &str, ts: i64, model: &str, client_model: &str, client_reasoning: &str) {
         if id.is_empty() {
             return;
         }
         let guard = self.guard();
         let _ = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
-            sql::insert_started_request(&tx, id, ts, model, client_model)?;
+            sql::insert_started_request(&tx, id, ts, model, client_model, client_reasoning)?;
             // 陈旧清理与插入同事务：僵尸行的判定时点与本次开始时点一致，
             // 中断也只影响「这次有没有清成」，不会留下半删状态
             sql::finish_stale_running(&tx, stale_cutoff(), now_ms())?;
@@ -421,6 +421,32 @@ impl RequestStats {
         let _ = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
             sql::finish_stale_running(&tx, stale_cutoff(), now_ms())?;
+            tx.commit()
+        });
+    }
+
+    /// 按 id 收尾一条在途行（**断线兜底**：客户端在响应完成前放弃连接）。
+    ///
+    /// ── 谁调它 ──────────────────────────────────────────────────
+    /// `api::pipeline::DisconnectGuard` 的 Drop —— 入口 handler 被 axum 取消
+    /// 时（连接关闭即取消 handler，官方语义）执行。那条路径上收尾记账
+    /// （`record_entry`）永远不会被调用，行会停在 status=0 直到 1 小时的僵尸
+    /// 清扫；本方法把「断开」变成第三条收尾路径（与 OmniProxy 的
+    /// `res.on('close')` 收尾同一意图：**断开也要落一条明确的终态**）。
+    ///
+    /// 只 UPDATE 不 INSERT：没有进行中行（转发前就失败的路径）时影响 0 行，
+    /// 什么都不做 —— 那些请求由各自的记账点负责，这里绝不替它们补行。
+    /// 库不可用时静默跳过（与 `record_started` 同一取向：少一次收尾只影响
+    /// 一条明细的显示，不影响任何业务）。
+    pub fn finalize_interrupted(&self, id: &str, error: &str) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let guard = self.guard();
+        let _ = self.with_conn_mut(&guard, |conn| {
+            let tx = conn.transaction()?;
+            sql::finish_running_request(&tx, id, error, now_ms())?;
             tx.commit()
         });
     }
@@ -587,10 +613,11 @@ impl RequestStats {
             })
         };
         let (total, matched, running, entries) = loaded.unwrap_or((0, 0, 0, Vec::new()));
-        // 每行经 `entry_json` 补一个派生字段 `providerLabel`（id → label 的换算；
-        // 换算处与汇总的 providers 数组同一个函数，两处名字必然一致）。
-        // 汇总是**反序列化回 Value**，不是另一套结构：契约字段仍由 record.rs
-        // 的 serde 注解决定，这里只加不删
+        // 每行经 `entry_json` 补两个派生字段：`providerLabel`（id → label 的换算；
+        // 换算处与汇总的 providers 数组同一个函数，两处名字必然一致）与
+        // `phaseElapsedMs`（在途行「当前阶段已持续多久」，读取那一刻现算 ——
+        // 理由见那个函数的说明）。汇总是**反序列化回 Value**，不是另一套结构：
+        // 契约字段仍由 record.rs 的 serde 注解决定，这里只加不删
         let rows: Vec<Value> = entries.iter().map(entry_json).collect();
         json!({
             "entries": rows,

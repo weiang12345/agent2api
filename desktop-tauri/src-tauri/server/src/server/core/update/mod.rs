@@ -41,8 +41,9 @@ pub use version::{
     UpdateError, DEFAULT_REPO, GITHUB_API, MAX_INSTALLER_BYTES,
 };
 
-/// 检测与下载建连阶段的超时（Node 版 REQUEST_TIMEOUT_MS）。
-/// 下载本身不设总超时（长下载会被掐断），只在建连阶段给足时间。
+/// 检查更新（GitHub API）请求的总超时（Node 版 REQUEST_TIMEOUT_MS）。
+/// 只传给 API 探测：reqwest 0.12 的请求级总超时覆盖到 body 读完为止，
+/// 下载安装包传 None，否则大包 30 秒内下不完必被掐断。
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
 
 /// 请求 GitHub 的 UA（Node 版字面量）
@@ -191,8 +192,8 @@ impl UpdateManager {
     async fn refresh_latest(&self) -> Result<(), UpdateError> {
         let repository = self.repository();
         let url = format!("{GITHUB_API}/repos/{repository}/releases/latest");
-        let response = client::fetch_with_egress(&url, &client::github_headers(), REQUEST_TIMEOUT_MS)
-            .await?;
+        let headers = client::github_headers();
+        let response = client::fetch_with_egress(&url, &headers, Some(REQUEST_TIMEOUT_MS)).await?;
 
         let status = response.status().as_u16();
         if status == 404 {
@@ -201,9 +202,10 @@ impl UpdateManager {
         }
         if status == 403 || status == 429 {
             // 文案照抄 Node（含环境变量提示）：403 多为匿名请求限额用尽
-            return Err(UpdateError::new(
-                "GitHub 接口访问受限（可能是请求频率超限）。稍后再试，或设置 WORKBUDDY_GITHUB_TOKEN 提高限额",
-            ));
+            let hint = "，或设置 WORKBUDDY_GITHUB_TOKEN 提高限额";
+            return Err(UpdateError::new(format!(
+                "GitHub 接口访问受限（可能是请求频率超限）。稍后再试{hint}"
+            )));
         }
         if !response.status().is_success() {
             return Err(UpdateError::new(format!("GitHub 返回 HTTP {status}")));
@@ -241,11 +243,16 @@ impl UpdateManager {
                 url
             }
         };
+        // 发布时间：正常都带 published_at；缺失时回落到 created_at（防御）
+        let published_at = {
+            let value = text("published_at");
+            if value.is_empty() { text("created_at") } else { value }
+        };
         let latest = json!({
             "tag": tag,
             "name": name,
             "notes": notes,
-            "publishedAt": text("published_at"),
+            "publishedAt": published_at,
             "pageUrl": page_url,
             "prerelease": payload.get("prerelease").and_then(Value::as_bool) == Some(true),
             "asset": pick_installer(payload.get("assets")),
@@ -502,7 +509,7 @@ impl UpdateManager {
         ];
         // 建连 + 等响应头阶段也要能被取消（reason 见函数注释）
         let response = tokio::select! {
-            result = client::fetch_with_egress(target.as_str(), &headers, REQUEST_TIMEOUT_MS) => {
+            result = client::fetch_with_egress(target.as_str(), &headers, None) => {
                 result?
             }
             _ = wait_cancel(cancel_flag) => return Ok(0),

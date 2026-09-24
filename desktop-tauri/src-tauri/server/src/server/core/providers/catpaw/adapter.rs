@@ -202,6 +202,18 @@ impl ProviderAdapter for CatPawAdapter {
         }
     }
 
+    /// 从发送体读随行的思考等级：复用 [`models::resolve_effort`] 本身。
+    ///
+    /// 它的取值链（`reasoning_effort` / `reasoningEffort` / `effort`）、小写归一
+    /// 与三档校验就是本家转发时对档位做的**全部**处理 —— 所以这里读出的值
+    /// 就是上游 `declarativeParams.effort` 将会收到的值，不需要第二份逻辑。
+    /// `Err`（客户端传了本家不认的档位）返回 None：那条请求随后会被
+    /// `prepare::prepare` 以 400 拒掉，上游从未收到任何档位，错误列会说清原因，
+    /// 等级列不预支一个「没发出去」的值。
+    fn outbound_reasoning(&self, body: &Value) -> Option<String> {
+        models::resolve_effort(body).ok().flatten()
+    }
+
     /// 取可用凭证（`X-Passport-Token` + `uid`），**含存在性校验**。
     ///
     /// `account_id` 为空表示「没有指定账号」：环境变量旁路（`CATPAW_COOKIE`）
@@ -255,14 +267,17 @@ impl ProviderAdapter for CatPawAdapter {
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
+        account_id: &'a str,
         force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     > {
         Box::pin(async move {
             // 凭证解析失败（没账号、也没桌面端登录态）→ 「没刷」而不是「失败」：
-            // 一个不用 CatPaw 的用户点刷新时，红色失败会让他以为哪里坏了
-            let credentials = match credentials::snapshot_for(store, "") {
+            // 一个不用 CatPaw 的用户点刷新时，红色失败会让他以为哪里坏了。
+            // `account_id` 非空 = 用户在弹窗里点名的那条（按 id 直取，取不到
+            // 也走「没刷」——那是「这条不可用」，不是这次刷新出错了）
+            let credentials = match credentials::snapshot_for(store, account_id) {
                 Ok(credentials) => credentials,
                 Err(error) => {
                     logging::verbose(

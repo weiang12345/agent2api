@@ -35,6 +35,30 @@ use crate::server::errors::GatewayError;
 /// 这里不再叠加总超时 —— 那会掐断长回答的 SSE 流。
 pub const NO_TOTAL_TIMEOUT: Option<u64> = None;
 
+/// 单次尝试**等待上游响应头**的上限（毫秒）。
+///
+/// 与 OmniProxy 的 `headers_timeout`（默认 300 秒）同义：连接建立之后、
+/// 响应头到达之前的静默等待必须有个上限 —— `read_timeout` 管的是「两次数据
+/// 之间」，虽然首包之前的等待也计入它，但分钟级的等待 × 重试链（同账号重发 ×
+/// 换号）会把一条请求拖到几十分钟，而客户端早就等不及了。
+///
+/// 现在是**配置项**（设置页「请求超时 → 等待响应超时」，默认 300 秒，
+/// 1–3600）：每次发送时从内存快照取一次，改完设置下一个请求就生效。
+///
+/// 为什么默认 300 秒是安全的：网关请求上游**恒带 `stream: true`**（见
+/// `UpstreamService::forward` 的说明），响应头在 SSE 建立时就到达，
+/// 与「模型思考多久」无关；非流式的长回答也走这条路径（本地聚合）。
+/// 超时按传输层失败处理（502 + 既有退避重试），与连接失败同一档。
+fn headers_timeout() -> Duration {
+    Duration::from_millis(crate::server::config::timeout_settings().headers_ms())
+}
+
+/// 「连接中超时」的设定值（秒）：连接超时文案标注实际生效的秒数用，
+/// 与设置页「请求超时 → 连接中超时」同一份配置。
+fn connect_timeout_seconds() -> u64 {
+    crate::server::config::timeout_settings().connect_ms() / 1000
+}
+
 /// 一次上游请求的全部素材（协议无关形态；provider 差异在构造阶段已消解）
 pub struct TransportRequest {
     /// 上游完整 URL（由适配器给出）
@@ -129,27 +153,56 @@ pub async fn send_chat_request(
     if let Some(timeout) = NO_TOTAL_TIMEOUT {
         builder = builder.timeout(Duration::from_millis(timeout));
     }
-    builder.send().await.map_err(|error| {
-        // 网络层错误（ECONNREFUSED、代理鉴权失败、DNS…）：带上根因与出口说明，
-        // 便于判断是不是代理配错了 —— 文案照抄 Node 的 fetchViaProxy
-        let via = match &plan.proxy {
-            Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
-            Some(proxy) => format!("经代理 {}", proxy.host),
-            None => "直连".to_string(),
-        };
-        UpstreamRequestError {
-            message: format!(
-                "上游请求失败（{via}）: {}",
-                egress::describe_error_detail(&error)
-            ),
+    // 出口说明（失败文案用）：文案照抄 Node 的 fetchViaProxy
+    let via = match &plan.proxy {
+        Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
+        Some(proxy) => format!("经代理 {}", proxy.host),
+        None => "直连".to_string(),
+    };
+    // 等待响应头有上限（见 headers_timeout 的说明）：超时后 future 被丢弃，
+    // 上游连接随之关闭（与客户端断开时的取消是同一机制）
+    let headers_budget = headers_timeout();
+    match tokio::time::timeout(headers_budget, builder.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => {
+            // `send()` 阶段的超时只可能来自连接（等待响应头由外层计时器管，
+            // 它的预算 ≤ 客户端 read_timeout，见 egress 的说明）：此时错误链
+            // 对用户没有信息量（就是「没连上」），文案直接给设置页的旋钮名
+            // 与实际生效的秒数；其余（ECONNREFUSED、代理鉴权失败、DNS…）
+            // 保留根因与出口说明，便于判断是不是代理配错了
+            let reason = if error.is_timeout() {
+                format!("连接中超时({}秒)", connect_timeout_seconds())
+            } else {
+                "上游连接失败".to_string()
+            };
+            let message = if error.is_timeout() {
+                format!("连接中超时({}秒，出口 {via})", connect_timeout_seconds())
+            } else {
+                format!(
+                    "上游请求失败（{via}）: {}",
+                    egress::describe_error_detail(&error)
+                )
+            };
+            Err(UpstreamRequestError { message, reason })
         }
-    })
+        Err(_elapsed) => {
+            let seconds = headers_budget.as_secs();
+            Err(UpstreamRequestError {
+                reason: format!("等待响应超时({seconds}秒)"),
+                message: format!("等待响应超时({seconds}秒，出口 {via})"),
+            })
+        }
+    }
 }
 
 /// 传输层失败（统一收敛成 502，与 Node 的 fetchViaProxy 一致）
 #[derive(Clone, Debug)]
 pub struct UpstreamRequestError {
     pub message: String,
+    /// 简短原因（重试链里「这次为什么重试」的展示文案）：
+    /// 「连接中超时(N秒)」/「等待响应超时(N秒)」/「上游连接失败」。
+    /// `message` 是最终失败的详细文案（带出口说明），这里是它的简短形态。
+    pub reason: String,
 }
 
 impl UpstreamRequestError {

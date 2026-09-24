@@ -212,8 +212,12 @@ const BRIDGE_JS: &str = r#"
     // 手动刷新（网关页「刷新模型清单」按钮）：只刷支持远程目录的家、
     // 强制绕过缓存，返回 `{results, refreshed, skipped, failed, models}`
     // —— **带刷新后的聚合清单**，界面就地重绘、不必再拉一次 /api/session
-    // （理由见后端 `api::models` 的模块头）。不传 body：这条无入参
-    refreshModels: () => call('POST', '/api/models/refresh', {}),
+    // （理由见后端 `api::models` 的模块头）。
+    //
+    // 可选入参 `{accounts: {providerId: accountId}}`：「获取模型」弹窗每行的
+    // 「模型来源」下拉点名的账号（用谁去打该家的目录接口）。不传 = 各家按
+    // 默认选取（队首可用账号）；逐条结果里带 `accountId` 供界面回读。
+    refreshModels: payload => call('POST', '/api/models/refresh', payload || {}),
     // 模型管理（启停 / 映射）：写接口都返回最新 {models, mappings, reasoningLevels}
     // 映射照抄 OmniProxy 语义：对外名自由命名（允许与上游 id 同名），同一对外名
     // 可在不同提供商各建一条（主备）；provider 为空 = 旧版全局语义
@@ -406,6 +410,10 @@ const BRIDGE_JS: &str = r#"
     // （详情弹窗「预览对话」的数据源；列表接口不回正文，行保持轻）。
     // 找不到给 404，前端据此提示「没有保存原始报文」。
     getStatsRequestRaw: id => call('GET', '/api/stats/requests/raw' + toQuery({ id })),
+    // 手动终止一条**在途**请求（详情弹窗的「终止请求」按钮）：
+    // 受理 `{success:true,terminated:true}`；不在进行中给 404（已结束 /
+    // 上次启动遗留的进行中行），前端据此提示刷新列表
+    terminateStatsRequest: id => call('POST', '/api/stats/requests/terminate' + toQuery({ id })),
     // 清理弹窗的预览统计 `{all, raw, dbBytes, vacuumRunning, lastVacuum}`：
     // 与 DELETE 共用同一份筛选解析（后端 filter_from_params），预览说删 N 条、
     // 确认删掉的就是 N 条 —— 预览与执行必须同源，否则就是新的「清空事故」
@@ -436,6 +444,12 @@ const BRIDGE_JS: &str = r#"
     // 契约同 saveRetention：PUT 允许部分字段，返回生效后的全量值。
     getRetry: () => call('GET', '/api/retry'),
     saveRetry: patch => call('PUT', '/api/retry', patch),
+
+    // ── 上游请求超时（设置页「通用 → 请求超时」）──
+    // 四项秒数（连接 / 等待响应 / 流式空闲 / 非流式响应体），存配置（/api/timeouts）。
+    // 契约同 saveRetry：PUT 允许部分字段，返回生效后的全量值。
+    getTimeouts: () => call('GET', '/api/timeouts'),
+    saveTimeouts: patch => call('PUT', '/api/timeouts', patch),
 
     // ── 调试模式（设置页「通用 → 调试模式」）──
     // 开关存配置（debugMode）：开启后转发层把上游原始报文（凭据类头已脱敏）

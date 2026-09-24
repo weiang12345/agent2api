@@ -88,9 +88,11 @@ use crate::server::logging;
 
 use super::payload::{send_body, ProviderContext, SendBody};
 use super::request::{read_upstream_error, send_chat_request, TransportRequest};
+use super::usage::LogPhase;
 use super::{
-    account_display, account_label, connections::ConnectionGuard, describe_proxy, reset_hint,
-    rotate, ForwardOutcome, InFlightGuard, RouteTarget, UpstreamService, MAX_ROUTE_ATTEMPTS,
+    account_display, account_label, cancellation, connections::ConnectionGuard, describe_proxy,
+    reset_hint, rotate, ForwardOutcome, InFlightGuard, RouteTarget, UpstreamService,
+    MAX_ROUTE_ATTEMPTS,
 };
 
 /// 上游一次请求的失败（已分类 + 已构好给客户端的错误）。
@@ -160,6 +162,23 @@ fn take_switch(switches_left: &mut usize, total: usize) -> bool {
 /// 动作（见模块头的三个动作），对同一账号原地重试只会白等一个间隔。
 const TRANSIENT_RETRY_STATUSES: &[u16] = &[408, 500, 502, 503, 504];
 
+/// 这次的失败状态码是否命中「指定错误码直接换号」名单（设置页「通用 → 请求重试」）。
+///
+/// 命中的失败**跳过本账号**：不进 [`send_with_retry`] 的原地重发，也不做同
+/// 账号的补救动作（内容拦截换提示词、401 刷新凭证 —— 那两个同样是「同一账号
+/// 再发一次」），直接换下一个账号继续试（与动作 3 同一条顺延路，受「切换
+/// 账号重试次数」管）。换满或队列里没有没试过的账号时，错误才原样给客户端。
+/// 所以判定点放在那两个补救动作之前。
+///
+/// 传输层失败（DNS / 代理 / 连接）没有上游状态码，不受名单管。
+/// `status_code` 是 `i64` 形态（GatewayError 存的是 `i32`，这里统一收宽），
+/// 负值 / 越界不可能是 HTTP 状态码，按「不在名单」处理。
+fn direct_switch_status(status: i64) -> bool {
+    u16::try_from(status)
+        .map(|code| config::retry_settings().no_retry(code))
+        .unwrap_or(false)
+}
+
 /// 瞬时 HTTP 错误的统一退避建议（设置页「请求重试」的全局兜底）。
 ///
 /// `remaining` 是原地重发**还剩几次**（见 [`RetryBudget`] 的说明）；
@@ -175,13 +194,16 @@ fn transient_retry_advice(status: u16, remaining: usize) -> Option<RetryAdvice> 
 }
 
 /// 传输层失败（DNS / 代理 / 连接）的统一退避建议：与瞬时 HTTP 错误同一套设置。
-fn transport_retry_advice(remaining: usize) -> Option<RetryAdvice> {
+///
+/// 原因取错误自带的简短形态（`UpstreamRequestError::reason`）：连接超时与
+/// 等待响应头超时各自带设置页旋钮名与实际秒数，其余统一「上游连接失败」。
+fn transport_retry_advice(error: &super::request::UpstreamRequestError, remaining: usize) -> Option<RetryAdvice> {
     if remaining == 0 {
         return None;
     }
     Some(RetryAdvice {
         delay_ms: config::retry_settings().delay_ms(),
-        reason: "上游连接失败".to_string(),
+        reason: error.reason.clone(),
     })
 }
 
@@ -425,6 +447,14 @@ async fn attempt_queue(
     // 裸 `continue` 会回到内层（用同一个账号再发一次，正好是要避免的事）。
     // `continue 'accounts` 才表达「换队列里的下一个账号」。
     'accounts: for _ in 0..=MAX_ROUTE_ATTEMPTS {
+        // ── 手动终止：每一轮选路之前先看令牌 ────────────────────────
+        // 覆盖「回到循环」的所有时刻：去重排队、退避睡眠、换号顺延、上游
+        // 响应之后的下一轮。更细的等待点（等响应头、退避）由 `send_with_retry`
+        // 各自 select 令牌，这里兜住其余（含会话式 / 自定义家的两轮之间）。
+        // 此刻没有在途尝试需要定稿（上一轮的两个出口都已记过明细），直接返回。
+        if ctx.telemetry.is_cancelled() {
+            return Err(cancellation::cancelled_error());
+        }
         let target =
             rotate::select_target_account(service, provider_ids, &cooldown_keys, &tried_ids).await?;
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
@@ -443,6 +473,19 @@ async fn attempt_queue(
             match attempt_custom(service, ctx, target, slot, connections, degraded).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    // 手动终止优先（与无状态路径同一判定与理由）：不把已受理的
+                    // 终止当成「这一轮失败」去顺延下一个账号
+                    if ctx.telemetry.is_cancelled() {
+                        ctx.telemetry.finish_last_attempt(
+                            Some(cancellation::MANUAL_TERMINATED_STATUS),
+                            Some(cancellation::MANUAL_TERMINATED),
+                        );
+                        return Err(cancellation::cancelled_error());
+                    }
+                    // 「指定错误码直接换号」名单在这里没有专属分支：命中时
+                    // `attempt_custom` 内部的原地重发已被第二道闸挡住（见
+                    // `direct_switch_status`），落到下面就是与其它错误同一条
+                    // 换号顺延路 —— 直接换下一个账号，换满仍失败才原样返回。
                     // 失败的账号记入 tried，回到账号循环顺延 —— 与会话式
                     // 失败（is_stateful 分支）同一套兜底。
                     if let Some(account_id) = custom_account_id {
@@ -531,6 +574,16 @@ async fn attempt_queue(
             {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    // 手动终止优先（与无状态 / 自定义两条路径同一判定与理由）：
+                    // 会话式这一轮已经结束，但用户要的是终止 —— 不把它当成
+                    // 普通失败去顺延下一个账号（那会把终止拖成另一轮转发）
+                    if ctx.telemetry.is_cancelled() {
+                        ctx.telemetry.finish_last_attempt(
+                            Some(cancellation::MANUAL_TERMINATED_STATUS),
+                            Some(cancellation::MANUAL_TERMINATED),
+                        );
+                        return Err(cancellation::cancelled_error());
+                    }
                     if let Some(account_id) = stateful_account_id {
                         if !tried_ids.contains(&account_id) {
                             tried_ids.push(account_id);
@@ -798,6 +851,28 @@ async fn attempt_queue(
                     break (response, wire_model);
                 }
                 Err(failure) => {
+                    // ── 手动终止优先于一切重试动作 ────────────────────────
+                    // 用户已经点了「终止请求」：换号 / 退避 / 刷新凭证都没有
+                    // 意义。判定放在分类动作之前 —— 否则一次「恰好同时发生」
+                    // 的上游错误会按 Fatal 走换号顺延，把已受理的终止拖到下一轮
+                    // （下一轮虽然也会被循环顶拦下，但白跑一次选路与发送）。
+                    // 本轮明细在这里定稿（与下面那条定稿出口互斥：直接 return）。
+                    if ctx.telemetry.is_cancelled() {
+                        ctx.telemetry.finish_last_attempt(
+                            Some(cancellation::MANUAL_TERMINATED_STATUS),
+                            Some(cancellation::MANUAL_TERMINATED),
+                        );
+                        return Err(cancellation::cancelled_error());
+                    }
+                    // ── 指定错误码直接换号 ──────────────────────────────
+                    // 用户点名的状态码（默认 402）不做「同一账号再看一眼」：
+                    // 原地重发已在 `send_with_retry` 的第二道闸挡住，这里的
+                    // 标记再把同账号的补救动作（动作 0 换提示词、动作 2 刷新
+                    // 凭证）一并跳过 —— 点名的码没有任何例外。明细仍走下面
+                    // 「这一轮的结局已定」那条公共定稿出口，之后与其它错误
+                    // 一样按动作 1 / 动作 3 换号顺延：直接换下一个账号继续试，
+                    // 换满或没有更多账号时错误才原样返回客户端。
+                    let named_switch = direct_switch_status(i64::from(failure.error.status_code));
                     // ── 动作 0：内容策略拦截 → 换中性提示词，同账号立即重试一次 ──
                     // 上游按逐字精确匹配审核，命中即整单拦截；这是**误报**而不是
                     // 账号问题（余额健康、未限流、session 未死），所以既不罚账号
@@ -813,6 +888,7 @@ async fn attempt_queue(
                     // 重试成功时这一轮的结局就是成功。`degraded` 置位后不再重复
                     // 触发，一次请求最多补救一次。
                     if matches!(failure.class, UpstreamErrorClass::ContentBlocked { .. })
+                        && !named_switch
                         && !degraded
                         && ctx.prompt.mode.degradable()
                     {
@@ -847,6 +923,7 @@ async fn attempt_queue(
                     // 重试若成功，这一轮的结局就是成功（`break response` 那条
                     // 出口会记上）。这也与 `attempts` 的口径一致：那一轮只 +1。
                     if matches!(failure.class, UpstreamErrorClass::TokenExpired { .. })
+                        && !named_switch
                         && !refreshed
                     {
                         refreshed = true;
@@ -1577,6 +1654,58 @@ fn model_rewrite_of(adapter: &dyn ProviderAdapter, model: &str) -> Option<super:
     }
 }
 
+/// 手动终止在 `send_with_retry` 里的返回形态（见 [`cancelled_error`] 的说明：
+/// 调用方按令牌判定，不读这里的 `class`）。
+fn cancelled_failure() -> OutboundFailure {
+    OutboundFailure {
+        class: UpstreamErrorClass::Fatal {
+            status: cancellation::MANUAL_TERMINATED_STATUS as u16,
+            message: cancellation::MANUAL_TERMINATED.to_string(),
+            upstream_code: None,
+        },
+        error: cancellation::cancelled_error(),
+    }
+}
+
+/// 发一次上游请求；被手动终止时**立即**放弃等待（不等响应头超时）。
+///
+/// 上游连接随 future 被丢弃而关闭（与客户端断开时的取消是同一机制），
+/// 错误文案直接用手动终止的原文 —— 它不会被当成传输失败重试（调用方在
+/// 传输失败分支的最前面查令牌）。
+async fn send_or_cancel(
+    transport: &TransportRequest,
+    telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
+) -> Result<reqwest::Response, super::request::UpstreamRequestError> {
+    let Some(token) = telemetry.cancel_token() else {
+        return send_chat_request(transport).await;
+    };
+    tokio::select! {
+        result = send_chat_request(transport) => result,
+        _ = token.cancelled() => Err(super::request::UpstreamRequestError {
+            message: cancellation::MANUAL_TERMINATED.to_string(),
+            reason: cancellation::MANUAL_TERMINATED.to_string(),
+        }),
+    }
+}
+
+/// 退避睡眠；被手动终止时立即醒来（用户点了终止就不该再等一个间隔）。
+///
+/// 醒来之后由调用方的循环顶检查令牌并收尾 —— 这里不做判定，只负责「别睡着」。
+async fn sleep_or_cancel(
+    telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
+    delay_ms: u64,
+) {
+    let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+    tokio::pin!(sleep);
+    match telemetry.cancel_token() {
+        Some(token) => tokio::select! {
+            _ = &mut sleep => {}
+            _ = token.cancelled() => {}
+        },
+        None => sleep.await,
+    }
+}
+
 /// 发一次上游请求，含「可退避重试」循环（次数 / 间隔来自设置页的全局重试设置）。
 ///
 /// 成功的定义是 HTTP 2xx —— 与改造前 `request_with_waf_retry` 一致。
@@ -1613,12 +1742,28 @@ async fn send_with_retry(
     degraded: bool,
 ) -> Result<reqwest::Response, OutboundFailure> {
     loop {
-        let response = match send_chat_request(transport).await {
+        // 手动终止：发送前先看令牌（退避睡眠 / 上一轮失败之后回到这里）。
+        // 出口是 `cancelled_failure`，但调用方（attempt_queue）在分类动作之前
+        // 会再查一次令牌并直接返回 —— 这个 class 只是让本函数的返回形状成立。
+        if telemetry.is_cancelled() {
+            return Err(cancelled_failure());
+        }
+        // 阶段：这一下就是**真正发出**上游请求的时刻 → 等待响应。
+        // 为什么不能只靠尝试起头那一处（`note_attempt_started`）：同账号内的
+        // 退避重发也走本循环（外面看不见），退避期间阶段是「重试中」，
+        // 睡醒重发时必须推回去 —— 否则那一段等待首字节的时间会被显示成
+        // 「重试中」，而它其实已经在等上游出字了。
+        telemetry.note_phase(LogPhase::Waiting);
+        let response = match send_or_cancel(transport, telemetry).await {
             Ok(response) => response,
             Err(error) => {
+                // 手动终止：不把它当传输失败去退避重发（原因不是链路抖动）
+                if telemetry.is_cancelled() {
+                    return Err(cancelled_failure());
+                }
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
                 // 次数用完才收敛成 502，与改造前的兜底一致
-                if let Some(advice) = transport_retry_advice(budget.remaining) {
+                if let Some(advice) = transport_retry_advice(&error, budget.remaining) {
                     budget.remaining -= 1;
                     let used = budget.used();
                     telemetry.note_attempt_retry(&advice.reason, None, advice.delay_ms);
@@ -1626,7 +1771,7 @@ async fn send_with_retry(
                         "[Upstream]",
                         &retry_log_line(&advice.reason, advice.delay_ms, used, budget.total),
                     );
-                    tokio::time::sleep(Duration::from_millis(advice.delay_ms)).await;
+                    sleep_or_cancel(telemetry, advice.delay_ms).await;
                     continue;
                 }
                 let gateway = error.to_gateway_error();
@@ -1644,7 +1789,20 @@ async fn send_with_retry(
             return Ok(response);
         }
         let status = response.status().as_u16();
-        let detail = read_upstream_error(response, capture).await;
+        // 错误响应体的读取同样受「非流式响应超时」管（对应 OmniProxy
+        // readBodyWithStallGuard 的用法之一）：上游接了错误响应却迟迟不吐完
+        // 出错体时，不能让「读错误」把请求挂住 —— 读不出来就当上游没给细节，
+        // 分类仍按状态码走（classify_error 只看 status 也能给出结论）。
+        let detail = {
+            let budget = Duration::from_millis(config::timeout_settings().body_ms());
+            match tokio::time::timeout(budget, read_upstream_error(response, capture)).await {
+                Ok(detail) => detail,
+                Err(_elapsed) => super::request::UpstreamErrorDetail {
+                    code: None,
+                    message: format!("非流式响应超时({}秒)", budget.as_secs()),
+                },
+            }
+        };
         let body = detail.to_value();
         let class = adapter.classify_error(status, &body);
         // 退避重试：provider 专属判定优先，没声明时对瞬时状态码统一兜底
@@ -1655,7 +1813,17 @@ async fn send_with_retry(
         // （拦截由指纹逐字匹配触发，字节没变结论就不会变），还白吃掉重试预算。
         // 换过提示词之后（`degraded`）才回到既有口径：仍被拦就按适配器的退避建议
         // 重试（11-128 的「拦截窗口会持续一小段时间」是实测结论），再不行才换账号。
+        //
+        // ── 「指定错误码直接换号」为什么是第二道闸 ────────────────────
+        // 用户点名的状态码（默认 402）连「再看一眼」都不值得：重发同一份 body
+        // 结论不变。这里返回 None 会让下面的终端错误路径立即收尾，不再消耗
+        // 原地重发预算 —— 换号那条路由编排层接管：命中名单的失败不留在本账号
+        // 上，直接换下一个账号继续试（见 `direct_switch_status` 与动作 3），
+        // 换满仍失败才把错误给客户端。两处合起来才是「这个码直接换号」的
+        // 完整语义。
         let advice = if !degraded && matches!(class, UpstreamErrorClass::ContentBlocked { .. }) {
+            None
+        } else if direct_switch_status(i64::from(status)) {
             None
         } else {
             adapter
@@ -1671,7 +1839,7 @@ async fn send_with_retry(
                 "[Upstream]",
                 &retry_log_line(&advice.reason, advice.delay_ms, used, budget.total),
             );
-            tokio::time::sleep(Duration::from_millis(advice.delay_ms)).await;
+            sleep_or_cancel(telemetry, advice.delay_ms).await;
             continue;
         }
         // 定论的上游错误：这一行只在**终端**留痕。请求日志那侧由本轮明细的

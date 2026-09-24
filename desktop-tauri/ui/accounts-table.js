@@ -38,7 +38,7 @@
     supportsCheckin,
     checkedInToday,
     accountTags,
-    editionCell,
+    editionSuffix,
     formatResetText,
     activeLimits,
     limitPanelHtml,
@@ -49,6 +49,27 @@
   const PRIORITY_MIN = 0;
   const PRIORITY_MAX = 9999;
   const PRIORITY_DEFAULT = 100;
+
+  /**
+   * 账号名隐藏开关（表头「账号」旁边那颗眼睛）：打开后账号列的名字整体显示成
+   * 星号，截图 / 演示时不必逐个打码。这是「怎么看这张表」的偏好，与列宽同一档，
+   * 存 localStorage 跨次启动保留。
+   */
+  const NAMES_HIDDEN_KEY = 'workbuddy-desktop-accounts-names-hidden';
+  let namesHidden = localStorage.getItem(NAMES_HIDDEN_KEY) === '1';
+
+  /** 切换隐藏状态并落盘，返回切换后的值（点击处理用它触发整表重绘） */
+  function toggleNamesHidden() {
+    namesHidden = !namesHidden;
+    localStorage.setItem(NAMES_HIDDEN_KEY, namesHidden ? '1' : '0');
+    return namesHidden;
+  }
+
+  /**
+   * 星号掩码：按原名长度生成、4~12 个封顶 —— 完全不保长会把账号列压成短短一截，
+   * 与关闭时版式差得太多；封顶 12 则不让超长名字把星号串拉到撑破列宽。
+   */
+  const maskName = name => '*'.repeat(Math.min(Math.max(name.length, 4), 12));
 
   const clampPriority = value => Math.min(PRIORITY_MAX, Math.max(PRIORITY_MIN, Math.round(value)));
   const priorityOf = account => {
@@ -180,7 +201,7 @@
     })),
     // 挂载点是批量栏右侧的操作组（「批量操作 / 取消选择」那两颗）：齿轮插在最前，
     // 正好落在「批量操作」左边。放在这里而不是工具条右侧的操作组，是因为工具条
-    // 那组已经被「查询积分 / 全部签到 / 添加账号」占满，齿轮挤在它们前面时
+    // 那组已经被「查询余额 / 全部签到 / 添加账号」占满，齿轮挤在它们前面时
     // 会与三段筛选抢同一行的右端；批量栏这组按钮本就偏「对当前这张表做什么」，
     // 列设置（怎么看这张表）排头更顺。
     mount: () => document.querySelector('#batch-bar .batch-actions'),
@@ -196,6 +217,15 @@
     const columns = visibleColumns();
     const cells = columns.map((column, index) => {
       const hint = column.hint ? `<span class="th-hint">${esc(column.hint)}</span>` : '';
+      // 账号列的「隐藏账号名」眼睛：点一下名字整列变星号（处理在 accounts-view.js
+      // 的委托里，与本表「纯展示、不绑事件」的分工一致）。图标随状态换睁眼 / 闭眼，
+      // 隐藏生效时常亮主色 —— 「现在处于打码状态」不用悬停就能看出来。
+      const eye = column.key === 'account'
+        ? `<button class="name-eye${namesHidden ? ' on' : ''}" data-action="toggle-names"`
+          + ` title="${namesHidden ? '显示账号名' : '隐藏账号名（名字显示为星号）'}"`
+          + ` aria-label="${namesHidden ? '显示账号名' : '隐藏账号名'}"`
+          + ` aria-pressed="${namesHidden}">${window.wbIcons?.icon?.(namesHidden ? 'eyeOff' : 'eye', 13) || ''}</button>`
+        : '';
       // 把手不放勾选列（47px 宽，把手会压住复选框），也不放最后一列 ——
       // 它绝对定位在右缘（right: -4px），钉在表格右缘会顶出一条横向滚动条
       // （见模块头）。「哪一列在最后」是用户配置出来的，所以按渲染后的位置判。
@@ -210,7 +240,7 @@
       // data-col 是列的身份：列设置能换顺序，列宽（accounts-columns.js 的
       // columnAt）与它自己的 <col> 都靠这个属性认列，不再靠「第几个」。
       return `<th class="cell-${column.key} ta-${column.align}" data-col="${esc(column.key)}">`
-        + `<span class="th-label"${column.title ? ` title="${esc(column.title)}"` : ''}>${esc(column.label)}${hint}</span>${grip}</th>`;
+        + `<span class="th-label"${column.title ? ` title="${esc(column.title)}"` : ''}>${esc(column.label)}${hint}${eye}</span>${grip}</th>`;
     }).join('');
     return `<thead><tr>${cells}</tr></thead>`;
   }
@@ -300,23 +330,28 @@
   }
 
   /**
-   * 提供商：展示名 + 版本徽章，**默认同一行**，列宽不够才整块折行（flex-wrap，
-   * 见 .cell-provider .pv 的样式说明——折行是整块下移，badge 文字不会被截断）。
+   * 提供商：一枚徽章，带版本后缀（「WorkBuddy 国际版」）——与 AutoClaw 那种
+   * 「名字自带版本」的家同一种形态，不再提供商、版本两枚并排。列宽不够时
+   * 整块折行（flex-wrap，见 .cell-provider .pv 的样式说明）。
    * 徽章的配色按 provider id 生成（`p-<id>` 类），未登记的家在 CSS 里落到中性兜底
    * —— 加一家时不必改样式表，也不会显示成空白。
    */
   function providerCell(provider, account) {
-    const edition = providerFeatures(provider).edition ? editionCell(account) : '';
     const label = window.wbProviders?.labelOf?.(provider) || provider;
+    const edition = providerFeatures(provider).edition ? editionSuffix(account) : '';
+    const text = edition ? `${label} ${edition}` : label;
     return `<td class="cell-provider"><div class="pv">`
-      + `<span class="pbadge p-${esc(provider)}" title="提供商：${esc(label)}">${esc(label)}</span>`
-      + edition
+      + `<span class="pbadge p-${esc(provider)}" title="提供商：${esc(text)}">${esc(text)}</span>`
       + `</div></td>`;
   }
 
   /**
-   * 账号：第一行名称，第二行「桌面端」标记，第三行只在异常时出现
-   * （代理不可用原因 / 账号不可用）。
+   * 账号：第一行名称，第二行邮箱（有才渲染），第三行只在异常时出现
+   * （代理不可用原因）。
+   *
+   * 「账号当前不可用」那行红字不再渲染：`available` 把「手动禁用」也算进去
+   * （后端 `available = enabled && has_credentials`），手动关掉的账号被标成
+   * 「不可用」是把同一件事说两遍 —— 启用状态开关自己已经表达了。
    *
    * 标识（UID / userId）与 Token 尾号**不再上屏**：它们对「这条账号能不能用」没有
    * 信息量，却把副标题占掉大半 —— 同一屏里账号名和状态才是要一眼扫到的东西。
@@ -327,90 +362,149 @@
    * 账号列是唯一随窗口与列宽变化伸缩的一列，长文案在这里才读得到。
    * 限流的恢复时间不再出现在这里 —— 限额按模型记，它有自己的列（见 limitsCell）。
    *
-   * ── 代理那一段本次搬走了 ────────────────────────────────────
-   * 它原先在这里的第二行（「桌面端 · 代理 Clash 混合端口 7890」），现在有独立的
-   * 代理列（见 proxyCell）。两处显示同一个事实只会让人怀疑它们会不会不一致，
-   * 而代理是**线路**（决定请求从哪出去、出问题先看哪），与「这条账号是不是
-   * 桌面端登录态」不是同一类信息。第二行因此只剩桌面端标记，
-   * 普通账号（非桌面端、无代理）的副标识行整个不渲染（见 sub 的判空）。
+   * ── 第二行现在放**邮箱**（本次修正）────────────────────────────
+   * 原先第二行是一枚「桌面端」标签：它说的是「这条记录的凭证从哪来」（实现细节），
+   * 而这一列要回答的是「这是谁的号」。邮箱才是那个答案 —— 尤其是 AutoClaw
+   * 国际版：网页登录（Zai / Google）建出来的账号，名字只是上游 `user_name`
+   * （可能是个昵称，如「Lucas Ou」），光看名字分不清是同一个人还是两个人。
+   * 「桌面端实时登录态」这条信息没有丢，挪进了账号名的悬停提示。
+   *
+   * 名字本身就是邮箱时（桌面端导入的默认名就是邮箱）不重复渲染 ——
+   * 见后端 `import_autoclaw_desktop_account` 的默认名规则。
+   *
+   * ── Qoder / AutoClaw 国际版反过来：邮箱当**主名**（features.emailAsName）──
+   * 它们的记录名是上游资料里的昵称（Qoder 的 profile、AutoClaw 国际版网页登录
+   * 拿到的 `user_name`），与邮箱并存时两行说的是同一个人（一个对不上号、
+   * 一个能对上号）。所以这两家的账号列只显示邮箱：主行直接取邮箱，昵称 / 备注名
+   * 不再占一行（要看就悬停），副行也不再重复渲染邮箱。缺邮箱时照旧回落到名字。
    */
   function accountCell(account) {
     const ident = identifierOf(account);
     const features = providerFeatures(providerOf(account));
     const name = account.nickname || account.name || ident || '未命名账号';
+    const email = String(account.email || '').trim();
+    // Qoder 这类「以邮箱为账号名」的家：有邮箱就用它当主名（见 features.emailAsName）
+    const emailAsName = features.emailAsName && email ? email : '';
     const title = [
       ident ? `${features.identifier} ${ident}` : '',
+      // 邮箱顶掉了名字的位置，名字（昵称 / 备注名）改从这里看；隐藏账号名开关
+      // 打开时连这里也不给 —— 否则悬停一下就能绕过打码，那个开关就白开了
+      emailAsName && name !== email && !namesHidden ? `账号名 ${name}` : '',
+      // 桌面端实时登录态从标签挪到这里（见上方说明）：信息还在，只是不再占一行
+      isDesktopAccount(account) ? '桌面端实时登录态（凭证每次从客户端登录态文件读取）' : '',
       account.tokenTail ? `Token 尾号 ${account.tokenTail}` : '',
       account.updatedAt ? `更新于 ${formatTime(account.updatedAt)}` : '',
       account.source ? `来源 ${account.source === 'imported' ? '旧数据导入' : '手动添加'}` : '',
     ].filter(Boolean).join('；');
 
-    const desktop = isDesktopAccount(account)
-      ? '<span class="badge desktop-tag" title="桌面端实时登录态：凭证每次从客户端登录态文件读取">桌面端</span>'
+    const showEmail = !emailAsName && email && email !== name;
+    // 隐藏账号名开关打开时邮箱一起打码：它同样能认出「这是谁的号」，
+    // 只遮名字等于没遮（掩码按原值取长，见 maskName 的说明）
+    const sub = showEmail
+      ? `<div class="acct-sub"><span class="acct-email" title="账号邮箱">`
+        + `${esc(namesHidden ? maskName(email) : email)}</span></div>`
       : '';
     // 明细行为空时整行不渲染：一个空的 .acct-sub 仍占一行行高（margin + line-height），
     // 在没有任何副标识的账号上会白留一道空隙，而它恰恰是「这行没什么可说的」那种账号
     const note = healthNote(account);
+    // 主名：以邮箱为账号名的家（Qoder）取邮箱，其余取名字
+    const primary = emailAsName || name;
+    // 隐藏开关打开时主名整体变星号（掩码按原值取长，见 maskName 的说明）
+    const shown = namesHidden ? maskName(primary) : primary;
     return `<td class="cell-account"><div class="acct-name"${title ? ` title="${esc(title)}"` : ''}>`
-      + `<span class="name">${esc(name)}</span></div>`
-      + (desktop ? `<div class="acct-sub">${desktop}</div>` : '')
+      + `<span class="name">${esc(shown)}</span></div>`
+      + sub
       + note
       + '</td>';
   }
 
   /**
-   * 代理：这个账号出网走哪条线路（列形态参考 OmniProxy 的「代理」列 ——
-   * 一格一件事，扫一眼就知道走的是哪个出口）。
+   * 代理：这个账号出网走哪条线路（列形态对照 OmniProxy 的「代理」列：一格一个
+   * **下拉，选中即保存** —— 处理在 accounts-view 的 change 委托里）。
    *
-   * ── 三种形态 ────────────────────────────────────────────────
-   *   · 未配置 → 「直连」（中性色）。空着会被当成渲染缺失，而写「无」不像状态；
-   *     「直连」是准确的说法 —— 它就是不走代理。
-   *   · 已配置 → 后端给的展示名 `proxy.label`（Clash 是「节点名（:7890）」或
-   *     「Clash 混合端口 7890」，自定义是「http://host:port」；换算在
-   *     `core::proxies::describe_account_proxy`，前端不自己拼 —— 两处拼法迟早漂）。
-   *   · 解析失败 → 「解析失败」红字，完整原因进 title（账号列的异常说明里
-   *     还有一份更显眼的，两处都指向「去设置里改」）。
+   * ── 下拉选项 ────────────────────────────────────────────────
+   *   · 「直连」→ 清掉代理（null）；
+   *   · 每个 Clash Verge 出口一项（`节点名 :端口`）→ `{source:'clash', listenerUid}`；
+   *   · 「自定义代理…」是**动作项**（值 [`PROXY_CUSTOM_EDIT`]，不是一种配置）：
+   *     自定义要填协议 / host / port / 账号密码，表达不进一个下拉 —— 选中它
+   *     打开账号设置弹窗（完整的代理表单在那里），view 侧随即把下拉恢复原值。
    *
-   * ── 为什么整格是一个按钮，而不是像 OmniProxy 那样的行内下拉 ──────
-   * OmniProxy 的代理是**独立实体**（有 id / name / protocol / host / port），
-   * 所以一个下拉就能换。本项目的代理是**账号内嵌的配置**，三种形态里
-   * 「自定义」（协议 + host + port + 用户名密码）根本表达不进一个下拉，
-   * 而 Clash 出口列表还要异步读 Clash Verge 的配置（见 proxy-form.js 的
-   * `loadClashOptions`）。行内下拉只能覆盖「直连 / Clash 出口」两态，
-   * 第三种仍要开弹窗 —— 与其做一半、让用户猜「为什么这里改不了自定义」，
-   * 不如让整格都是「去改它」的入口：点开的就是那个完整的代理表单
-   * （`data-action="settings"`，与操作列那颗「设置」走同一条链，
-   * 处理在 app.js 的 runAccountAction）。
+   * ── 出口列表从哪来 ──────────────────────────────────────────
+   * proxy-form.js 的模块级缓存（`clashSnapshot` 同步读）——本函数是纯渲染、
+   * 不发请求；缓存没就绪时先只有「直连 + 当前值 + 自定义…」，view 侧首次渲染
+   * 后补拉一次再重画。当前值是 Clash 出口但不在列表里（出口被删 / 列表换了
+   * 订阅）时照 OmniProxy 的手法把当前值补成一项，不让它从下拉里消失。
+   *
+   * ── 解析失败（proxy.error）──────────────────────────────────
+   * 当前值照常显示、label 带「（不可用）」、整格标红、原因进 title ——
+   * 账号列第二行的异常说明里还有一份更显眼的（见 healthNote）。
    */
+  /** 代理下拉里两个「不是出口 uid」的特殊值：代表当前自定义配置的显示项、打开设置弹窗的动作项 */
+  const PROXY_CUSTOM_CURRENT = '__proxy_custom__';
+  const PROXY_CUSTOM_EDIT = '__proxy_custom_edit__';
+
   function proxyCell(account) {
-    const button = (label, kind, title) =>
-      `<button class="proxy-cell ${kind}" data-action="settings" data-id="${esc(account.id)}"`
-      + ` title="${esc(title)}">${esc(label)}</button>`;
     const proxy = account.proxy;
-    if (!proxy) {
-      return `<td class="cell-proxy">${button('直连', 'none', '该账号直连上游，未配置出网代理；点击可设置')}</td>`;
+    const source = proxy?.config?.source || proxy?.source;
+    const label = proxy?.label || (source === 'custom' ? '自定义代理' : '已设置');
+    const broken = proxy?.error;
+
+    // 当前值（option 的 selected 口径）；值域 = 上面的三条注释。
+    // 「有代理但取不到 Clash 出口 uid」（自定义 / 坏形状）都落到自定义项 ——
+    // 绝不能回落成「直连」：那会把「配置坏了」显示成「没配」。
+    let current = '';
+    if (source === 'clash' && proxy?.config?.listenerUid) current = String(proxy.config.listenerUid);
+    else if (proxy) current = PROXY_CUSTOM_CURRENT;
+
+    const rows = [{ value: '', label: '直连' }];
+    const clash = window.wbProxyForm?.clashSnapshot?.()?.clash;
+    const exits = Array.isArray(clash?.options) ? clash.options : [];
+    for (const exit of exits) rows.push({ value: String(exit.uid), label: `${exit.name} :${exit.port}` });
+    // 「当前出口已不在列表」（被删 / 换了订阅）：补位项 + title 提示各担一半——
+    // 长名字会把「（不在列表）」截掉，悬浮的 title 里必须能读到这件事
+    const staleExit = source === 'clash' && Boolean(current)
+      && !exits.some(exit => String(exit.uid) === current);
+    // 列表已就绪但拿不到出口：放一条不可选的说明，省得用户对着空列表猜
+    if (clash && clash.available === false) {
+      rows.push({ value: '__hint__', label: clash.error ? 'Clash 配置不可用' : '未检测到 Clash Verge', disabled: true });
+    } else if (clash && !exits.length) {
+      rows.push({ value: '__hint__', label: '没有可用的 Clash 出口', disabled: true });
+    } else if (!clash && window.wbProxyForm?.clashError?.()) {
+      // 列表读取失败（视图侧在节流重试）：把「为什么少一批选项」说出来 ——
+      // 与「没装 Clash」是两种不同的处境，不能都静默成两项
+      rows.push({ value: '__hint__', label: 'Clash 出口列表读取失败（重试中）', disabled: true });
     }
-    if (proxy.error) {
-      return `<td class="cell-proxy">${button(
-        '解析失败',
-        'bad',
-        `代理不可用：${proxy.error}（转发时会回退直连）；点击可修改`,
-      )}</td>`;
+    if (source === 'clash') {
+      if (staleExit) {
+        rows.push({ value: current, label: `${label}${broken ? '（不可用）' : '（不在列表）'}` });
+      }
+    } else if (current === PROXY_CUSTOM_CURRENT) {
+      const prefix = source === 'custom' ? '自定义：' : '';
+      rows.push({ value: PROXY_CUSTOM_CURRENT, label: `${prefix}${label}${broken ? '（不可用）' : ''}` });
     }
-    const label = proxy.label || '已设置';
-    const from = proxy.source === 'clash' ? 'Clash Verge 出口' : '自定义代理';
-    return `<td class="cell-proxy">${button(label, 'on', `${from}：${label}；点击可修改`)}</td>`;
+    rows.push({ value: PROXY_CUSTOM_EDIT, label: '自定义代理…' });
+
+    const title = broken
+      ? `代理不可用：${proxy.error}（转发时会回退直连）；选「自定义代理…」去修改`
+      : staleExit
+        ? `「${label}」已不在 Clash 的当前配置里（转发时会回退直连）；选择即保存，「自定义代理…」重新设置`
+        : `当前：${proxy ? label : '直连'}；选择即保存，「自定义代理…」打开完整设置`;
+    return `<td class="cell-proxy${broken ? ' err' : ''}">`
+      + `<select class="proxy-pick" data-proxy-pick="${esc(account.id)}"`
+      + ` data-proxy-selected="${esc(current)}" title="${esc(title)}">`
+      + rows.map(row => `<option value="${esc(row.value)}"`
+        + `${row.disabled ? ' disabled' : ''}${row.value === current ? ' selected' : ''}>${esc(row.label)}</option>`).join('')
+      + '</select></td>';
   }
 
   /**
-   * 异常说明（第三行）。只覆盖「不随请求变化」的故障（代理 / 不可用）；
+   * 异常说明（第三行）。只覆盖「不随请求变化」的代理故障；
    * 限流是按模型的、会自动解除，它的展示与操作都在「限流」列里。
    * 没有异常时返回空串 —— 不能给正常账号留一行占位，那一行的高度会白送给整张表。
    */
   function healthNote(account) {
     const notes = [];
     if (account.proxy?.error) notes.push(`代理不可用：${account.proxy.error}`);
-    if (account.available === false) notes.push(account.reason || '账号当前不可用');
     if (!notes.length) return '';
     return `<div class="acct-note bad" title="${esc(notes.join('；'))}">${esc(notes.join('；'))}</div>`;
   }
@@ -453,7 +547,7 @@
    *
    * 开关直接落 `PATCH { enabled }`（与「⋯」菜单里的启用/禁用是同一条链，语义一致），
    * 不做二次确认 —— 这个动作可逆，且关掉后账号记录仍在列表里（不是删除）。
-   * 徽章沿用 accounts-model 的 accountTags：代理异常 / 不可用 / 仅账号管理；
+   * 徽章沿用 accounts-model 的 accountTags：代理异常 / 仅账号管理；
    * 一切正常时它返回空串，这里就**不渲染徽章那一行** —— 启用状态由开关的
    * 轨道位置与滑块表达，再补一枚「启用」是同一格里的第二次说明。
    */
@@ -759,6 +853,13 @@
     PRIORITY_DEFAULT,
     priorityOf,
     clampPriority,
+    // 代理下拉的两个特殊值：视图侧的 change 委托按同一份常量比对
+    // （「自定义代理…」= 打开设置弹窗的动作，不是一种配置；见 proxyCell）
+    PROXY_CUSTOM_CURRENT,
+    PROXY_CUSTOM_EDIT,
+    // 账号名隐藏开关：状态在本模块（accountCell / headRowHtml 渲染时都要读），
+    // 切换入口给视图侧的点击委托调 —— 本模块不绑事件，见模块头的分工说明
+    toggleNamesHidden,
     captureEditing,
     restoreEditing,
   };
