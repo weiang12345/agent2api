@@ -163,21 +163,25 @@ impl ProviderAdapter for TraeAdapter {
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
+        account_id: &'a str,
         force: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
         Box::pin(async move {
-            let Some(record) = store.trae_account_record("") else {
+            let Some(record) = store.trae_account_record(account_id) else {
                 logging::verbose("[Models]", "Trae 模型目录刷新跳过：尚未添加账号");
-                return ModelRefreshOutcome::unchanged();
+                if account_id.is_empty() {
+                    return ModelRefreshOutcome::unchanged();
+                }
+                return ModelRefreshOutcome::failed("指定的账号不存在或不可用，请重新选择");
             };
             let Ok(credentials) = Credentials::from_payload(&record) else {
                 return ModelRefreshOutcome::failed("Trae 账号凭证无效，请重新登录");
             };
-            let credentials = match refresh_if_needed(store, "", &credentials, false).await {
+            let credentials = match refresh_if_needed(store, account_id, &credentials, false).await {
                 Ok(value) => value,
                 Err(error) => return ModelRefreshOutcome::failed(error.message),
             };
-            let proxy = match account_proxy(store, "") {
+            let proxy = match account_proxy(store, account_id) {
                 Ok(value) => value,
                 Err(error) => return ModelRefreshOutcome::failed(error.message),
             };
