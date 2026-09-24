@@ -136,7 +136,7 @@ $response.assets[0].size
 ## 8. 当前部署基线
 
 - 当前 Release：`v2.7.5-fork.1`
-- 当前 `main` 提交：`bdcced7`
+- 当前发布基线提交：`bdcced7`
 - 当前更新仓库：`weiang12345/agent2api`
 - 当前构建产物：`Agent2API_2.7.5_x64-setup.exe`
 - 当前 SHA256：
