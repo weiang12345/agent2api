@@ -24,7 +24,10 @@ pub async fn start() -> Result<OAuthLogin, GatewayError> {
     let state = text(&payload, &["state"]);
     let login_url = text(&payload, &["login_url", "loginUrl"]);
     if state.is_empty() || login_url.is_empty() {
-        return Err(GatewayError::with_status(502, "AtomCode 登录服务未返回 state 或授权地址"));
+        return Err(GatewayError::with_status(
+            502,
+            "AtomCode 登录服务未返回 state 或授权地址",
+        ));
     }
     Ok(OAuthLogin { state, login_url })
 }
@@ -38,11 +41,18 @@ pub async fn poll_once(state: &str) -> Result<Option<Credentials>, GatewayError>
         .await
         .map_err(|error| transport_error("检查 AtomCode 登录状态", &error.to_string()))?;
     let check_payload = payload(response, "检查 AtomCode 登录状态")?;
-    if !check_payload.get("valid").and_then(Value::as_bool).unwrap_or(false) {
+    if !check_payload
+        .get("valid")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
 
-    let token_url = format!("{PLATFORM_BASE_URL}/auth/token?state={}", urlencoding(state));
+    let token_url = format!(
+        "{PLATFORM_BASE_URL}/auth/token?state={}",
+        urlencoding(state)
+    );
     let response = send_request("GET", &token_url, None, &[])
         .await
         .map_err(|error| transport_error("获取 AtomCode 登录凭证", &error.to_string()))?;
@@ -52,7 +62,10 @@ pub async fn poll_once(state: &str) -> Result<Option<Credentials>, GatewayError>
 
 pub async fn refresh(credentials: &Credentials) -> Result<Credentials, GatewayError> {
     if credentials.refresh_token.is_empty() {
-        return Err(GatewayError::with_status(400, "AtomCode 账号缺少 refreshToken，无法续期"));
+        return Err(GatewayError::with_status(
+            400,
+            "AtomCode 账号缺少 refreshToken，无法续期",
+        ));
     }
     let url = format!("{PLATFORM_BASE_URL}/oauth/refresh");
     let body = json!({ "refresh_token": credentials.refresh_token });

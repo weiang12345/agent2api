@@ -43,12 +43,11 @@ pub async fn entry(State(state): State<ServerState>, request: axum::extract::Req
     let method = request.method().clone();
     let full_path = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or("").to_string();
-    let body = match axum::body::to_bytes(request.into_body(), crate::server::http::MAX_BODY_SIZE)
-        .await
-    {
-        Ok(bytes) => bytes,
-        Err(error) => return management_error(413, format!("请求体读取失败或过大: {error}")),
-    };
+    let body =
+        match axum::body::to_bytes(request.into_body(), crate::server::http::MAX_BODY_SIZE).await {
+            Ok(bytes) => bytes,
+            Err(error) => return management_error(413, format!("请求体读取失败或过大: {error}")),
+        };
     dispatch(&state, method, &full_path, &query, &body).await
 }
 

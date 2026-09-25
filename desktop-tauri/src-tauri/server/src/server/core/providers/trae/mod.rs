@@ -59,7 +59,10 @@ impl ProviderAdapter for TraeAdapter {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if token.is_empty() {
-            return Err(GatewayError::with_status(401, "Trae 账号缺少 accessToken，无法转发"));
+            return Err(GatewayError::with_status(
+                401,
+                "Trae 账号缺少 accessToken，无法转发",
+            ));
         }
         let machine_id = account
             .get("auth")
@@ -100,14 +103,20 @@ impl ProviderAdapter for TraeAdapter {
                 status: if status == 0 { 429 } else { status },
             };
         }
-        UpstreamErrorClass::Fatal { status, message, upstream_code: code }
+        UpstreamErrorClass::Fatal {
+            status,
+            message,
+            upstream_code: code,
+        }
     }
 
     fn ensure_access_token<'a>(
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let credentials = credentials_for(store, account_id)?;
             let refreshed = refresh_if_needed(store, account_id, &credentials, false).await?;
@@ -119,7 +128,9 @@ impl ProviderAdapter for TraeAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let credentials = credentials_for(store, account_id)?;
             let refreshed = refresh_if_needed(store, account_id, &credentials, true).await?;
@@ -142,12 +153,12 @@ impl ProviderAdapter for TraeAdapter {
         true
     }
 
-
     fn query_usage<'a>(
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let credentials = credentials_for(store, account_id)?;
             let credentials = refresh_if_needed(store, account_id, &credentials, false).await?;
@@ -177,7 +188,8 @@ impl ProviderAdapter for TraeAdapter {
             let Ok(credentials) = Credentials::from_payload(&record) else {
                 return ModelRefreshOutcome::failed("Trae 账号凭证无效，请重新登录");
             };
-            let credentials = match refresh_if_needed(store, account_id, &credentials, false).await {
+            let credentials = match refresh_if_needed(store, account_id, &credentials, false).await
+            {
                 Ok(value) => value,
                 Err(error) => return ModelRefreshOutcome::failed(error.message),
             };
@@ -209,20 +221,19 @@ impl ProviderAdapter for TraeAdapter {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                Output = Result<crate::server::core::upstream::ForwardOutcome, GatewayError>,
-            > + Send
-            + 'a,
+                    Output = Result<crate::server::core::upstream::ForwardOutcome, GatewayError>,
+                > + Send
+                + 'a,
         >,
     > {
         Box::pin(async move {
             let credentials = credentials_for(store, account_id)?;
             let credentials = refresh_if_needed(store, account_id, &credentials, false).await?;
             let plan = self.chat_plan(&credentials, body)?;
-            let mut builder = egress::client_for(proxy.as_ref())
-                .post(plan.url)
-                .body(serde_json::to_vec(&plan.body).map_err(|_| {
-                    GatewayError::with_status(500, "Trae 请求体序列化失败")
-                })?);
+            let mut builder = egress::client_for(proxy.as_ref()).post(plan.url).body(
+                serde_json::to_vec(&plan.body)
+                    .map_err(|_| GatewayError::with_status(500, "Trae 请求体序列化失败"))?,
+            );
             for (key, value) in plan.headers {
                 builder = builder.header(key, value);
             }
@@ -240,7 +251,10 @@ impl ProviderAdapter for TraeAdapter {
                 let text = response.text().await.unwrap_or_default();
                 return Err(GatewayError::with_status(
                     i32::from(status),
-                    format!("Trae 上游返回 {status}: {}", text.chars().take(300).collect::<String>()),
+                    format!(
+                        "Trae 上游返回 {status}: {}",
+                        text.chars().take(300).collect::<String>()
+                    ),
                 ));
             }
 
@@ -252,10 +266,7 @@ impl ProviderAdapter for TraeAdapter {
                 let chunk = chunk.map_err(|error| {
                     GatewayError::with_status(
                         502,
-                        format!(
-                            "Trae 上游流中断：{}",
-                            egress::describe_error_detail(&error)
-                        ),
+                        format!("Trae 上游流中断：{}", egress::describe_error_detail(&error)),
                     )
                 })?;
                 for event in parser.push(&chunk) {
@@ -330,7 +341,10 @@ impl TraeAdapter {
     }
 }
 
-pub fn credentials_for(store: &AccountStore, account_id: &str) -> Result<Credentials, GatewayError> {
+pub fn credentials_for(
+    store: &AccountStore,
+    account_id: &str,
+) -> Result<Credentials, GatewayError> {
     let record = store
         .trae_account_record(account_id)
         .ok_or_else(|| GatewayError::with_status(401, "没有可用的 Trae 账号"))?;

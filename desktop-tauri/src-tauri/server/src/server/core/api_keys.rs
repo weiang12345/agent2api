@@ -91,7 +91,11 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 
 /// 白名单列表 → 落盘形态（**空也写成 `[]`**，见模块头）
 fn list_value(list: &[String]) -> Value {
-    Value::Array(list.iter().map(|item| Value::String(item.clone())).collect())
+    Value::Array(
+        list.iter()
+            .map(|item| Value::String(item.clone()))
+            .collect(),
+    )
 }
 
 impl ApiKeyEntry {

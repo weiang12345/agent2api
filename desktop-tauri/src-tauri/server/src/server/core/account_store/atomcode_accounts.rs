@@ -37,7 +37,8 @@ impl AccountStore {
         source: &str,
     ) -> Result<Value, AccountStoreError> {
         let mut credentials = credentials.clone();
-        credentials.complete_identity()
+        credentials
+            .complete_identity()
             .map_err(|error| AccountStoreError::new(error.message, error.status_code))?;
         let guard = self.guard();
         let existing = self
@@ -63,7 +64,12 @@ impl AccountStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .or_else(|| existing.as_ref().map(StoredAccount::name).filter(|value| !value.is_empty()))
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(StoredAccount::name)
+                    .filter(|value| !value.is_empty())
+            })
             .unwrap_or_else(|| {
                 if !credentials.name.is_empty() {
                     credentials.name.clone()
@@ -99,17 +105,34 @@ impl AccountStore {
         };
         fields.insert("id".to_string(), Value::String(id.clone()));
         fields.insert("provider".to_string(), Value::String(PROVIDER.to_string()));
-        fields.insert("uid".to_string(), Value::String(credentials.user_id.clone()));
-        fields.insert("name".to_string(), Value::String(truncate_chars(&record_name, 100)));
-        fields.insert("nickname".to_string(), Value::String(credentials.name.clone()));
-        fields.insert("tokenTail".to_string(), Value::String(token_tail_of(&credentials.access_token)));
+        fields.insert(
+            "uid".to_string(),
+            Value::String(credentials.user_id.clone()),
+        );
+        fields.insert(
+            "name".to_string(),
+            Value::String(truncate_chars(&record_name, 100)),
+        );
+        fields.insert(
+            "nickname".to_string(),
+            Value::String(credentials.name.clone()),
+        );
+        fields.insert(
+            "tokenTail".to_string(),
+            Value::String(token_tail_of(&credentials.access_token)),
+        );
         fields.insert("priority".to_string(), Value::from(priority));
         fields.insert("enabled".to_string(), Value::Bool(true));
         fields.insert("desktop".to_string(), Value::Bool(false));
         fields.insert("source".to_string(), Value::String(source.to_string()));
         fields.insert(
             "addedAt".to_string(),
-            Value::from(existing.as_ref().map(StoredAccount::added_at).unwrap_or_else(logging::now_ms)),
+            Value::from(
+                existing
+                    .as_ref()
+                    .map(StoredAccount::added_at)
+                    .unwrap_or_else(logging::now_ms),
+            ),
         );
         fields.insert("updatedAt".to_string(), Value::from(logging::now_ms()));
         fields.insert("rateLimits".to_string(), json!({}));
@@ -138,7 +161,13 @@ impl AccountStore {
         else {
             return Ok(CredentialWrite::Stale);
         };
-        for key in ["accessToken", "refreshToken", "expiresAt", "userId", "addedAt"] {
+        for key in [
+            "accessToken",
+            "refreshToken",
+            "expiresAt",
+            "userId",
+            "addedAt",
+        ] {
             if record.get(key) != expected.get(key) {
                 return Ok(CredentialWrite::Stale);
             }
@@ -156,7 +185,10 @@ impl AccountStore {
                 record.fields_mut().insert(key, value);
             }
         }
-        record.set("tokenTail", Value::String(token_tail_of(&credentials.access_token)));
+        record.set(
+            "tokenTail",
+            Value::String(token_tail_of(&credentials.access_token)),
+        );
         record.set_updated_at(logging::now_ms());
         self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
         Ok(CredentialWrite::Written)
@@ -175,9 +207,15 @@ impl AccountStore {
             "tokenTail",
             "expiresAt",
         ] {
-            public.insert(key.to_string(), record.get(key).cloned().unwrap_or(Value::Null));
+            public.insert(
+                key.to_string(),
+                record.get(key).cloned().unwrap_or(Value::Null),
+            );
         }
-        public.insert("userId".to_string(), record.get("uid").cloned().unwrap_or(Value::Null));
+        public.insert(
+            "userId".to_string(),
+            record.get("uid").cloned().unwrap_or(Value::Null),
+        );
         public.insert(
             "hasRefreshToken".to_string(),
             Value::Bool(!record.refresh_token().is_empty()),
@@ -190,7 +228,13 @@ impl AccountStore {
             "proxy".to_string(),
             crate::server::core::proxies::describe_account_proxy(Some(&record.proxy())),
         );
-        public.insert("rateLimits".to_string(), record.get("rateLimits").cloned().unwrap_or_else(|| json!({})));
+        public.insert(
+            "rateLimits".to_string(),
+            record
+                .get("rateLimits")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        );
         public.insert("desktop".to_string(), Value::Bool(false));
         public.insert("available".to_string(), Value::Bool(record.has_token()));
         Value::Object(public)

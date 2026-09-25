@@ -15,23 +15,42 @@ pub const IDE_VERSION_CODE: &str = "20260811";
 pub const FUNCTION: &str = "solo_work_lite";
 pub const DEFAULT_MODEL: &str = "glm-5.2";
 
-pub fn solo_headers(token: &str, user_id: &str, machine_id: &str, device_id: &str, stream: bool) -> Vec<(String, String)> {
+pub fn solo_headers(
+    token: &str,
+    user_id: &str,
+    machine_id: &str,
+    device_id: &str,
+    stream: bool,
+) -> Vec<(String, String)> {
     vec![
         ("Content-Type".to_string(), "application/json".to_string()),
         (
             "Accept".to_string(),
-            if stream { "text/event-stream".to_string() } else { "application/json".to_string() },
+            if stream {
+                "text/event-stream".to_string()
+            } else {
+                "application/json".to_string()
+            },
         ),
         ("User-Agent".to_string(), format!("Trae/{IDE_VERSION}")),
-        ("Authorization".to_string(), format!("Cloud-IDE-JWT {token}")),
+        (
+            "Authorization".to_string(),
+            format!("Cloud-IDE-JWT {token}"),
+        ),
         ("X-Cloudide-Token".to_string(), token.to_string()),
         ("X-Ide-Token".to_string(), token.to_string()),
         ("X-Uid".to_string(), user_id.to_string()),
         ("X-App-Id".to_string(), APP_ID.to_string()),
         ("X-App-Version".to_string(), "default".to_string()),
         ("X-Ide-Version".to_string(), IDE_VERSION.to_string()),
-        ("X-Ide-Version-Code".to_string(), IDE_VERSION_CODE.to_string()),
-        ("X-App-Version-Code".to_string(), IDE_VERSION_CODE.to_string()),
+        (
+            "X-Ide-Version-Code".to_string(),
+            IDE_VERSION_CODE.to_string(),
+        ),
+        (
+            "X-App-Version-Code".to_string(),
+            IDE_VERSION_CODE.to_string(),
+        ),
         ("X-Ide-Version-Type".to_string(), "stable".to_string()),
         ("X-Device-Type".to_string(), "macos".to_string()),
         ("X-OS-Version".to_string(), "macOS 15.7.4".to_string()),
@@ -51,14 +70,18 @@ pub fn oauth_headers() -> Vec<(String, String)> {
 }
 
 pub fn prepare_body(body: &Value, stream: bool) -> Result<Value, GatewayError> {
-    let object = body.as_object().ok_or_else(|| {
-        GatewayError::with_status(400, "Trae 请求体必须是 JSON 对象")
-    })?;
+    let object = body
+        .as_object()
+        .ok_or_else(|| GatewayError::with_status(400, "Trae 请求体必须是 JSON 对象"))?;
     let mut out = Map::new();
     for (key, value) in object {
         out.insert(key.clone(), value.clone());
     }
-    let model = out.get("model").and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty());
+    let model = out
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let model = model.unwrap_or(DEFAULT_MODEL).to_string();
     out.insert("model".to_string(), Value::String(model.clone()));
     out.insert("config_name".to_string(), Value::String(model));
@@ -76,7 +99,10 @@ pub fn prepare_body(body: &Value, stream: bool) -> Result<Value, GatewayError> {
 
 fn normalize_messages(value: Option<&Value>) -> Result<Value, GatewayError> {
     let Some(list) = value.and_then(Value::as_array).cloned() else {
-        return Err(GatewayError::with_status(400, "Trae 请求缺少 messages 数组"));
+        return Err(GatewayError::with_status(
+            400,
+            "Trae 请求缺少 messages 数组",
+        ));
     };
     let mut out = Vec::with_capacity(list.len());
     for mut message in list {
@@ -147,7 +173,11 @@ fn normalize_tool_choice(out: &mut Map<String, Value>) {
                 out.insert("tool_choice".to_string(), Value::String(value));
             }
         }
-        Value::Object(value) => match value.get("type").and_then(Value::as_str).unwrap_or_default() {
+        Value::Object(value) => match value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
             "none" => {
                 out.remove("tool_choice");
                 out.remove("tools");

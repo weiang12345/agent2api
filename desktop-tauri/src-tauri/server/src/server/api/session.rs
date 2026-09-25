@@ -124,7 +124,11 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
 ///
 /// 模型未知 / 该模型下确实没有可用账号时给 null —— 界面回落到
 /// `currentAccountId`，宁可让它标一个「队列第一位」，也不要整列 ★ 凭空消失。
-fn routed_account_id(accounts: &Value, model: Option<&str>, counts: &HashMap<String, usize>) -> Value {
+fn routed_account_id(
+    accounts: &Value,
+    model: Option<&str>,
+    counts: &HashMap<String, usize>,
+) -> Value {
     let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
         return Value::Null;
     };
@@ -210,6 +214,40 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
             "edition": task.edition, "provider": "qoder" }));
     }
+    // ZCode：**服务端中介的 CLI 轮询**（`/oauth/cli/init` 拿授权地址，
+    // 用户在浏览器里授权后由后台任务轮询换令牌）。响应形状与 Qoder 那条
+    // 一致（`{state, authUrl, edition, provider}`），前端不需要新分支。
+    //
+    // ── 地区取谁：**provider id**，不是请求里的 `edition` ────────
+    // 界面上两个地区是两张卡片（`zcode` / `zcode-intl`），点哪张就发哪个
+    // provider id —— 那是权威。`edition` 是前端回显用的字段，若拿它定地区，
+    // 两张卡片共用一个表单时就会串味（点了国际版却落了国内版账号，
+    // 而账号记录一旦落错家，转发会稳定打错域名）。因此这里由 kind 反查地区，
+    // 再把地区交给登录任务（任务表里的 edition 串只用做日志与回显）。
+    if let Some(region) = crate::server::core::providers::zcode::region::Region::from_kind(kind) {
+        let handle = match state.login().start_zcode_login(region) {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        // ★ 必须等授权地址落地再响应，不能直接回快照：地址只能从上游 init 拿，
+        // 而 init 在 spawn 出去的任务里跑 —— 立刻回快照就是回一个 `authUrl: null`，
+        // 壳侧读一次就放弃（「后端未返回登录链接，请检查网络」），不会轮询补取。
+        // 等待与登记用的都是 WorkBuddy 那条的现成机制（`wait_for_auth_url`
+        // 顺带把任务按 state 登记进任务表，`/wait` 靠它查）。
+        let (task_state, auth_url, task_edition) = match state
+            .login()
+            .wait_for_auth_url(&handle, Duration::from_millis(AUTH_URL_WAIT_MS))
+            .await
+        {
+            Ok(values) => values,
+            Err(error) => {
+                logging::log("[Login]", &format!("❌ 发起 ZCode 登录失败: {error}"));
+                return management_error(502, error);
+            }
+        };
+        return ok_json(json!({ "state": task_state, "authUrl": auth_url,
+            "edition": task_edition, "provider": region.provider_id() }));
+    }
     // Cline：**设备授权登录**（WorkOS RFC 8628）。形态上介于「网页登录」与
     // 「Qoder 设备授权」之间：同步问上游要 user_code 与授权页地址（一次 POST），
     // 把地址交给界面打开；用户确认后由后台任务轮询换令牌。
@@ -233,7 +271,11 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
             .map(str::to_string)
             .filter(|value| !value.trim().is_empty());
         let provider_id = crate::server::core::providers::kind_id(kind);
-        let handle = match state.login().start_cline_device_login(provider_id, name).await {
+        let handle = match state
+            .login()
+            .start_cline_device_login(provider_id, name)
+            .await
+        {
             Ok(handle) => handle,
             Err(error) => return management_error(400, error),
         };
@@ -327,7 +369,10 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
 /// 响应形状与 workbuddy 分支**完全一致**（`{state, authUrl}` + 一个 `edition`
 /// 字段）：前端与壳侧轮询逻辑只认这三个键，多一个 provider 维度不该改动它们。
 /// `edition` 对非 workbuddy 没有语义（这里仍给默认值，省得前端读到 null）。
-async fn start_web_login(state: ServerState, kind: crate::server::core::providers::ProviderKind) -> Response {
+async fn start_web_login(
+    state: ServerState,
+    kind: crate::server::core::providers::ProviderKind,
+) -> Response {
     let label = crate::server::core::providers::meta(kind).label;
     let handle = match state.login().start_web_login(kind) {
         Ok(handle) => handle,
@@ -335,7 +380,10 @@ async fn start_web_login(state: ServerState, kind: crate::server::core::provider
     };
     let task = handle.snapshot();
     let (Some(task_state), Some(auth_url)) = (task.state, task.auth_url) else {
-        return management_error(500, format!("{label}网页登录未能生成 state/授权地址，请重试"));
+        return management_error(
+            500,
+            format!("{label}网页登录未能生成 state/授权地址，请重试"),
+        );
     };
     ok_json(json!({
         "state": task_state,
@@ -371,7 +419,9 @@ pub async fn login_cancel(State(state): State<ServerState>, body: Bytes) -> Resp
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let canceled = state.login().tasks().cancel(&task_state);
+    // 走 LoginService 那一层（而不是 `tasks().cancel`）：AutoClaw 那条链借来的
+    // 回调端口挂在它的待办表上，取消时得一起释放（见 `LoginService::cancel`）
+    let canceled = state.login().cancel(&task_state);
     ok_json(json!({ "canceled": canceled }))
 }
 
@@ -480,8 +530,8 @@ pub async fn login_trae_callback(
         .cloned()
         .unwrap_or_default();
     let callback_url = {
-        let mut url = url::Url::parse("http://127.0.0.1/authorize")
-            .expect("static callback base URL");
+        let mut url =
+            url::Url::parse("http://127.0.0.1/authorize").expect("static callback base URL");
         {
             let mut query = url.query_pairs_mut();
             for (key, value) in &params {
@@ -490,7 +540,11 @@ pub async fn login_trae_callback(
         }
         url.to_string()
     };
-    let response = match state.login().finish_trae_login(&callback_url, &task_state).await {
+    let response = match state
+        .login()
+        .finish_trae_login(&callback_url, &task_state)
+        .await
+    {
         Ok(_) => catpaw_callback_page(200, "Trae 登录成功，已返回网关，可以关闭此页面。"),
         Err(error) => catpaw_callback_page(
             error.status_code as u16,
@@ -681,9 +735,9 @@ pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> 
     )
     .await
     {
-            Ok(credentials) => credentials,
-            Err(error) => return management_error(error.status_code, error.message),
-        };
+        Ok(credentials) => credentials,
+        Err(error) => return management_error(error.status_code, error.message),
+    };
     // 备注名：用户显式填的优先；没填则用脱敏手机号（`130****4229`）——
     // 比默认的「账号 830290」更像用户自己认得出来的标识
     let name = payload
@@ -721,14 +775,20 @@ pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> 
 ///
 /// 不认识的值一律 400：**不静默回落**到某一个变体 —— 那会让用户点 Google
 /// 却打开 Zai 的授权页（而两者用的是不同的账号体系，登进去是个陌生账号）。
-fn oauth_vendor_of(payload: &Value) -> Result<crate::server::core::providers::autoclaw::oauth::Vendor, Response> {
+fn oauth_vendor_of(
+    payload: &Value,
+) -> Result<crate::server::core::providers::autoclaw::oauth::Vendor, Response> {
     let raw = payload
         .get("vendor")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
-    crate::server::core::providers::autoclaw::oauth::Vendor::from_id(raw)
-        .ok_or_else(|| management_error(400, format!("未知的登录方式「{raw}」（只支持 zai / google）")))
+    crate::server::core::providers::autoclaw::oauth::Vendor::from_id(raw).ok_or_else(|| {
+        management_error(
+            400,
+            format!("未知的登录方式「{raw}」（只支持 zai / google）"),
+        )
+    })
 }
 
 /// `GET /api/session/login/oauth/captcha-config` —— 取风控验证配置。
@@ -755,8 +815,9 @@ pub async fn login_oauth_captcha_config(body: Bytes) -> Response {
 
 /// `POST /api/session/login/oauth/start` —— 带验证码参数发起 OAuth 登录。
 ///
-/// body `{provider, vendor, captchaVerifyParam}` → `{state, authUrl, provider, edition}`
-/// （与另外几条登录链**同一个响应形状**，前端与壳侧的等待逻辑不必为新家分叉）。
+/// body `{provider, vendor, captchaVerifyParam}` → `{state, authUrl, provider,
+/// edition, warning?}`（与另外几条登录链**同一个响应形状**，前端与壳侧的等待
+/// 逻辑不必为新家分叉；`warning` 是这一轮有降级时给用户看的一句话，没有就不带）。
 ///
 /// ── 为什么这条不走壳侧的 `start_login` ────────────────────────
 /// 壳侧那条命令的职责是「打开一个窗口去登录」，而这条的前提是「前端已经在
@@ -764,6 +825,18 @@ pub async fn login_oauth_captcha_config(body: Bytes) -> Response {
 /// 环境）。把验证码参数从渲染层传给壳、再让壳回头调网关，等于绕一圈传一个
 /// 不该由壳理解的不透明字符串。因此这条直接是**前端 → 网关**的一跳，
 /// 拿到 authUrl 后由前端交给壳去打开（与其它家最终都由壳开窗口一致）。
+///
+/// ── 回调地址交给登录服务定（本次修正）────────────────────────
+/// 这里只给「网关自己的 loopback 基址」（`http://localhost:<网关端口>`）与
+/// 「浏览器是否在同一台机器上」，**不再**直接把网关端口当回调：
+/// Zai 的 redirect_uri 白名单只认官方客户端那四个登记端口，网关端口会被拒
+/// （`{"detail":"Redirect URI not registered for this client"}`，issue #11）。
+/// 因此由 `core::login::autoclaw` 去借一个登记端口、并把回调转回这个基址 ——
+/// 判据与回落顺序都在那边（见其 `callback_endpoint`）。
+///
+/// `local_browser` 的判据是**监听地址是不是 loopback**：桌面壳固定绑
+/// 127.0.0.1；容器 / 远程部署按 `AGENT2API_HOST`（默认 0.0.0.0）—— 那种形态
+/// 下浏览器解析的 `localhost` 是它自己那台机器，占登记端口没有意义。
 pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
     let region = autoclaw_region_of(&payload);
@@ -775,32 +848,55 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
         .get("captchaVerifyParam")
         .and_then(Value::as_str)
         .unwrap_or("");
-    // 回调挂在本网关自己的 loopback 端口上。host 必须是 `localhost`：
-    // Zai 的 OAuth 服务在 authorize 阶段校验 redirect_uri 白名单，`127.0.0.1`
-    // 会被拒（`Redirect URI not registered for this client`，2026-09-22 实测；
-    // Google 同形态却能过 —— 两家规则不同）。形态必须与客户端逐字同款，
-    // 理由与回调路由见 `providers::autoclaw::oauth::CALLBACK_PATH_PREFIX`。
-    let callback_base = format!("http://localhost:{}", state.port);
-    let handle = match state
+    // ── 浏览器要访问的地址按「回调路由挂在哪个端口」拼 ─────────────
+    // 回调路由在**管理面**那套路由里（见 http.rs 的 `panel_router`）：同端口
+    // 形态（桌面壳、未设 AGENT2API_PANEL_PORT 的 headless）就是 `state.port`；
+    // 分端口形态它在 `panel_port` 上 —— 那时浏览器必须打到那个端口，否则
+    // 回调（以及监听器的 302 转发目标）会落进主端口的 404。
+    let api_port = state
+        .panel_port
+        .filter(|port| *port != state.port)
+        .unwrap_or(state.port);
+    let gateway_base = format!("http://localhost:{api_port}");
+    let (handle, warning) = match state
         .login()
-        .start_autoclaw_oauth_login(region, vendor, captcha, &callback_base)
+        .start_autoclaw_oauth_login(
+            region,
+            vendor,
+            captcha,
+            &gateway_base,
+            state.host.is_loopback(),
+        )
         .await
     {
-        Ok(handle) => handle,
+        Ok(result) => result,
         Err(reason) => return management_error(400, reason),
     };
     let task = handle.snapshot();
-    ok_json(json!({
+    let mut body = json!({
         "state": task.state,
         "authUrl": task.auth_url,
         "edition": task.edition,
         "provider": region.provider_id(),
-    }))
+    });
+    if let Some(warning) = warning {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("warning".to_string(), Value::String(warning));
+        }
+    }
+    ok_json(body)
 }
 
 /// `GET /auth/callback-{vendor}` —— 浏览器回调（客户端同款形态，见
-/// `providers::autoclaw::oauth::CALLBACK_PATH_PREFIX`；Zai 的 OAuth 白名单按
-/// host 校验，navigate_uri 必须与官方客户端逐字同款才能通过）。
+/// `providers::autoclaw::oauth::CALLBACK_PATH_PREFIX`）。
+///
+/// ── 两个入口都落到这里（本次修正）────────────────────────────
+/// `navigate_uri` 指向 z.ai 登记过的那四个端口之一，不是本路由所在端口：
+///   - 那一轮抢到了登记端口 → 浏览器先落到那个监听器上，它再 302 到这里
+///     （见 `providers::autoclaw::callback_server`）；
+///   - 一个都没抢到（官方客户端在运行）→ 壳侧内嵌窗口把这次导航截回这里
+///     （见 `src/login.rs` 的 `autoclaw_callback_forward`）。
+/// 两条路都只把 `code` / `state` 带过来，因此这里的校验口径不变。
 ///
 /// ── 为什么这条免鉴权（挂 public 组）──────────────────────────
 /// 调用方是**用户的浏览器**（授权页 302 到这里），它当然没有我们的 API Key。
@@ -836,7 +932,9 @@ pub async fn login_autoclaw_oauth_callback(
         .await
     {
         Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
-        Err(error) => oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message)),
+        Err(error) => {
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
     }
 }
 
@@ -869,6 +967,44 @@ fn oauth_callback_page(status: i32, message: &str) -> Response {
         html,
     )
         .into_response()
+}
+
+// ─── GET /auth/callback-accio ───────────────────────────────
+
+/// Accio 网页登录的回调（**浏览器 302 到这里**，查询串带 `code` / `state`）。
+///
+/// ── 为什么免鉴权（挂 public 组）──────────────────────────────
+/// 调用方是**用户的浏览器**（授权页完成后顶层导航到我们交给它的 return_url），
+/// 它当然没有我们的 API Key。与 CatPaw / AutoClaw 两条 loopback 回调同一取舍。
+///
+/// ── 路径是我们自己定的 ──────────────────────────────────────
+/// 与 AutoClaw 那条「必须与官方客户端逐字同款（Zai 按 host 校验白名单）」不同：
+/// Accio 的 `return_url` 由**发起方**随授权请求带上（桌面端自己用的是
+/// `http://127.0.0.1:<port>/auth/callback`），登录页只负责把 code/state 拼回来。
+/// 因此这里用 `callback-accio` 这个别家不会撞的名字。
+///
+/// ── 任务关联 ────────────────────────────────────────────────
+/// `state` 是我们生成的那个（拼在 return_url 前的授权 URL 里），登录页原样带回，
+/// 因此直接按它查任务表即可（与 AutoClaw 的「变体匹配 + 最近发起」不同）。
+///
+/// 响应是给人看的 HTML（浏览器停在这一页），不走 `ok_json` 那套信封。
+pub async fn login_accio_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    match state.login().finish_accio_login(&code, &task_state).await {
+        Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
+        Err(error) => {
+            // 这一轮已经作废：把 PKCE 的 pending 也丢掉，免得留在表里等超时
+            state.login().drop_accio_pending(&task_state);
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
 }
 
 // ─── POST /api/session/refresh ──────────────────────────────

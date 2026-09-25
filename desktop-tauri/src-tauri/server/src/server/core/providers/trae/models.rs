@@ -81,7 +81,10 @@ pub async fn refresh(
         return ModelRefreshOutcome::failed("Trae 未返回可用模型");
     }
     let count = models.len();
-    let state = CatalogState { models, fetched_at: logging::now_ms() };
+    let state = CatalogState {
+        models,
+        fetched_at: logging::now_ms(),
+    };
     match catalog().write() {
         Ok(mut guard) => *guard = state,
         Err(poisoned) => *poisoned.into_inner() = state,
@@ -233,9 +236,7 @@ async fn checkin_request(
         Some(REQUEST_TIMEOUT_MS),
     )
     .await
-    .map_err(|error| {
-        GatewayError::with_status(502, format!("Trae 签到请求失败：{error}"))
-    })?;
+    .map_err(|error| GatewayError::with_status(502, format!("Trae 签到请求失败：{error}")))?;
     if !response.ok {
         let message = response
             .payload
@@ -259,7 +260,12 @@ fn parse_models(payload: &Value) -> Vec<Value> {
     };
     let mut out = Vec::new();
     for item in list {
-        let Some(id) = item.get("config_name").and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()) else {
+        let Some(id) = item
+            .get("config_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
             continue;
         };
         let name = item
@@ -310,11 +316,18 @@ fn parse_usage(raw: &Value) -> (i64, i64, i64, i64) {
     let mut used = 0;
     let mut pack_count = 0;
     for pack in packs {
-        let current_limit = pack.pointer("/entitlement_base_info/quota/credits_limit").and_then(Value::as_i64).unwrap_or(0);
+        let current_limit = pack
+            .pointer("/entitlement_base_info/quota/credits_limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         if current_limit <= 0 {
             continue;
         }
-        let current_used = pack.pointer("/usage/credits_amount").and_then(Value::as_f64).map(|value| value as i64).unwrap_or(0);
+        let current_used = pack
+            .pointer("/usage/credits_amount")
+            .and_then(Value::as_f64)
+            .map(|value| value as i64)
+            .unwrap_or(0);
         limit += current_limit;
         used += current_used;
         remain += current_limit - current_used;

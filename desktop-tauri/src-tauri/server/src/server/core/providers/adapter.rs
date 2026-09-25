@@ -118,7 +118,7 @@ use crate::server::errors::GatewayError;
 
 use super::qoder;
 use super::raccoon;
-use super::{kind_id, meta, ProviderKind};
+use super::{catalog_cache, kind_id, meta, ProviderKind};
 
 /// 转发前对「账号 + 请求体」的完整构造计划（架构文档 §4.2 的 ChatRequestPlan）。
 ///
@@ -468,9 +468,7 @@ pub trait ProviderAdapter: Send + Sync {
         store: &'a AccountStore,
         account_id: &'a str,
         force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>>;
 
     /// 模型目录刷新是否走「账号」这一维（默认 true；Cline 覆写为 false）。
     ///
@@ -555,7 +553,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// 「同一账号重试」那一档给出（见 `config::RetrySettings`）。
     /// 适配器据此判断该不该再退避 —— 而不是自己去读全局设置：那样写的话
     /// 「哪一档管什么」这条规则就会漏进每个适配器里各实现一遍。
-    fn retry_advice(&self, _error_body: &Value, _attempt: usize, _budget: usize) -> Option<RetryAdvice> {
+    fn retry_advice(
+        &self,
+        _error_body: &Value,
+        _attempt: usize,
+        _budget: usize,
+    ) -> Option<RetryAdvice> {
         None
     }
 
@@ -809,9 +812,8 @@ pub trait ProviderAdapter: Send + Sync {
         &'a self,
         _store: &'a AccountStore,
         _account_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
+    {
         let kind = self.kind();
         Box::pin(async move {
             Err(GatewayError::with_status(
@@ -882,6 +884,14 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::ClinePass => &super::cline::CLINE_PASS_ADAPTER,
         ProviderKind::AtmCode => &super::atomcode::ATMCODE_ADAPTER,
         ProviderKind::Trae => &super::trae::TRAE_ADAPTER,
+        // Accio 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `accio::endpoints::Region` 与 `accio::mod` 的模块头）
+        ProviderKind::Accio => &super::accio::ACCIO_ADAPTER,
+        ProviderKind::AccioCn => &super::accio::ACCIO_CN_ADAPTER,
+        // ZCode 的两个地区是两个 provider、两个实例（同一份实现按地区参数化，
+        // 见 `zcode::adapter` 与 `zcode::region` 的模块头）
+        ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
+        ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
     }
 }
 
@@ -927,6 +937,16 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::ClinePass,
         ProviderKind::AtmCode,
         ProviderKind::Trae,
+        // Accio 的两个地区各算一家（同一份实现、两套账号与目录缓存）
+        ProviderKind::Accio,
+        ProviderKind::AccioCn,
+        // ZCode 的两个地区各算一家（同一份实现、两套账号）。
+        // 它**在**本列表里是因为适配器已接真身、能参与目录刷新调度；
+        // 但 `supports_model_refresh()` 为 false（静态清单，见 `zcode::models`），
+        // 所以刷新循环对它是空操作 —— 这不影响「已实现」这个判定：
+        // 本列表回答的是「这家接线了没有」，不是「这家的目录能不能远程刷」。
+        ProviderKind::Zcode,
+        ProviderKind::ZcodeIntl,
     ]
 }
 
@@ -960,7 +980,11 @@ pub struct ModelRefreshOutcome {
 impl ModelRefreshOutcome {
     /// 真刷新成功（`count` 是落地后的条目数）
     pub fn refreshed(count: usize) -> Self {
-        Self { refreshed: true, count, message: None }
+        Self {
+            refreshed: true,
+            count,
+            message: None,
+        }
     }
 
     /// 没有刷（按缓存/TTL 跳过、上游没给可用清单、没有可用的家等）——
@@ -971,7 +995,11 @@ impl ModelRefreshOutcome {
 
     /// 尝试刷新但失败（`reason` 是会显示给用户的原因）
     pub fn failed(reason: impl Into<String>) -> Self {
-        Self { refreshed: false, count: 0, message: Some(reason.into()) }
+        Self {
+            refreshed: false,
+            count: 0,
+            message: Some(reason.into()),
+        }
     }
 }
 
@@ -1074,9 +1102,53 @@ pub async fn refresh_implemented(store: &AccountStore) {
     }
 }
 
+/// 启动时恢复各家的持久化清单缓存（`ServerState::bootstrap` 在库句柄就绪后
+/// 调用一次，见 `providers::catalog_cache` 的模块头）。
+///
+/// ── 为什么必须显式跑一次 ────────────────────────────────────
+/// 各家的目录句柄是 `OnceLock` **懒初始化**，而持久化缓存只能在首次初始化时
+/// 读回（那正是各家 `restored_state` / `restored_cache` 的位置）。若某个更早的
+/// 调用点先碰到了句柄（那时 `catalog_cache::install` 还没跑），句柄就固化在
+/// 「没有缓存」的空状态上，缓存再也读不回来 —— 症状恰恰是本切片要消灭的那个
+/// （重启后回落到内置清单）。这里显式预热一次，把「首次初始化」钉在库就绪之后。
+///
+/// 顺带补一次默认规则种子：缓存恢复的清单与远程刷新落地的是同一批 id，
+/// 种子该在它们第一次可见时就位（与 [`refresh_implemented`] 开头那几行同一件事，
+/// 只是启动这一刻还没有任何刷新跑过）。
+pub fn restore_cached_catalogs() {
+    // 逐家触发一次 `list_models`（workbuddy 的目录也在这条路上：它的适配器
+    // 直接读 `core::models::global_catalog()`）——返回值丢弃，这里要的只是
+    // 「让各家的句柄初始化一次」这个副作用
+    for kind in implemented_kinds() {
+        let _ = adapter_for(kind).list_models();
+    }
+    seed_current_raccoon_defaults();
+    seed_current_workbuddy_defaults();
+    seed_current_qoder_defaults();
+    seed_current_cline_defaults();
+    // 留痕：哪些家的清单是从持久化缓存恢复的、各是什么时候拉的。没有这条
+    // 日志，「这次的清单是刚拉的还是上次的」在排障时只能靠翻数据库回答。
+    let restored = catalog_cache::cached_scopes();
+    if !restored.is_empty() {
+        let detail = restored
+            .iter()
+            .map(|(scope, at)| format!("{scope}（{}）", catalog_cache::age_text(*at)))
+            .collect::<Vec<_>>()
+            .join("、");
+        crate::server::logging::log(
+            "[Models]",
+            &format!(
+                "📦 已从缓存恢复 {} 份模型清单（{}）——各家的刷新会在拉到新清单后覆盖",
+                restored.len(),
+                detail
+            ),
+        );
+    }
+}
+
 /// **手动**刷新模型清单：只刷「支持刷新」的家，且强制绕过缓存。
 ///
-/// 逐家结果：`[{ provider, providerLabel, status, count?, fixed?, message? }, ...]`，
+/// 逐家结果：`[{ provider, providerLabel, status, count?, refreshedAt, fixed?, message? }, ...]`，
 /// 顺序 = 注册表顺序，**每家都有一条**（不支持的家也在里面，status = `skipped`
 /// 并说明原因）—— 界面的汇总（成功 N / 失败 M / 跳过 K）与逐条明细因此能对上
 /// 总数（与 `credential_maintenance::refresh_expiring_accounts` 同一取舍）。
@@ -1084,6 +1156,9 @@ pub async fn refresh_implemented(store: &AccountStore) {
 /// ── 结果字段（前后端契约）──────────────────────────────────────
 ///   - `status`：`"refreshed" | "skipped" | "failed"`（三档语义见下）；
 ///   - `count`：仅在 `refreshed` 时出现，落地后的条目数；
+///   - `refreshedAt`：**这家清单当前的拉取时刻**（毫秒，0 = 从未成功过），
+///     每行都有。取的是清单自身的时刻而不是「本次请求的时刻」—— 失败 / 跳过的
+///     家清单没变，它的时间就该是上次成功那次（界面「更新日期」列读它）；
 ///   - `fixed`：仅在「这家不支持刷新」时出现且为 true —— **机器可识别的标记**，
 ///     前端据此把「能力边界」（固定清单，永远刷不出东西）与「本次没取到新内容」
 ///     分开说；按 `message` 文案匹配会在措辞调整后静默失效
@@ -1162,6 +1237,8 @@ pub async fn refresh_implemented_forced(
                 "status": "skipped",
                 "fixed": true,
                 "message": "该提供商使用固定模型清单（上游没有远程目录接口）",
+                // 与其它分支同一契约：这家没有远程目录，时刻恒为 0（界面显示占位）
+                "refreshedAt": 0,
             }));
             continue;
         }
@@ -1172,7 +1249,9 @@ pub async fn refresh_implemented_forced(
         let used = if !adapter.refresh_uses_account() {
             None
         } else if requested.is_empty() {
-            store.current_entry_for_provider(provider_id).map(|entry| entry.id)
+            store
+                .current_entry_for_provider(provider_id)
+                .map(|entry| entry.id)
         } else {
             Some(requested.to_string())
         };
@@ -1193,6 +1272,12 @@ pub async fn refresh_implemented_forced(
             item["status"] = json!("skipped");
             item["message"] = json!("本次刷新没有取到新清单（上游未返回可用的模型列表）");
         }
+        // 这家清单**当前**的拉取时刻（毫秒；0 = 从未成功过），界面的「更新日期」
+        // 列读它。必须在 `refresh_models` **之后**取：本次成功的家拿到的是刚刚
+        // 那一刻，失败 / 跳过的家拿到的是上次成功那次的时刻 —— 那正是「这份清单
+        // 是什么时候的」这个问题要的答案（用「本次请求的时刻」会在失败行上撒谎，
+        // 显示成刚更新过）。
+        item["refreshedAt"] = json!(super::catalog::refresh_meta(kind).1);
         results.push(item);
     }
     results

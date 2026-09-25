@@ -22,15 +22,28 @@ fn public_builtin_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(String, V
     for (kind, manifest) in active {
         let provider = kind_id(*kind);
         let mut names: Vec<String> = manifest.iter().map(model_id).collect();
-        names.extend(rules.mappings.iter()
-            .filter(|mapping| mapping.provider.as_deref().map_or(true, |owner| owner == provider))
-            .map(|mapping| mapping.alias.clone()));
+        names.extend(
+            rules
+                .mappings
+                .iter()
+                .filter(|mapping| {
+                    mapping
+                        .provider
+                        .as_deref()
+                        .map_or(true, |owner| owner == provider)
+                })
+                .map(|mapping| mapping.alias.clone()),
+        );
         for name in names {
-            let Some(wire) = builtin_target(&rules, *kind, manifest, &name) else { continue };
+            let Some(wire) = builtin_target(&rules, *kind, manifest, &name) else {
+                continue;
+            };
             if !claimed.insert(name.to_lowercase()) {
                 continue;
             }
-            let Some(upstream) = manifest.iter().find(|item| model_id(item) == wire.model) else { continue };
+            let Some(upstream) = manifest.iter().find(|item| model_id(item) == wire.model) else {
+                continue;
+            };
             let mut item = list_item(upstream, provider);
             if let Some(object) = item.as_object_mut() {
                 object.insert("id".to_string(), Value::String(name.clone()));
@@ -46,11 +59,13 @@ fn public_builtin_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(String, V
 }
 
 pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value {
-    let active: Vec<_> = active_manifests(store).into_iter()
+    let active: Vec<_> = active_manifests(store)
+        .into_iter()
         .filter(|(kind, _)| key_scope::allows_provider(scope, kind_id(*kind)))
         .collect();
     let (source, refreshed_at) = aggregate_source(&active);
-    let mut data: Vec<_> = public_builtin_items(&active).into_iter()
+    let mut data: Vec<_> = public_builtin_items(&active)
+        .into_iter()
         .map(|(_, item)| item)
         .filter(|item| key_scope::allows_model(scope, &model_id(item)))
         .collect();
@@ -58,7 +73,11 @@ pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value 
     super::super::custom::append_models_response(store, scope, &mut data);
     // 自定义家贡献了条目时，这份列表就不再是单/多家内置的来源了 ——
     // 与「多家内置」同一个词（aggregate），下游据此知道列表是拼出来的。
-    let source = if data.len() > builtin_count { "aggregate" } else { source };
+    let source = if data.len() > builtin_count {
+        "aggregate"
+    } else {
+        source
+    };
     list_response_from(data, source, refreshed_at)
 }
 
@@ -70,12 +89,17 @@ pub fn has_available_providers(store: &AccountStore) -> bool {
 }
 
 pub fn advertised_model_ids(store: &AccountStore) -> Vec<String> {
-    models_response(store, None).get("data").and_then(Value::as_array)
-        .map(|items| items.iter().map(model_id).collect()).unwrap_or_default()
+    models_response(store, None)
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(model_id).collect())
+        .unwrap_or_default()
 }
 
 pub fn advertised_manifest_contains(store: &AccountStore, model: &str) -> bool {
-    advertised_model_ids(store).iter().any(|id| id.eq_ignore_ascii_case(model))
+    advertised_model_ids(store)
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(model))
 }
 
 pub fn suggest_advertised(store: &AccountStore, model: &str, limit: usize) -> Vec<String> {
@@ -83,24 +107,42 @@ pub fn suggest_advertised(store: &AccountStore, model: &str, limit: usize) -> Ve
 }
 
 pub fn session_models(store: &AccountStore) -> Vec<Value> {
-    models_response(store, None).get("data").and_then(Value::as_array)
-        .cloned().unwrap_or_default().into_iter().map(|mut item| {
-            let provider = item.get("owned_by").and_then(Value::as_str).unwrap_or("").to_string();
-            let is_default = item.get("is_default").cloned().unwrap_or(Value::Bool(false));
+    models_response(store, None)
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut item| {
+            let provider = item
+                .get("owned_by")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let is_default = item
+                .get("is_default")
+                .cloned()
+                .unwrap_or(Value::Bool(false));
             if let Some(object) = item.as_object_mut() {
-                object.insert("providerLabel".to_string(), Value::String(super::super::label_of(&provider)));
+                object.insert(
+                    "providerLabel".to_string(),
+                    Value::String(super::super::label_of(&provider)),
+                );
                 object.insert("provider".to_string(), Value::String(provider));
                 object.insert("isDefault".to_string(), is_default);
             }
             item
-        }).collect()
+        })
+        .collect()
 }
 
 pub fn models_by_provider(store: &AccountStore) -> Value {
     let mut map = Map::new();
     for (kind, manifest) in active_manifests(store) {
-        let mut names: Vec<_> = public_builtin_items(&[(kind, manifest)]).into_iter()
-            .map(|(_, item)| model_id(&item)).collect();
+        let mut names: Vec<_> = public_builtin_items(&[(kind, manifest)])
+            .into_iter()
+            .map(|(_, item)| model_id(&item))
+            .collect();
         names.sort_by_key(|name| name.to_lowercase());
         map.insert(kind_id(kind).to_string(), json!(names));
     }
@@ -122,10 +164,14 @@ pub fn manage_view(store: &AccountStore) -> Value {
     for (kind, mut manifest) in active_manifests(store) {
         let provider = kind_id(kind);
         manifest.sort_by_key(|item| !rules.default_enabled(provider, &model_id(item)));
-        let source = if refresh_meta(kind).0 { "remote" } else { "builtin" };
+        // 一次取「远程与否 + 拉取时刻」：两者是同一处状态，分两次取会多读一次锁
+        let (remote, refreshed_at) = refresh_meta(kind);
+        let source = if remote { "remote" } else { "builtin" };
         for item in manifest {
             let id = model_id(&item);
-            if id.is_empty() { continue; }
+            if id.is_empty() {
+                continue;
+            }
             let default = rules.binding(provider, &id, &id);
             let enabled = rules.default_enabled(provider, &id);
             mappings.push(json!({
@@ -136,13 +182,24 @@ pub fn manage_view(store: &AccountStore) -> Value {
             let mut aliases = Vec::new();
             for (index, mapping) in rules.mappings.iter().enumerate() {
                 if !mapping.target.eq_ignore_ascii_case(&id)
-                    || !mapping.provider.as_deref().map_or(true, |owner| owner == provider)
-                { continue; }
+                    || !mapping
+                        .provider
+                        .as_deref()
+                        .map_or(true, |owner| owner == provider)
+                {
+                    continue;
+                }
                 attached.insert(index);
                 if mapping.alias.eq_ignore_ascii_case(&id)
-                    || aliases.iter().any(|alias: &String| alias.eq_ignore_ascii_case(&mapping.alias))
-                { continue; }
-                let Some(effective) = rules.binding(provider, &mapping.alias, &id) else { continue };
+                    || aliases
+                        .iter()
+                        .any(|alias: &String| alias.eq_ignore_ascii_case(&mapping.alias))
+                {
+                    continue;
+                }
+                let Some(effective) = rules.binding(provider, &mapping.alias, &id) else {
+                    continue;
+                };
                 aliases.push(mapping.alias.clone());
                 mappings.push(json!({
                     "alias": effective.alias, "target": id, "provider": provider,
@@ -150,19 +207,31 @@ pub fn manage_view(store: &AccountStore) -> Value {
                     "isDefault": false, "dangling": false, "carried": true,
                 }));
             }
-            let source = if rules.custom.iter().any(|custom| custom.matches(provider, &id)) {
+            let source = if rules
+                .custom
+                .iter()
+                .any(|custom| custom.matches(provider, &id))
+            {
                 "manual"
-            } else { source };
+            } else {
+                source
+            };
             models.push(json!({
                 "id": id, "name": item.get("name"), "credits": item.get("credits"),
                 "isDefault": item.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
                 "provider": provider, "providerLabel": super::super::label_of(provider),
                 "source": source, "enabled": enabled, "aliases": aliases,
+                // 这一家的清单是什么时候拉到的（毫秒；0 = 从未成功拉过）。
+                // 缓存恢复的清单与刚拉的清单**都是 `remote`**，时效只能靠这个
+                // 时间戳说明（见 `providers::catalog_cache` 的模块头）。
+                "refreshedAt": refreshed_at,
             }));
         }
     }
     for (index, mapping) in rules.mappings.iter().enumerate() {
-        if attached.contains(&index) { continue; }
+        if attached.contains(&index) {
+            continue;
+        }
         let carried = match mapping.provider.as_deref() {
             Some(provider) => kind_from_id(provider).is_some_and(|kind| {
                 entry_id_in_manifest(&manifest_for(kind), &mapping.target).is_some()

@@ -16,10 +16,16 @@ pub fn build_chat_request(
     body: &Value,
 ) -> Result<ChatRequestPlan, GatewayError> {
     if access_token.is_empty() {
-        return Err(GatewayError::with_status(401, "AtomCode 账号缺少 accessToken，无法转发"));
+        return Err(GatewayError::with_status(
+            401,
+            "AtomCode 账号缺少 accessToken，无法转发",
+        ));
     }
     if user_id.is_empty() {
-        return Err(GatewayError::with_status(401, "AtomCode 账号缺少用户标识，无法签名"));
+        return Err(GatewayError::with_status(
+            401,
+            "AtomCode 账号缺少用户标识，无法签名",
+        ));
     }
     let serialized = serde_json::to_vec(body)
         .map_err(|_| GatewayError::with_status(500, "AtomCode 请求体序列化失败"))?;
@@ -38,8 +44,14 @@ pub fn build_chat_request(
     let mut headers = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "application/json".to_string()),
-        ("Authorization".to_string(), format!("Bearer {access_token}")),
-        ("User-Agent".to_string(), format!("atomcode/{CLIENT_VERSION}")),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {access_token}"),
+        ),
+        (
+            "User-Agent".to_string(),
+            format!("atomcode/{CLIENT_VERSION}"),
+        ),
     ];
     headers.extend(crypto::build_auth_headers(&input)?);
     Ok(ChatRequestPlan {

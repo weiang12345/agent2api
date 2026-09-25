@@ -77,7 +77,10 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
             _ => Value::String(String::new()),
         },
     );
-    if let Some(value) = model.get("maxOutputTokens").filter(|value| !value.is_null()) {
+    if let Some(value) = model
+        .get("maxOutputTokens")
+        .filter(|value| !value.is_null())
+    {
         item.insert("max_output_tokens".to_string(), value.clone());
     }
     if let Some(value) = model.get("maxInputTokens").filter(|value| !value.is_null()) {
@@ -85,7 +88,12 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
     }
     item.insert(
         "supports_tool_call".to_string(),
-        Value::Bool(model.get("supportsToolCall").map(js_truthy).unwrap_or(false)),
+        Value::Bool(
+            model
+                .get("supportsToolCall")
+                .map(js_truthy)
+                .unwrap_or(false),
+        ),
     );
     item.insert(
         "supports_images".to_string(),
@@ -93,7 +101,12 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
     );
     item.insert(
         "supports_reasoning".to_string(),
-        Value::Bool(model.get("supportsReasoning").map(js_truthy).unwrap_or(false)),
+        Value::Bool(
+            model
+                .get("supportsReasoning")
+                .map(js_truthy)
+                .unwrap_or(false),
+        ),
     );
     item.insert(
         "is_default".to_string(),

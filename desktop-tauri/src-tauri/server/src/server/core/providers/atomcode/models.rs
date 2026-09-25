@@ -85,7 +85,10 @@ pub async fn refresh(
     } else if let Err(poisoned) = catalog().write() {
         *poisoned.into_inner() = state;
     }
-    logging::log("[Models]", &format!("✅ AtomCode 模型目录已更新（{count} 个）"));
+    logging::log(
+        "[Models]",
+        &format!("✅ AtomCode 模型目录已更新（{count} 个）"),
+    );
     ModelRefreshOutcome::refreshed(count)
 }
 
@@ -110,8 +113,14 @@ pub async fn claim(
 ) -> Result<Value, GatewayError> {
     for tier in ["Max", "Pro", "Lite"] {
         let body = json!({ "plan_type": tier });
-        let response = request_raw("POST", "/coding-plan/claim-v2", Some(&body), credentials, proxy)
-            .await?;
+        let response = request_raw(
+            "POST",
+            "/coding-plan/claim-v2",
+            Some(&body),
+            credentials,
+            proxy,
+        )
+        .await?;
         if response.ok {
             let payload = response.payload.unwrap_or(Value::Null);
             if payload.get("success").and_then(Value::as_bool) == Some(true)
@@ -121,7 +130,10 @@ pub async fn claim(
             }
         }
     }
-    Err(GatewayError::with_status(502, "AtomCode CodingPlan 领取失败"))
+    Err(GatewayError::with_status(
+        502,
+        "AtomCode CodingPlan 领取失败",
+    ))
 }
 
 fn parse_models(payload: &Value) -> Vec<Value> {
@@ -173,14 +185,14 @@ fn normalize_usage(raw: &Value) -> Value {
     let available = current_usage
         .get("window_token_limit")
         .and_then(Value::as_i64)
-        .zip(current_usage.get("window_tokens_used").and_then(Value::as_i64))
+        .zip(
+            current_usage
+                .get("window_tokens_used")
+                .and_then(Value::as_i64),
+        )
         .map(|(limit, used)| (limit - used).max(0));
-    let remain_quota = plan
-        .get("remaining_days")
-        .and_then(Value::as_i64);
-    let total_quota = plan
-        .get("total_days")
-        .and_then(Value::as_i64);
+    let remain_quota = plan.get("remaining_days").and_then(Value::as_i64);
+    let total_quota = plan.get("total_days").and_then(Value::as_i64);
     json!({
         "available": available,
         "unit": "tokens",
@@ -249,14 +261,22 @@ async fn request_raw(
 ) -> Result<ApiResponse, GatewayError> {
     let url = format!("{CODINGPLAN_BASE_URL}{path}");
     let headers = vec![
-        ("Authorization".to_string(), format!("Bearer {}", credentials.access_token)),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", credentials.access_token),
+        ),
         ("User-Agent".to_string(), "atomcode/5.0.2".to_string()),
     ];
-    send_request_via(method, &url, body, &headers, proxy, Some(REQUEST_TIMEOUT_MS))
-        .await
-        .map_err(|error| {
-            GatewayError::with_status(502, format!("AtomCode 请求失败：{error}"))
-        })
+    send_request_via(
+        method,
+        &url,
+        body,
+        &headers,
+        proxy,
+        Some(REQUEST_TIMEOUT_MS),
+    )
+    .await
+    .map_err(|error| GatewayError::with_status(502, format!("AtomCode 请求失败：{error}")))
 }
 
 fn url_encode(value: &str) -> String {

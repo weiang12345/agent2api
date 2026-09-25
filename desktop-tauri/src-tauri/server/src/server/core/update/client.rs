@@ -31,8 +31,14 @@ use super::version::UpdateError;
 /// 空串当未配置）。配了 token 则限额更高（匿名 60 次/小时，带 token 5000）。
 pub fn github_headers() -> Vec<(String, String)> {
     let mut headers = vec![
-        ("Accept".to_string(), "application/vnd.github+json".to_string()),
-        ("User-Agent".to_string(), "workbuddy-local-proxy".to_string()),
+        (
+            "Accept".to_string(),
+            "application/vnd.github+json".to_string(),
+        ),
+        (
+            "User-Agent".to_string(),
+            "workbuddy-local-proxy".to_string(),
+        ),
         ("X-GitHub-Api-Version".to_string(), "2022-11-28".to_string()),
     ];
     let token = ["WORKBUDDY_GITHUB_TOKEN", "GITHUB_TOKEN"]
@@ -72,7 +78,10 @@ fn resolve_egress_candidates() -> Vec<(String, Option<ResolvedProxy>)> {
                 }
             } else if let Some(error) = resolution.error() {
                 // Node 在这条分支上静默（try/catch 吞掉），这里留 verbose 便于排障
-                logging::verbose("[Update]", &format!("Clash 出口不可用（{error}），仅用直连"));
+                logging::verbose(
+                    "[Update]",
+                    &format!("Clash 出口不可用（{error}），仅用直连"),
+                );
             }
         }
         None => {}
@@ -114,7 +123,10 @@ pub async fn fetch_with_egress(
             Err(error) => {
                 logging::verbose(
                     "[Update]",
-                    &format!("经 {label} 访问失败: {}", egress::describe_error_detail(&error)),
+                    &format!(
+                        "经 {label} 访问失败: {}",
+                        egress::describe_error_detail(&error)
+                    ),
                 );
                 last_error = Some(error);
             }

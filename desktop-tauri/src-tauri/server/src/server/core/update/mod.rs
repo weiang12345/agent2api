@@ -231,7 +231,11 @@ impl UpdateManager {
             .to_string();
         let name = {
             let name = text("name");
-            if name.is_empty() { raw_tag.clone() } else { name }
+            if name.is_empty() {
+                raw_tag.clone()
+            } else {
+                name
+            }
         };
         // notes 截断到 4000 字符（HTML 正文字段，直接给界面展示）
         let notes: String = text("body").chars().take(4000).collect();
@@ -246,7 +250,11 @@ impl UpdateManager {
         // 发布时间：正常都带 published_at；缺失时回落到 created_at（防御）
         let published_at = {
             let value = text("published_at");
-            if value.is_empty() { text("created_at") } else { value }
+            if value.is_empty() {
+                text("created_at")
+            } else {
+                value
+            }
         };
         let latest = json!({
             "tag": tag,
@@ -288,7 +296,11 @@ impl UpdateManager {
             .as_ref()
             .and_then(|value| value.get("asset"))
             .filter(|value| {
-                value.get("url").and_then(Value::as_str).map(|url| !url.is_empty()).unwrap_or(false)
+                value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(|url| !url.is_empty())
+                    .unwrap_or(false)
             })
             .cloned();
         let latest_text = |key: &str| -> Value {
@@ -382,7 +394,11 @@ impl UpdateManager {
             .and_then(|mut segments| segments.next_back())
             .unwrap_or("")
             .to_string();
-        let filename = safe_file_name(if name.is_empty() { &fallback_name } else { name });
+        let filename = safe_file_name(if name.is_empty() {
+            &fallback_name
+        } else {
+            name
+        });
         let download_dir = self.download_dir();
         if let Err(error) = std::fs::create_dir_all(&download_dir) {
             return Err(UpdateError::new(format!("创建下载目录失败: {error}")));
@@ -430,7 +446,9 @@ impl UpdateManager {
         file_path: PathBuf,
         cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        let outcome = self.download_stream(&target, &file_path, &cancel_flag).await;
+        let outcome = self
+            .download_stream(&target, &file_path, &cancel_flag)
+            .await;
         let canceled = cancel_flag.load(std::sync::atomic::Ordering::SeqCst);
         let succeeded = matches!(&outcome, Ok(_)) && !canceled;
 
@@ -606,7 +624,9 @@ impl UpdateManager {
             return Ok(received);
         }
         // 磁盘写入完成后再核一次大小，避免「进度 100% 但文件不完整」
-        let size = std::fs::metadata(file_path).map(|meta| meta.len()).unwrap_or(0);
+        let size = std::fs::metadata(file_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         if declared > 0 && size != declared {
             return Err(UpdateError::new(format!(
                 "安装包不完整（期望 {declared} 字节，实际 {size} 字节）"

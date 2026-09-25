@@ -112,7 +112,10 @@ pub fn normalize_tools(tools: Option<&Value>) -> Result<Vec<Value>, CatPawError>
                 Some(false) => {}
             }
         }
-        let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if name.is_empty()
             || name.len() > 128
             || !name
@@ -283,8 +286,8 @@ mod tests {
             .collect();
         tools.push(function_tool("exec", deep));
 
-        let normalized = normalize_tools(Some(&Value::Array(tools)))
-            .expect("合法的深层 schema 不应再被拒绝");
+        let normalized =
+            normalize_tools(Some(&Value::Array(tools))).expect("合法的深层 schema 不应再被拒绝");
         assert_eq!(normalized.len(), 13);
         assert_eq!(
             normalized[12].get("name").and_then(Value::as_str),
@@ -330,22 +333,13 @@ mod tests {
 
     #[test]
     fn accepts_nesting_up_to_the_limit() {
-        assert!(validate_json_value(
-            &nested_object(MAX_JSON_NESTING_DEPTH),
-            "schema",
-            0
-        )
-        .is_ok());
+        assert!(validate_json_value(&nested_object(MAX_JSON_NESTING_DEPTH), "schema", 0).is_ok());
     }
 
     #[test]
     fn rejects_pathological_nesting() {
-        let error = validate_json_value(
-            &nested_object(MAX_JSON_NESTING_DEPTH + 2),
-            "schema",
-            0,
-        )
-        .expect_err("超过上限应当报错");
+        let error = validate_json_value(&nested_object(MAX_JSON_NESTING_DEPTH + 2), "schema", 0)
+            .expect_err("超过上限应当报错");
         assert!(error.message.contains("嵌套过深"), "{}", error.message);
     }
 
@@ -356,9 +350,12 @@ mod tests {
             let mut properties = Map::new();
             properties.insert(key.to_string(), json!({ "type": "string" }));
             let schema = json!({ "properties": properties });
-            let error = validate_json_value(&schema, "schema", 0)
-                .expect_err("危险键应当被拒绝");
-            assert!(error.message.contains("包含不允许的字段"), "{}", error.message);
+            let error = validate_json_value(&schema, "schema", 0).expect_err("危险键应当被拒绝");
+            assert!(
+                error.message.contains("包含不允许的字段"),
+                "{}",
+                error.message
+            );
         }
     }
 }

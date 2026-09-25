@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::server::core::providers::catalog_cache;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::logging;
 
@@ -70,9 +71,25 @@ struct CatalogState {
     fetched_at: i64,
 }
 
+/// 进程级目录句柄。首次初始化时**先从持久化缓存恢复**（上次成功拉到的远程
+/// 清单），没有再留空 —— 空状态的读取语义就是「回落到静态表」。
 fn catalog() -> &'static RwLock<CatalogState> {
     static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
-    CATALOG.get_or_init(|| RwLock::new(CatalogState::default()))
+    CATALOG.get_or_init(|| RwLock::new(restored_state()))
+}
+
+/// 首次初始化读一次持久化缓存（见 `providers::catalog_cache` 的模块头）。
+///
+/// 缓存里存的就是 `CatalogState` 的形态（`refresh` 落地的那份），所以这里只做
+/// 「搬回来」：不重新归一 —— 两处各写一份映射迟早分叉。
+fn restored_state() -> CatalogState {
+    match catalog_cache::load(catalog_cache::SCOPE_CATPAW) {
+        Some(cached) => CatalogState {
+            models: cached.models,
+            fetched_at: cached.fetched_at,
+        },
+        None => CatalogState::default(),
+    }
 }
 
 fn read_state() -> CatalogState {
@@ -202,9 +219,11 @@ fn normalize_entry(item: &Value) -> Option<Value> {
         None => item
             .get("parameterDefinitions")
             .and_then(Value::as_array)
-            .map(|definitions| definitions.iter().any(|definition| {
-                definition.get("id").and_then(Value::as_str) == Some("effort")
-            }))
+            .map(|definitions| {
+                definitions.iter().any(|definition| {
+                    definition.get("id").and_then(Value::as_str) == Some("effort")
+                })
+            })
             .unwrap_or(false),
     };
     let mut entry = json!({
@@ -231,7 +250,10 @@ fn normalize_entry(item: &Value) -> Option<Value> {
             object.insert("maxInputTokens".to_string(), Value::from(max_window));
         }
         if let Some(default_window) = enum_default(definitions, "context") {
-            object.insert("defaultContextWindow".to_string(), Value::String(default_window));
+            object.insert(
+                "defaultContextWindow".to_string(),
+                Value::String(default_window),
+            );
         }
     }
     Some(entry)
@@ -357,11 +379,18 @@ pub async fn refresh(
     let mut state = read_state();
     state.models = models;
     state.fetched_at = logging::now_ms();
+    // 落持久化缓存（进程重启后由 `restored_state` 读回）。`state` 要被
+    // `write` 消费，所以先存；**不在目录锁内** —— 缓存写入要拿库连接锁，
+    // 两把锁不能嵌套。
+    catalog_cache::save(catalog_cache::SCOPE_CATPAW, &state.models, state.fetched_at);
     match catalog().write() {
         Ok(mut guard) => *guard = state,
         Err(poisoned) => *poisoned.into_inner() = state,
     }
-    logging::log("[Models]", &format!("✅ CatPaw 模型目录已更新（{count} 个）"));
+    logging::log(
+        "[Models]",
+        &format!("✅ CatPaw 模型目录已更新（{count} 个）"),
+    );
     ModelRefreshOutcome::refreshed(count)
 }
 
@@ -459,9 +488,9 @@ fn static_list() -> Vec<Value> {
 /// 静态表里按 id 找条目（大小写/分隔符宽容，见 `models::find_model_entry`）
 fn spec_of(id: &str) -> Option<&'static super::models::ModelSpec> {
     let wanted = normalize(id);
-    MODELS.iter().find(|entry| {
-        normalize(entry.id) == wanted || normalize(entry.name) == wanted
-    })
+    MODELS
+        .iter()
+        .find(|entry| normalize(entry.id) == wanted || normalize(entry.name) == wanted)
 }
 
 /// 与 `models::normalize_model_name` 同口径（小写 + 空白/下划线/点 → 连字符）

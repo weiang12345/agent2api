@@ -15,8 +15,12 @@ use super::endpoints;
 
 static FLIGHTS: OnceLock<Table<Credentials>> = OnceLock::new();
 
-pub fn snapshot(store: &AccountStore, account_id: &str) -> Result<(Value, Credentials), GatewayError> {
-    let record = store.qoder_account_record(account_id)
+pub fn snapshot(
+    store: &AccountStore,
+    account_id: &str,
+) -> Result<(Value, Credentials), GatewayError> {
+    let record = store
+        .qoder_account_record(account_id)
         .ok_or_else(|| GatewayError::with_status(404, "Qoder 账号不存在，请先添加账号"))?;
     let mut credentials = Credentials::from_payload(&record)?;
     credentials.complete_identity()?;
@@ -33,10 +37,19 @@ pub async fn ensure_fresh(
         return Ok(credentials);
     }
     if !credentials.can_refresh() {
-        return Err(GatewayError::with_status(400, "Qoder 账号没有刷新凭证，请重新登录或添加 PAT"));
+        return Err(GatewayError::with_status(
+            400,
+            "Qoder 账号没有刷新凭证，请重新登录或添加 PAT",
+        ));
     }
-    let key = format!("{}:{}:{}:{}:{}", store.file_string(), account_id, credentials.region.id(),
-        refresh_flight::fingerprint(&credentials.access_token), refresh_flight::fingerprint(&credentials.refresh_token));
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        store.file_string(),
+        account_id,
+        credentials.region.id(),
+        refresh_flight::fingerprint(&credentials.access_token),
+        refresh_flight::fingerprint(&credentials.refresh_token)
+    );
     match FLIGHTS.get_or_init(Table::new).join(&key) {
         Join::Waiter(waiter) => waiter.wait().await,
         Join::Leader(leader) => {
@@ -65,30 +78,50 @@ async fn refresh_and_save(
             Some(&json!({ "refreshToken": credentials.oauth_refresh() })),
             &endpoints::open_api_headers(Some(&credentials.access_token)),
             proxy.as_ref(),
-        ).await?;
+        )
+        .await?;
         let data = auth::payload(response, "凭证续期")?;
         let token = credentials::secret(&data, &["token"])?;
         if token.is_empty() {
-            return Err(GatewayError::with_status(502, "Qoder 续期响应缺少 token，旧凭证未被覆盖"));
+            return Err(GatewayError::with_status(
+                502,
+                "Qoder 续期响应缺少 token，旧凭证未被覆盖",
+            ));
         }
         let refresh_token = credentials::secret(&data, &["refresh_token"])?;
         if refresh_token.contains('|') {
-            return Err(GatewayError::with_status(502, "Qoder 续期响应的 refresh_token 格式无效"));
+            return Err(GatewayError::with_status(
+                502,
+                "Qoder 续期响应的 refresh_token 格式无效",
+            ));
         }
         let mut fresh = credentials.clone();
         fresh.access_token = token;
-        fresh.refresh_token = format!("{}|{}|{}",
-            if refresh_token.is_empty() { credentials.oauth_refresh() } else { &refresh_token },
-            credentials.user_id, credentials.machine_id);
-        fresh.expires_at = Some(credentials::timestamp(data.get("expires_at"))
-            .unwrap_or_else(|| logging::now_ms() + 30 * 24 * 60 * 60 * 1000));
+        fresh.refresh_token = format!(
+            "{}|{}|{}",
+            if refresh_token.is_empty() {
+                credentials.oauth_refresh()
+            } else {
+                &refresh_token
+            },
+            credentials.user_id,
+            credentials.machine_id
+        );
+        fresh.expires_at = Some(
+            credentials::timestamp(data.get("expires_at"))
+                .unwrap_or_else(|| logging::now_ms() + 30 * 24 * 60 * 60 * 1000),
+        );
         fresh
     };
     fresh.complete_identity()?;
     if fresh.user_id != credentials.user_id || fresh.region != credentials.region {
-        return Err(GatewayError::with_status(400, "Qoder 续期返回了不同账号，旧凭证未被覆盖"));
+        return Err(GatewayError::with_status(
+            400,
+            "Qoder 续期返回了不同账号，旧凭证未被覆盖",
+        ));
     }
-    match store.update_qoder_credentials_if_current(record, &fresh)
+    match store
+        .update_qoder_credentials_if_current(record, &fresh)
         .map_err(|error| GatewayError::with_status(error.status_code, error.message))?
     {
         CredentialWrite::Written => Ok(fresh),

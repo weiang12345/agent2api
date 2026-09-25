@@ -24,8 +24,11 @@ impl SoloError {
             1001 => 401,
             _ => 502,
         };
-        GatewayError::with_status(status, format!("Trae 上游错误 {}: {}", self.code, self.message))
-            .with_code(self.code.to_string())
+        GatewayError::with_status(
+            status,
+            format!("Trae 上游错误 {}: {}", self.code, self.message),
+        )
+        .with_code(self.code.to_string())
     }
 }
 
@@ -125,7 +128,11 @@ impl Translator {
         let mut frames = Vec::new();
         match event.kind.as_str() {
             "output" => {
-                let response = event.payload.get("response").and_then(Value::as_str).unwrap_or("");
+                let response = event
+                    .payload
+                    .get("response")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let reasoning = event
                     .payload
                     .get("reasoning_content")
@@ -166,7 +173,11 @@ impl Translator {
                 );
             }
             "error" => {
-                let code = event.payload.get("code").and_then(Value::as_i64).unwrap_or_default();
+                let code = event
+                    .payload
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
                 let message = event
                     .payload
                     .get("message")
@@ -183,7 +194,10 @@ impl Translator {
     pub fn finish_frames(&mut self) -> Vec<Value> {
         let mut frames = Vec::new();
         self.ensure_role(&mut frames);
-        let finish = self.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
+        let finish = self
+            .finish_reason
+            .clone()
+            .unwrap_or_else(|| "stop".to_string());
         frames.push(self.chunk(json!({}), Some(finish)));
         if let Some(usage) = self.usage.clone() {
             let mut value = self.chunk(json!({}), None);
@@ -206,7 +220,12 @@ impl Translator {
             );
         }
         if !self.tool_calls.is_empty() {
-            let calls: Vec<Value> = self.tool_calls.values().cloned().map(Value::Object).collect();
+            let calls: Vec<Value> = self
+                .tool_calls
+                .values()
+                .cloned()
+                .map(Value::Object)
+                .collect();
             message.insert("tool_calls".to_string(), Value::Array(calls));
         }
         json!({
@@ -248,11 +267,16 @@ impl Translator {
     }
 
     fn merge_tool_calls(&mut self, raw: Option<&Value>) {
-        let Some(list) = raw.and_then(Value::as_array).filter(|list| !list.is_empty()) else {
+        let Some(list) = raw
+            .and_then(Value::as_array)
+            .filter(|list| !list.is_empty())
+        else {
             return;
         };
         for item in list {
-            let Some(object) = item.as_object() else { continue };
+            let Some(object) = item.as_object() else {
+                continue;
+            };
             let index = object.get("index").and_then(Value::as_i64).unwrap_or(0);
             let merged = self.tool_calls.entry(index).or_insert_with(|| {
                 let mut initial = Map::new();
@@ -308,7 +332,9 @@ impl Translator {
             .filter(|list| !list.is_empty())?;
         let mut out = Vec::new();
         for item in list {
-            let Some(object) = item.as_object() else { continue };
+            let Some(object) = item.as_object() else {
+                continue;
+            };
             let mut delta = Map::new();
             for (key, value) in object {
                 if key == "function_call" {
@@ -324,7 +350,10 @@ impl Translator {
 }
 
 pub fn sse_frame(value: &Value) -> String {
-    format!("data: {}\n\n", serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()))
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+    )
 }
 
 pub fn sse_done() -> String {
@@ -355,7 +384,10 @@ mod tests {
         }
         let completion = translator.completion();
         assert_eq!(completion["choices"][0]["message"]["content"], "你好世界");
-        assert_eq!(completion["choices"][0]["message"]["reasoning_content"], "思考");
+        assert_eq!(
+            completion["choices"][0]["message"]["reasoning_content"],
+            "思考"
+        );
         assert_eq!(completion["usage"]["total_tokens"], 12);
         assert_eq!(completion["choices"][0]["finish_reason"], "stop");
     }
@@ -377,7 +409,10 @@ mod tests {
             translator.consume(event).expect("translate tool event");
         }
         let completion = translator.completion();
-        assert_eq!(completion["choices"][0]["message"]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(
+            completion["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call-1"
+        );
         assert_eq!(
             completion["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             "demo"

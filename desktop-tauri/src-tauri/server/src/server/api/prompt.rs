@@ -75,10 +75,7 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
             None => {
                 return errors::management_error(
                     400,
-                    format!(
-                        "{KEY_PROMPT_MODE} 只认 {}（收到: {text}）",
-                        allowed_modes()
-                    ),
+                    format!("{KEY_PROMPT_MODE} 只认 {}（收到: {text}）", allowed_modes()),
                 )
             }
         },
@@ -128,10 +125,7 @@ pub async fn put_prompt(State(_state): State<ServerState>, body: Bytes) -> Respo
     // 无论配置项有没有变都重跑一次解析：它顺带把**提示词文件此刻的内容**重新读
     // 一遍（用户刚改完文件、或刚把文件恢复出来，一次 PUT 就能生效）。
     if !config::set_prompt(mode, file) {
-        logging::log(
-            "[Config]",
-            "⚠️  系统提示词设置写入失败，本次运行内仍生效",
-        );
+        logging::log("[Config]", "⚠️  系统提示词设置写入失败，本次运行内仍生效");
     }
     let after = config::current();
     let next = after.prompt_settings();

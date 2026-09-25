@@ -5,9 +5,7 @@ use crate::server::core::auth_http::{send_request_via, ApiResponse};
 use crate::server::errors::GatewayError;
 
 use super::credentials::{random_hex, random_numeric_device_id, Credentials};
-use super::protocol::{
-    oauth_headers, CLIENT_ID, CONSOLE_HOST, IDE_VERSION, OAUTH_HOST,
-};
+use super::protocol::{oauth_headers, CLIENT_ID, CONSOLE_HOST, IDE_VERSION, OAUTH_HOST};
 
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
 
@@ -86,7 +84,10 @@ pub fn parse_callback(raw_url: &str, expected_state: &str) -> Result<Callback, G
         .cloned()
         .unwrap_or_default();
     if state != expected_state {
-        return Err(GatewayError::with_status(400, "Trae 登录回调 state 不一致，请重新发起登录"));
+        return Err(GatewayError::with_status(
+            400,
+            "Trae 登录回调 state 不一致，请重新发起登录",
+        ));
     }
     let user_info = parse_json_param(query.get("userInfo").map(String::as_str));
     let user_jwt = parse_json_param(query.get("userJwt").map(String::as_str));
@@ -122,7 +123,11 @@ pub fn parse_callback(raw_url: &str, expected_state: &str) -> Result<Callback, G
     })
 }
 
-pub async fn exchange(callback: Callback, machine_id: &str, device_id: &str) -> Result<Credentials, GatewayError> {
+pub async fn exchange(
+    callback: Callback,
+    machine_id: &str,
+    device_id: &str,
+) -> Result<Credentials, GatewayError> {
     let mut callback = callback;
     if !callback.refresh_token.is_empty() {
         let response = send_request_via(
@@ -139,7 +144,9 @@ pub async fn exchange(callback: Callback, machine_id: &str, device_id: &str) -> 
             Some(REQUEST_TIMEOUT_MS),
         )
         .await
-        .map_err(|error| GatewayError::with_status(502, format!("Trae 登录凭证兑换失败：{error}")))?;
+        .map_err(|error| {
+            GatewayError::with_status(502, format!("Trae 登录凭证兑换失败：{error}"))
+        })?;
         let payload = response_payload(response, "Trae 登录凭证兑换")?;
         let result = payload.get("Result").cloned().unwrap_or(payload);
         callback.access_token = result
@@ -148,7 +155,11 @@ pub async fn exchange(callback: Callback, machine_id: &str, device_id: &str) -> 
             .map(str::to_string)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| GatewayError::with_status(502, "Trae 登录凭证兑换缺少 Token"))?;
-        if let Some(refresh) = result.get("RefreshToken").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+        if let Some(refresh) = result
+            .get("RefreshToken")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             callback.refresh_token = refresh.to_string();
         }
         callback.expires_at = result
@@ -183,7 +194,10 @@ pub async fn exchange(callback: Callback, machine_id: &str, device_id: &str) -> 
 
 pub async fn refresh(credentials: &Credentials) -> Result<Credentials, GatewayError> {
     if credentials.refresh_token.is_empty() {
-        return Err(GatewayError::with_status(400, "Trae 账号缺少 refreshToken，无法续期"));
+        return Err(GatewayError::with_status(
+            400,
+            "Trae 账号缺少 refreshToken，无法续期",
+        ));
     }
     let response = send_request_via(
         "POST",
@@ -361,10 +375,13 @@ mod tests {
 
     #[test]
     fn builds_login_url_and_parses_callback() {
-        let login = build_login("http://127.0.0.1:1234/authorize")
-            .expect("build login");
-        assert!(login.auth_url.starts_with("https://www.trae.cn/authorization?"));
-        assert!(login.auth_url.contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A1234%2Fauthorize"));
+        let login = build_login("http://127.0.0.1:1234/authorize").expect("build login");
+        assert!(login
+            .auth_url
+            .starts_with("https://www.trae.cn/authorization?"));
+        assert!(login
+            .auth_url
+            .contains("auth_callback_url=http%3A%2F%2F127.0.0.1%3A1234%2Fauthorize"));
         assert_eq!(login.machine_id.len(), 32);
         assert_eq!(login.device_id.len(), 16);
         assert!(login.device_id.chars().all(|ch| ch.is_ascii_digit()));
@@ -374,9 +391,11 @@ mod tests {
             "ScreenName": "Trae User",
         })
         .to_string();
-        let user_info: String = url::form_urlencoded::byte_serialize(user_info_json.as_bytes()).collect();
+        let user_info: String =
+            url::form_urlencoded::byte_serialize(user_info_json.as_bytes()).collect();
         let user_jwt_json = serde_json::json!({ "Token": "jwt-token" }).to_string();
-        let user_jwt: String = url::form_urlencoded::byte_serialize(user_jwt_json.as_bytes()).collect();
+        let user_jwt: String =
+            url::form_urlencoded::byte_serialize(user_jwt_json.as_bytes()).collect();
         let callback_url = format!(
             "http://127.0.0.1:1234/authorize?refreshToken=refresh&userInfo={}&userJwt={}&loginTraceID={}",
             user_info, user_jwt, login.state

@@ -18,12 +18,20 @@ pub struct SignatureInput<'a> {
     pub nonce: &'a [u8],
 }
 
-pub fn build_auth_headers(input: &SignatureInput<'_>) -> Result<Vec<(String, String)>, GatewayError> {
+pub fn build_auth_headers(
+    input: &SignatureInput<'_>,
+) -> Result<Vec<(String, String)>, GatewayError> {
     if input.oauth_token.is_empty() || input.user_id.is_empty() {
-        return Err(GatewayError::with_status(401, "AtomCode 账号缺少用户或凭证，无法签名"));
+        return Err(GatewayError::with_status(
+            401,
+            "AtomCode 账号缺少用户或凭证，无法签名",
+        ));
     }
     if input.nonce.len() != 16 {
-        return Err(GatewayError::with_status(500, "AtomCode 签名 nonce 长度无效"));
+        return Err(GatewayError::with_status(
+            500,
+            "AtomCode 签名 nonce 长度无效",
+        ));
     }
     let master_key = decode_master_key()?;
     let token_hash = Sha256::digest(input.oauth_token.as_bytes());
@@ -54,11 +62,17 @@ pub fn build_auth_headers(input: &SignatureInput<'_>) -> Result<Vec<(String, Str
     );
     let signature = hmac_sha256(&signing_key, canonical.as_bytes());
     Ok(vec![
-        ("X-AtomCode-Sig".to_string(), format!("v1:{}", hex_encode(&signature))),
+        (
+            "X-AtomCode-Sig".to_string(),
+            format!("v1:{}", hex_encode(&signature)),
+        ),
         ("X-AtomCode-Ts".to_string(), input.timestamp.to_string()),
         ("X-AtomCode-Nonce".to_string(), nonce_hex),
         ("X-AtomCode-Alg".to_string(), "1".to_string()),
-        ("X-AtomCode-Ver".to_string(), input.client_version.to_string()),
+        (
+            "X-AtomCode-Ver".to_string(),
+            input.client_version.to_string(),
+        ),
     ])
 }
 
@@ -73,7 +87,10 @@ fn decode_master_key() -> Result<Vec<u8>, GatewayError> {
     let key = hex_decode(MASTER_KEY_HEX)
         .ok_or_else(|| GatewayError::with_status(500, "AtomCode 签名主密钥无效"))?;
     if key.len() != 32 {
-        return Err(GatewayError::with_status(500, "AtomCode 签名主密钥长度无效"));
+        return Err(GatewayError::with_status(
+            500,
+            "AtomCode 签名主密钥长度无效",
+        ));
     }
     Ok(key)
 }

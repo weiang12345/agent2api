@@ -22,7 +22,10 @@ pub struct Credentials {
 impl Credentials {
     pub fn from_payload(payload: &Value) -> Result<Self, GatewayError> {
         if !payload.is_object() {
-            return Err(GatewayError::with_status(400, "AtomCode 账号内容必须是 JSON 对象"));
+            return Err(GatewayError::with_status(
+                400,
+                "AtomCode 账号内容必须是 JSON 对象",
+            ));
         }
         let access_token = secret(payload, &["accessToken", "access_token", "access", "token"])?;
         if access_token.is_empty() {
@@ -41,14 +44,20 @@ impl Credentials {
             refresh_token,
             expires_at,
             user_id,
-            name: text(payload, &["name", "nickname"]).chars().take(100).collect(),
+            name: text(payload, &["name", "nickname"])
+                .chars()
+                .take(100)
+                .collect(),
             email: text(payload, &["email"]).chars().take(320).collect(),
         })
     }
 
     pub fn complete_identity(&mut self) -> Result<(), GatewayError> {
         if self.user_id.is_empty() {
-            return Err(GatewayError::with_status(400, "缺少 AtomCode 用户标识，无法保存账号"));
+            return Err(GatewayError::with_status(
+                400,
+                "缺少 AtomCode 用户标识，无法保存账号",
+            ));
         }
         Ok(())
     }
@@ -59,12 +68,18 @@ impl Credentials {
 
     pub fn expiring(&self) -> bool {
         self.can_refresh()
-            && self.expires_at.is_some_and(|expiry| expiry <= logging::now_ms() + REFRESH_MARGIN_MS)
+            && self
+                .expires_at
+                .is_some_and(|expiry| expiry <= logging::now_ms() + REFRESH_MARGIN_MS)
     }
 
     pub fn to_value(&self) -> Value {
         let text_or_null = |value: &str| -> Value {
-            if value.is_empty() { Value::Null } else { Value::String(value.to_string()) }
+            if value.is_empty() {
+                Value::Null
+            } else {
+                Value::String(value.to_string())
+            }
         };
         json!({
             "accessToken": text_or_null(&self.access_token),
@@ -130,18 +145,26 @@ pub fn secret(payload: &Value, keys: &[&str]) -> Result<String, GatewayError> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("");
-    if value.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("Bearer ")) {
+    if value
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
+    {
         value = value[7..].trim();
     }
     if value.len() > MAX_TOKEN_LENGTH || value.chars().any(char::is_control) {
-        return Err(GatewayError::with_status(400, "AtomCode 凭证过长或包含非法控制字符"));
+        return Err(GatewayError::with_status(
+            400,
+            "AtomCode 凭证过长或包含非法控制字符",
+        ));
     }
     Ok(value.to_string())
 }
 
 pub fn timestamp(value: Option<&Value>) -> Option<i64> {
     let value = value?;
-    let number = value.as_i64().or_else(|| value.as_str()?.trim().parse::<i64>().ok());
+    let number = value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok());
     if let Some(number) = number.filter(|value| *value > 0) {
         return if number < 100_000_000_000 {
             number.checked_mul(1000)

@@ -82,9 +82,11 @@
 //!   custom_accounts.rs   自定义提供商账号（`custom-` 前缀的 provider）：手动
 //!                添加（apiKey + baseUrl 覆盖项）、级联删除、custom 公开形态；
 //!                存储与校验的架构说明见 `core::custom_providers`
+//!   accio_accounts.rs    Accio 账号（两个地区各一家 provider）：添加（粘贴凭证 /
+//!                网页登录共用入口）、续期回写、公开形态（含 edition）
 
+pub mod accio_accounts;
 pub mod atomcode_accounts;
-pub mod trae_accounts;
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
@@ -103,6 +105,8 @@ pub mod store_batch;
 pub mod store_crud;
 pub mod store_util;
 pub mod store_view;
+pub mod trae_accounts;
+pub mod zcode_accounts;
 
 pub use store::{AccountStore, AccountStoreError};
 
@@ -126,9 +130,8 @@ pub const MAX_TOKEN_LENGTH: usize = 8192;
 
 /// CatPaw provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`RACCOON_PROVIDER_ID`] 的口径 —— 注册表改了 id，这个常量跟着变）。
-pub(crate) const CATPAW_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
-    crate::server::core::providers::ProviderKind::CatPaw,
-);
+pub(crate) const CATPAW_PROVIDER_ID: &str =
+    crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::CatPaw);
 
 /// AutoClaw provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`RACCOON_PROVIDER_ID`] 的口径）。
@@ -136,9 +139,8 @@ pub(crate) const CATPAW_PROVIDER_ID: &str = crate::server::core::providers::kind
 /// 这是**国内版**的 id（历史值，不改名 —— 存量账号的落盘契约）；
 /// 国际版见 [`AUTOCLAW_INTL_PROVIDER_ID`]。判「是不是 AutoClaw 系」用
 /// [`is_autoclaw_family`]。
-pub(crate) const AUTOCLAW_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
-    crate::server::core::providers::ProviderKind::AutoClaw,
-);
+pub(crate) const AUTOCLAW_PROVIDER_ID: &str =
+    crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::AutoClaw);
 
 /// AutoClaw **国际版** provider id（同 [`AUTOCLAW_PROVIDER_ID`] 的口径）。
 ///
@@ -152,9 +154,8 @@ pub(crate) const AUTOCLAW_INTL_PROVIDER_ID: &str = crate::server::core::provider
 /// Qoder provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`RACCOON_PROVIDER_ID`] 的口径）。Qoder 的账号形态与推理转发见
 /// `qoder_accounts.rs` 与 `providers::qoder` 的模块头。
-pub(crate) const QODER_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
-    crate::server::core::providers::ProviderKind::Qoder,
-);
+pub(crate) const QODER_PROVIDER_ID: &str =
+    crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Qoder);
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`RACCOON_PROVIDER_ID`] 的口径）。账号形态见 `cline_accounts.rs`。
@@ -168,14 +169,12 @@ pub(crate) const CLINE_PASS_PROVIDER_ID: &str = crate::server::core::providers::
 );
 
 /// AtomCode provider id（账号存储内部多处要用）。
-pub(crate) const ATMCODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
-    crate::server::core::providers::ProviderKind::AtmCode,
-);
+pub(crate) const ATMCODE_PROVIDER_ID: &str =
+    crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::AtmCode);
 
 /// Trae provider id。
-pub(crate) const TRAE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
-    crate::server::core::providers::ProviderKind::Trae,
-);
+pub(crate) const TRAE_PROVIDER_ID: &str =
+    crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Trae);
 
 /// 这个 provider 是不是 **Cline 系**（两个额度池之一）。
 ///
@@ -200,6 +199,28 @@ pub(crate) fn is_autoclaw_family(provider_id: &str) -> bool {
     provider_id == AUTOCLAW_PROVIDER_ID || provider_id == AUTOCLAW_INTL_PROVIDER_ID
 }
 
+/// 这个 provider 是不是 **Accio 系**（两个地区之一）。
+///
+/// 与 [`is_autoclaw_family`] 同一形态、同一理由：账号层有几处判断只关心
+/// 「是不是 Accio」（签到范围排除、公开形态），不关心哪个地区 ——
+/// 那些分支走本函数，于是加地区或改名时只改这里一处，而不是散在各文件里的
+/// `id == "accio"`（那种写法对国内版恒为假，是个不会报错的静默失配）。
+pub(crate) fn is_accio_family(provider_id: &str) -> bool {
+    crate::server::core::providers::accio::endpoints::Region::from_provider_id(provider_id)
+        .is_some()
+}
+
+/// 这个 provider 是不是 **ZCode 系**（两个地区之一）。
+///
+/// 与 [`is_autoclaw_family`] / [`is_accio_family`] 同一形态、同一理由：
+/// 账号层有几处判断只关心「是不是 ZCode」（签到范围排除、公开形态、
+/// 领取任务的账号枚举），不关心哪个地区 —— 那些分支走本函数，于是加地区
+/// 或改名时只改这里一处，而不是散在各文件里的 `id == "zcode"`
+/// （那种写法对国际版恒为假，是个不会报错的静默失配）。
+pub(crate) fn is_zcode_family(provider_id: &str) -> bool {
+    crate::server::core::providers::zcode::region::Region::from_provider_id(provider_id).is_some()
+}
+
 /// 小浣熊 provider id（账号存储内部多处要用）。
 ///
 /// **从注册表推导**（W4a）：`providers::kind_id` 是 `const fn`，所以这里可以
@@ -217,6 +238,4 @@ pub(crate) fn is_autoclaw_family(provider_id: &str) -> bool {
 /// 仍然按 id 判定 —— 那是「这一家的特殊行为」，不是白名单，改动量随新家到来
 /// 天然增加（每一家都有自己的一套字段与凭证链路）。
 pub(crate) const RACCOON_PROVIDER_ID: &str =
-    crate::server::core::providers::kind_id(
-        crate::server::core::providers::ProviderKind::Raccoon,
-    );
+    crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Raccoon);

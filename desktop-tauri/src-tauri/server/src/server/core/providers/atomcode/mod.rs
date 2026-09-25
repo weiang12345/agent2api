@@ -132,9 +132,8 @@ impl ProviderAdapter for AtmCodeAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let credentials = credentials_for(store, account_id)?;
             let credentials = refresh_if_needed(store, account_id, &credentials, false).await?;
@@ -164,7 +163,8 @@ impl ProviderAdapter for AtmCodeAdapter {
             let Ok(credentials) = Credentials::from_payload(&record) else {
                 return ModelRefreshOutcome::failed("AtomCode 账号凭证无效，请重新登录");
             };
-            let credentials = match refresh_if_needed(store, account_id, &credentials, false).await {
+            let credentials = match refresh_if_needed(store, account_id, &credentials, false).await
+            {
                 Ok(credentials) => credentials,
                 Err(error) => return ModelRefreshOutcome::failed(error.message),
             };
@@ -217,9 +217,7 @@ fn account_proxy(
         .ok_or_else(|| GatewayError::with_status(401, "没有可用的 AtomCode 账号"))?;
     match resolve_account_proxy(record.get("proxy")) {
         Some(ProxyResolution::Resolved(proxy)) => Ok(Some(proxy)),
-        Some(ProxyResolution::Failed(reason)) => {
-            Err(GatewayError::with_status(400, reason))
-        }
+        Some(ProxyResolution::Failed(reason)) => Err(GatewayError::with_status(400, reason)),
         None => Ok(None),
     }
 }

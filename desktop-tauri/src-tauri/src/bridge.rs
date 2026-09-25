@@ -194,6 +194,29 @@ const BRIDGE_JS: &str = r#"
         vendor: String(vendor || ''),
         captchaVerifyParam: String(captchaVerifyParam || ''),
       }),
+    // ── ZCode「周末套餐」领取（三个薄封装，直接打账号子路径接口）──────
+    // 与上面 AutoClaw 那三个方法同一形态，**两处必须成对存在**：本文件是
+    // 桌面壳的桥接，`server/src/web_shim.rs` 是 headless 面板的桥接 ——
+    // 只加一边时，另一形态下的界面会报「当前环境不支持领取（桥接方法缺失）」
+    // （zcode-claim.js 的 `api?.zcodeClaimPreview` 判定）。
+    //
+    // 契约（详见 `api/zcode_claim.rs` 的模块头）：
+    //   · captchaConfig 拿阿里云风控配置（前端用它初始化滑块 SDK）；
+    //     返回 `{enabled:false}` 表示上游此刻不要验证码 —— 前端**不该**弹滑块；
+    //   · preview 只读探测，返回 `{plans:[...], deployed}`；
+    //     `deployed:false` = 活动接口尚未部署（开抢前的正常状态，不是错误）；
+    //   · claim 真正领取；**业务失败也走 200**，由 `ok:false` + `failure`
+    //     表达（前端据此选提示文案）。
+    zcodeClaimCaptchaConfig: accountId =>
+      call('POST', `/api/accounts/${encodeURIComponent(String(accountId || ''))}/zcode-claim/captcha-config`),
+    zcodeClaimPreview: accountId =>
+      call('POST', `/api/accounts/${encodeURIComponent(String(accountId || ''))}/zcode-claim/preview`),
+    zcodeClaim: (accountId, planId, captchaVerifyParam, captchaRegion) =>
+      call('POST', `/api/accounts/${encodeURIComponent(String(accountId || ''))}/zcode-claim`, {
+        planId: planId ? String(planId) : '',
+        captchaVerifyParam: String(captchaVerifyParam || ''),
+        captchaRegion: captchaRegion ? String(captchaRegion) : '',
+      }),
     onLoginState: callback => on('login:state', callback),
     refreshSession: async () => {
       await call('POST', '/api/session/refresh', {});
@@ -209,14 +232,20 @@ const BRIDGE_JS: &str = r#"
     saveConfig: payload => call('POST', '/api/config', payload),
 
     // ── 模型清单 ──
-    // 手动刷新（网关页「刷新模型清单」按钮）：只刷支持远程目录的家、
-    // 强制绕过缓存，返回 `{results, refreshed, skipped, failed, models}`
-    // —— **带刷新后的聚合清单**，界面就地重绘、不必再拉一次 /api/session
-    // （理由见后端 `api::models` 的模块头）。
+    // 手动刷新（「获取模型」弹窗）：只刷支持远程目录的家、强制绕过缓存，
+    // 返回 `{results, refreshed, skipped, failed, models}` —— `models` 是
+    // **session 形状**的聚合清单（同 /api/session 的那份），给「就地重绘
+    // /api/session 快照」的调用方用；模型管理页那份 manage 视图（左栏计数、
+    // 行的「来源」列）不在其中 —— 它由调用方在刷新落地后自己重拉
+    // （见 models-fetch-modal.js 的 onRefreshed）。
     //
-    // 可选入参 `{accounts: {providerId: accountId}}`：「获取模型」弹窗每行的
-    // 「模型来源」下拉点名的账号（用谁去打该家的目录接口）。不传 = 各家按
-    // 默认选取（队首可用账号）；逐条结果里带 `accountId` 供界面回读。
+    // 可选入参两个键，都是新增的可选维度（老调用方不传 = 各家按默认选取 + 全部家）：
+    //   · `{accounts: {providerId: accountId}}`：「获取模型」弹窗每行的
+    //     「模型来源」下拉点名的账号（用谁去打该家的目录接口）；逐条结果里带
+    //     `accountId` 供界面回读。
+    //   · `{providers: [providerId, ...]}`：本次刷新的**范围白名单**，名单外的家
+    //     不打网络也不进结果（弹窗按「模型管理页实有清单的家 ∪ 有启用账号的家」
+    //     组装，见 models-fetch-modal.js 的 scopeProviders）。
     refreshModels: payload => call('POST', '/api/models/refresh', payload || {}),
     // 模型管理（启停 / 映射）：写接口都返回最新 {models, mappings, reasoningLevels}
     // 映射照抄 OmniProxy 语义：对外名自由命名（允许与上游 id 同名），同一对外名

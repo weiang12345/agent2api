@@ -440,6 +440,33 @@ pub fn shim_js() -> &'static str {
         captchaVerifyParam: String(captchaVerifyParam || ''),
       });
     },
+    // ── ZCode「周末套餐」领取（三个薄封装，直接打账号子路径接口）──────
+    // 与上面的 AutoClaw 三个方法同一形态：界面只管传参，路径与请求体形状
+    // 由这里对着后端 `api::zcode_claim` 的三个处理器写死一处。
+    //
+    // 契约（详见 `api/zcode_claim.rs` 的模块头）：
+    //   · captchaConfig 拿阿里云风控配置（前端用它初始化滑块 SDK）；
+    //     返回 `{enabled:false}` 表示上游此刻不要验证码 —— 前端**不该**弹滑块；
+    //   · preview 只读探测，返回 `{plans:[...], deployed}`；
+    //     `deployed:false` = 活动接口尚未部署（开抢前的正常状态，不是错误）；
+    //   · claim 真正领取，必须带 captchaVerifyParam；**业务失败也走 200**，
+    //     由 `ok:false` + `failure` 表达（前端据此选提示文案）。
+    zcodeClaimCaptchaConfig: function (accountId) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(accountId || ''))
+        + '/zcode-claim/captcha-config');
+    },
+    zcodeClaimPreview: function (accountId) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(accountId || ''))
+        + '/zcode-claim/preview');
+    },
+    zcodeClaim: function (accountId, planId, captchaVerifyParam, captchaRegion) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(accountId || ''))
+        + '/zcode-claim', {
+        planId: planId ? String(planId) : '',
+        captchaVerifyParam: String(captchaVerifyParam || ''),
+        captchaRegion: captchaRegion ? String(captchaRegion) : '',
+      });
+    },
     onLoginState: function (callback) {
       loginListeners.add(callback);
       return function () { loginListeners.delete(callback); };
@@ -458,7 +485,11 @@ pub fn shim_js() -> &'static str {
     saveConfig: function (payload) { return call('POST', '/api/config', payload); },
 
     // ── 模型清单 ──
-    refreshModels: function () { return call('POST', '/api/models/refresh', {}); },
+    // 入参原样透传（与桌面 bridge 对齐）：`{accounts: {providerId: accountId},
+    // providers: [id, ...]}` —— 「模型来源」点名的账号与本次刷新的范围都在里面。
+    // 早先这里写死 `{}`，两个可选项一起丢了：范围收窄失效（界面上看不到的家
+    // 也进结果，多出一批「缺少登录态」的噪音行），点名账号同样不生效。
+    refreshModels: function (payload) { return call('POST', '/api/models/refresh', payload || {}); },
     getModelManage: function () { return call('GET', '/api/models/manage'); },
     setModelState: function (payload) { return call('POST', '/api/models/state', payload); },
     // 第 4 / 第 5 个参数（思考等级 / 映射开关）都按「有没有传」决定是否进请求体：

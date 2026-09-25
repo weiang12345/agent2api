@@ -8,13 +8,18 @@
 //! 注意：服务端按官方客户端 UA 区分来源，缺失 UA 时 /v3/config 的 models
 //! 可能返回 null，因此 refresh 时必须带 User-Agent。
 //!
-//! ── 一个与任务书不一致的确认结论（有意为之）──────────────────
-//! 任务书提到「只在版本变化时写盘 {config_dir}/models.json」，但**Node 版
-//! 没有任何磁盘缓存**（全仓 grep `models.json` 零命中，workbuddy-models.mjs
-//! 全文没有 fs 调用）：目录是纯内存态，进程重启后回到内置清单，再由启动时/
-//! 每次 GET /v1/models 的异步刷新重新拉取。契约以 Node 版为准，所以这里
-//! **不新增缓存文件** —— 多一个文件就多一处与 Node 版的数据格式分叉点，
-//! 而收益只是省一次启动请求。
+//! ── 远程清单的持久化（与 Node 版的唯一一处有意分叉）──────────
+//! 任务书提到「只在版本变化时写盘 {config_dir}/models.json」；早先按「Node 版
+//! 没有任何磁盘缓存」（全仓 grep `models.json` 零命中，workbuddy-models.mjs
+//! 全文没有 fs 调用）移植时**没有实现**，目录因此是纯内存态：进程重启回到
+//! 内置清单，再由启动时/每次 GET /v1/models 的异步刷新重新拉取。
+//!
+//! 现在补上了，形态与任务书不同：**不写独立文件，进统一库的 `kv` 表**
+//! （`providers::catalog_cache`）。改主意的理由：纯内存态下，重启那次刷新
+//! 若失败（网络 / 无账号 / 上游报错），用户看到的就是内置清单 —— 上次拉到的
+//! 新清单整个丢失（上游新增的模型消失、已下架的模型回来被广告出去）。
+//! 这个分叉是有意的：Node 版没有「多提供商 + 管理页」这套界面，清单丢失的
+//! 影响面比现在小得多。缓存的形态与「为什么不留有效期」见那个模块的模块头。
 //!
 //! ── 并发 ──────────────────────────────────────────────────
 //! 目录是「读多写少」的共享态：句柄内一把 `RwLock`，读路径（/v1/models、
@@ -46,7 +51,7 @@ use serde_json::{json, Value};
 
 use crate::server::core::auth_http::send_raw;
 use crate::server::core::endpoints::{normalize_endpoint, user_agent_for_edition};
-use crate::server::core::providers::{kind_id, ProviderKind};
+use crate::server::core::providers::{catalog_cache, kind_id, ProviderKind};
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::logging;
 
@@ -57,7 +62,9 @@ use shape::{js_truthy, value_text};
 // 取这些名字，保持与拆分前同一条导入路径。
 // `shape_value_text` 是 `shape::value_text` 的别名导出：聚合目录要按 `name`
 // 匹配模型（对齐 `ModelCatalog::get` 的第二段），需要与这里同一套 JS 文本化。
-pub use shape::{list_item, list_response_from, model_id, suggest_from, value_text as shape_value_text};
+pub use shape::{
+    list_item, list_response_from, model_id, suggest_from, value_text as shape_value_text,
+};
 
 /// 下游可见模型白名单：/v1/models 与路由解析只暴露这些模型。
 ///
@@ -194,11 +201,33 @@ fn allowlist_fallback() -> Vec<Value> {
         .collect()
 }
 
-/// 初始目录：内置清单（经准入过滤）——与 Node 版 createModelCatalog 的初始化一致。
+/// 初始目录：**优先上次成功拉到的远程清单**（持久化缓存，见 `catalog_cache`
+/// 的模块头），没有再退回内置清单（经准入过滤）——与 Node 版
+/// `createModelCatalog` 的初始化相比，这里多出来的只有缓存恢复这一层。
+///
+/// 缓存恢复的清单**同样算「远程」**（`remote_refreshed = true`）：它确实是
+/// 上游下发的清单，只是可能旧一些。管理页的「来源」列与 `/v1/models` 的
+/// `meta.source` 因此显示「远程」而不是「内置」——那是事实，且时间戳
+/// （`last_refreshed_at`）会如实给出它是什么时候拉的。
 fn initial_state() -> CatalogState {
+    if let Some(cached) = catalog_cache::load(catalog_cache::SCOPE_WORKBUDDY) {
+        return CatalogState {
+            models: cached.models,
+            last_refreshed_at: cached.fetched_at,
+            remote_refreshed: true,
+        };
+    }
     let allowed = apply_filters(builtin_models());
-    let models = if allowed.is_empty() { allowlist_fallback() } else { allowed };
-    CatalogState { models, last_refreshed_at: 0, remote_refreshed: false }
+    let models = if allowed.is_empty() {
+        allowlist_fallback()
+    } else {
+        allowed
+    };
+    CatalogState {
+        models,
+        last_refreshed_at: 0,
+        remote_refreshed: false,
+    }
 }
 
 /// 模型目录句柄：内部一把 `RwLock`，克隆共享同一份状态。
@@ -216,7 +245,9 @@ impl Default for ModelCatalog {
 impl ModelCatalog {
     /// 构造目录（不刷新；刷新由启动流程与 /v1/models 触发）
     pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(initial_state())) }
+        Self {
+            inner: Arc::new(RwLock::new(initial_state())),
+        }
     }
 
     /// 读取状态快照；锁中毒（持锁 panic）时接管内部数据继续用，
@@ -346,7 +377,11 @@ impl ModelCatalog {
             .collect();
         list_response_from(
             data,
-            if state.remote_refreshed { "remote" } else { "builtin" },
+            if state.remote_refreshed {
+                "remote"
+            } else {
+                "builtin"
+            },
             state.last_refreshed_at,
         )
     }
@@ -396,10 +431,7 @@ impl ModelCatalog {
                         let allowed = apply_filters(raw.clone());
                         if !allowed.is_empty() {
                             self.apply_remote(allowed, "auto", false);
-                            return RefreshOutcome::refreshed(
-                                self.count(),
-                                "v3/config",
-                            );
+                            return RefreshOutcome::refreshed(self.count(), "v3/config");
                         }
                         logging::verbose(
                             "[Models]",
@@ -476,13 +508,20 @@ impl ModelCatalog {
                 };
                 object.insert("isDefault".to_string(), Value::Bool(is_auto));
                 let model_type = if enterprise {
-                    if raw_id.starts_with(custom_prefix) { "enterprise" } else { "built-in" }
+                    if raw_id.starts_with(custom_prefix) {
+                        "enterprise"
+                    } else {
+                        "built-in"
+                    }
                 } else if is_auto {
                     "auto"
                 } else {
                     "built-in"
                 };
-                object.insert("modelType".to_string(), Value::String(model_type.to_string()));
+                object.insert(
+                    "modelType".to_string(),
+                    Value::String(model_type.to_string()),
+                );
                 Value::Object(object)
             })
             .collect();
@@ -495,7 +534,15 @@ impl ModelCatalog {
             last_refreshed_at: logging::now_ms(),
             remote_refreshed: true,
         };
-        self.write(state);
+        self.write(state.clone());
+        // 落持久化缓存（进程重启后由 `initial_state` 读回，见 `catalog_cache`
+        // 的模块头）。必须在写锁**之外**：缓存写入要拿库连接锁，而本目录的
+        // 硬约束是「持锁期间不做 IO」。
+        catalog_cache::save(
+            catalog_cache::SCOPE_WORKBUDDY,
+            &state.models,
+            state.last_refreshed_at,
+        );
         // 远程清单首次落地时补一次 WorkBuddy 默认规则种子（默认只启用白名单内的
         // 模型，见 model_rules::seed_workbuddy_defaults）。必须放在写锁之外：种子
         // 要写 config.json，而「持锁期间不做任何 IO」是本目录的硬约束。
@@ -537,7 +584,10 @@ impl ModelCatalog {
                 None => match auth.get_current_session().await {
                     Ok(session) => (session, None),
                     Err(error) => {
-                        logging::verbose("[Models]", &format!("模型目录刷新失败: {}", error.message));
+                        logging::verbose(
+                            "[Models]",
+                            &format!("模型目录刷新失败: {}", error.message),
+                        );
                         return RefreshOutcome::not_refreshed(error.message);
                     }
                 },
@@ -589,7 +639,10 @@ impl ModelCatalog {
         if outcome.refreshed {
             logging::log(
                 "[Models]",
-                &format!("✅ 模型目录已更新（{} 个，来源 {}）", outcome.count, outcome.source),
+                &format!(
+                    "✅ 模型目录已更新（{} 个，来源 {}）",
+                    outcome.count, outcome.source
+                ),
             );
         } else {
             logging::verbose("[Models]", &format!("模型目录未更新: {}", outcome.reason));
@@ -642,7 +695,8 @@ fn encode_uri_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         let ch = *byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')')
+        if ch.is_ascii_alphanumeric()
+            || matches!(ch, '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')')
         {
             out.push(ch);
         } else {

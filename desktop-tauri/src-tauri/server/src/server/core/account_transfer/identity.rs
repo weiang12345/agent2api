@@ -120,7 +120,10 @@ fn qoder_region(fields: &Map<String, Value>) -> Result<Option<String>, ()> {
 }
 
 /// 导入记录的业务身份；无法确定身份时 Err（该条失败，不做猜测性匹配）。
-pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Result<String, String> {
+pub(super) fn identity_of_item(
+    provider: &str,
+    item: &Map<String, Value>,
+) -> Result<String, String> {
     let text = |key: &str| {
         item.get(key)
             .and_then(Value::as_str)

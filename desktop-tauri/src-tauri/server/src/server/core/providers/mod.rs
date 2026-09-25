@@ -86,13 +86,23 @@
 //!                 balance.rs     额度查询（credit 余额归一）
 //!                 adapter.rs     ProviderAdapter 实现（无状态，OpenAI 兼容，
 //!                                按池参数化）
+//!   accio/       Accio（`accio` 国际版 / `accio-cn` 国内版，同一份实现按地区
+//!                参数化）：账号管理 **+ 推理转发**。上游不是 OpenAI 协议而是
+//!                阿里 ADK 的 Gemini 风格信封（`/api/adk/llm/generateContent`，
+//!                SSE、token 在 body 里），因此 `is_stateful` 为 true。
+//!                子模块：endpoints / credentials / auth / refresh / oauth(PKCE)
+//!                / models（静态兜底 + `/api/llm/config/v2`）/ protocol /
+//!                stream / chat / balance
 //! 本文件仍然只做「身份与元数据」这一件事，不认识磁盘也不认识账号。
 
+pub mod accio;
 pub mod adapter;
 pub mod atomcode;
-pub mod trae;
 pub mod autoclaw;
 pub mod catalog;
+/// 远程模型清单的**持久化缓存**（各家的清单在进程重启后由它读回，见模块头）。
+/// 不进身份体系：它是各家的共用基础设施，只按 scope 字符串存取 JSON。
+pub mod catalog_cache;
 pub mod catpaw;
 pub mod cline;
 pub mod content_block;
@@ -106,7 +116,9 @@ pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
+pub mod trae;
 pub mod workbuddy;
+pub mod zcode;
 
 use serde_json::{json, Value};
 
@@ -196,6 +208,58 @@ pub enum ProviderKind {
     AtmCode,
     /// Trae SOLO 国内版（云直连）。
     Trae,
+    /// Accio **国际版**（`accio`）。适配实现在 `accio/`：账号管理（PKCE 网页
+    /// 登录 / 粘贴凭证 / 续期 / 额度查询）**加推理转发**。
+    ///
+    /// ── 上游长什么样（从客户端安装包逆向，见 `accio/mod.rs` 的模块头）──
+    /// 推理不是 OpenAI 协议而是阿里 ADK 的 **Gemini 风格**信封
+    /// （`POST {gw}/api/adk/llm/generateContent?sg_k=<md5(requestId)>`，body 是
+    /// protobuf-JSON：`contents` / `system_instruction` / `tools`，鉴权靠 body 里的
+    /// `token` 字段），因此 `is_stateful()` 为 true —— 与 Qoder 同一处境
+    /// （「一次发送要适配器自己完成」）。
+    Accio,
+    /// Accio **国内版**（`accio-cn`）。与 [`ProviderKind::Accio`] 同一套协议、
+    /// 同一个网关（`phoenix-gw.alibaba.com`）、同一个 `client_id`（`accio-work`），
+    /// 只有**登录站点**（`www.accio-ai.com`）、文件域名与 `x-package-region`
+    /// 请求头不同（`CN` vs `GLOBAL`）。
+    ///
+    /// ── 为什么两个地区是两家 provider（与 AutoClaw / Cline 同一思路）──────
+    /// 把地区做成「一家的一个字段」的后果与那两次一模一样：地区成了**账号的
+    /// 属性**，界面上混在一起，而「哪个账号走哪个站点」在列表里看不出来。
+    /// 两家共用**一份实现**：`accio::adapter::AccioAdapter` 持有一个
+    /// `accio::endpoints::Region`，两个静态实例（`ACCIO_ADAPTER` /
+    /// `ACCIO_CN_ADAPTER`）由 `adapter_for` 按 kind 给出。
+    /// 地区 → provider 的互查在 `accio::endpoints::Region`（`kind` /
+    /// `provider_id` / `from_provider_id`），别处不要再写 `"accio-cn"` 字面量。
+    AccioCn,
+    /// ZCode（智谱 / Z.AI 的编码代理客户端）**国内版**；适配实现在 `zcode/`：
+    /// 账号管理 **加推理转发**（OpenAI 兼容、Bearer 鉴权、无状态）。
+    ///
+    /// ── 这一家的特别之处：zcode 平面两地相同、推理平面两地不同 ──
+    /// 登录与「周末套餐」领取都在 ZCode 自己的服务端（`zcode.z.ai`），两地
+    /// 客户端用的是同一个域；真正跑推理的是各自开放平台的编码套餐端点
+    /// （国内 `open.bigmodel.cn` / 国际 `api.z.ai`）。所以「地区」在这一家
+    /// 只影响推理平面与账号归属 —— 与 AutoClaw（两地各一整套域名）不同。
+    ///
+    /// ── 与 [`ProviderKind::ZcodeIntl`] 同一份实现按地区参数化 ────
+    /// `zcode::adapter::ZcodeAdapter` 持有一个 `zcode::region::Region`，
+    /// 两个静态实例（`ZCODE_ADAPTER` / `ZCODE_INTL_ADAPTER`）由 `adapter_for`
+    /// 按 kind 给出。地区 → provider 的互查在 `zcode::region::Region`
+    /// （`kind` / `provider_id` / `from_provider_id`），别处不要再写
+    /// `"zcode"` / `"zcode-intl"` 这类字面量。
+    Zcode,
+    /// ZCode **国际版**（`zcode-intl`）。与 [`ProviderKind::Zcode`] 同一套协议、
+    /// 同一个 zcode 平面，只有推理平面（`api.z.ai`）与 OAuth 的 `provider`
+    /// 取值（`zai`）不同。
+    ///
+    /// ── 为什么两个地区是两家 provider（与 AutoClaw / Cline / Accio 同一思路）──
+    /// 把地区做成「一家的一个字段」的后果那三次已经各说过一遍：地区成了**账号
+    /// 的属性**，界面上混在一起、无法按地区隔离账号记录。
+    ///
+    /// ── 本家**没有签到**，接的是「周末套餐领取」────────────────
+    /// 其余各家都在 `core::auto_checkin` 的提供商清单里，本家不在 ——
+    /// 它没有签到活动，运营玩法是限时发放的体验套餐（见 `zcode::claim`）。
+    ZcodeIntl,
 }
 
 /// 一个提供商的静态元数据。
@@ -220,19 +284,71 @@ pub struct ProviderMeta {
 /// 注册表顺序只用于**展示**（providers 摘要、模型目录合并时同名模型的去重顺序）
 /// 与旧数据迁移（把按家分队的优先级合并成全局队列时，作为旧默认路由顺序的依据）。
 pub const PROVIDERS: &[ProviderMeta] = &[
-    ProviderMeta { id: "workbuddy", label: "WorkBuddy" },
-    ProviderMeta { id: "raccoon", label: "小浣熊" },
-    ProviderMeta { id: "catpaw", label: "CatPaw" },
+    ProviderMeta {
+        id: "workbuddy",
+        label: "WorkBuddy",
+    },
+    ProviderMeta {
+        id: "raccoon",
+        label: "小浣熊",
+    },
+    ProviderMeta {
+        id: "catpaw",
+        label: "CatPaw",
+    },
     // AutoClaw 两个地区**相邻**排列（本次改动的要求）：界面上它们是同一条产品线的
     // 两个版本，中间隔着别的家会让「找国际版」变成一次扫描。顺序也决定模型目录
     // 合并时同名模型先归谁家 —— 国内版在前，与存量账号的归属一致。
-    ProviderMeta { id: "autoclaw", label: "AutoClaw 国内版" },
-    ProviderMeta { id: "autoclaw-intl", label: "AutoClaw 国际版" },
-    ProviderMeta { id: "qoder", label: "Qoder" },
-    ProviderMeta { id: "cline-free", label: "Cline Free" },
-    ProviderMeta { id: "cline-pass", label: "Cline Pass" },
-    ProviderMeta { id: "atomcode", label: "AtomCode" },
-    ProviderMeta { id: "trae", label: "Trae" },
+    ProviderMeta {
+        id: "autoclaw",
+        label: "AutoClaw 国内版",
+    },
+    ProviderMeta {
+        id: "autoclaw-intl",
+        label: "AutoClaw 国际版",
+    },
+    ProviderMeta {
+        id: "qoder",
+        label: "Qoder",
+    },
+    ProviderMeta {
+        id: "cline-free",
+        label: "Cline Free",
+    },
+    ProviderMeta {
+        id: "cline-pass",
+        label: "Cline Pass",
+    },
+    ProviderMeta {
+        id: "atomcode",
+        label: "AtomCode",
+    },
+    ProviderMeta {
+        id: "trae",
+        label: "Trae",
+    },
+    // Accio 两个地区**相邻**排列（与 AutoClaw 同一理由：同一条产品线的两个
+    // 版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
+    // 合并时同名模型先归谁家 —— 国际版在前（用户装的、默认用的是它）。
+    ProviderMeta {
+        id: "accio",
+        label: "Accio",
+    },
+    ProviderMeta {
+        id: "accio-cn",
+        label: "Accio 国内版",
+    },
+    // ZCode 两个地区**相邻**排列（与 AutoClaw / Accio 同一理由：同一条产品线的
+    // 两个版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
+    // 合并时同名模型先归谁家 —— 国内版在前（国内网络环境下更常被添加的那个）。
+    ProviderMeta {
+        id: "zcode",
+        label: "ZCode 国内版",
+    },
+    ProviderMeta {
+        id: "zcode-intl",
+        label: "ZCode 国际版",
+    },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -303,6 +419,10 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "cline-pass" => Some(ProviderKind::ClinePass),
         "atomcode" => Some(ProviderKind::AtmCode),
         "trae" => Some(ProviderKind::Trae),
+        "accio" => Some(ProviderKind::Accio),
+        "accio-cn" => Some(ProviderKind::AccioCn),
+        "zcode" => Some(ProviderKind::Zcode),
+        "zcode-intl" => Some(ProviderKind::ZcodeIntl),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -331,6 +451,10 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::ClinePass => "cline-pass",
         ProviderKind::AtmCode => "atomcode",
         ProviderKind::Trae => "trae",
+        ProviderKind::Accio => "accio",
+        ProviderKind::AccioCn => "accio-cn",
+        ProviderKind::Zcode => "zcode",
+        ProviderKind::ZcodeIntl => "zcode-intl",
     }
 }
 

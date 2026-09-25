@@ -49,6 +49,7 @@ use serde_json::{json, Value};
 
 use crate::server::core::model_rules;
 use crate::server::core::providers::adapter::ModelRefreshOutcome;
+use crate::server::core::providers::catalog_cache;
 use crate::server::logging;
 
 /// 静态兜底清单里的默认对话模型 id（源实现 `DEFAULT_MODEL_ID`）。
@@ -159,10 +160,25 @@ struct CatalogState {
     fetched_at: i64,
 }
 
-/// 进程级目录句柄
+/// 进程级目录句柄。首次初始化时**先从持久化缓存恢复**（上次成功拉到的远程
+/// 清单），没有再留空 —— 空状态的读取语义就是「回落到静态兜底清单」。
 fn catalog() -> &'static RwLock<CatalogState> {
     static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
-    CATALOG.get_or_init(|| RwLock::new(CatalogState::default()))
+    CATALOG.get_or_init(|| RwLock::new(restored_state()))
+}
+
+/// 首次初始化读一次持久化缓存（见 `providers::catalog_cache` 的模块头）。
+///
+/// 缓存里存的就是 `CatalogState` 的形态（`refresh` 落地的那份），所以这里只做
+/// 「搬回来」：不重新解析、也不重新归一 —— 两处各写一份映射迟早分叉。
+fn restored_state() -> CatalogState {
+    match catalog_cache::load(catalog_cache::SCOPE_RACCOON) {
+        Some(cached) => CatalogState {
+            models: cached.models,
+            fetched_at: cached.fetched_at,
+        },
+        None => CatalogState::default(),
+    }
 }
 
 /// 读锁；锁中毒（持锁 panic）时接管内部数据继续用（与账号存储同一策略）
@@ -261,9 +277,7 @@ pub async fn refresh(
     // `force` 时整块跳过 —— 手动刷新就是要打这一次上游
     if !force {
         let state = read_state();
-        if !state.models.is_empty()
-            && logging::now_ms() - state.fetched_at < CATALOG_CACHE_TTL_MS
-        {
+        if !state.models.is_empty() && logging::now_ms() - state.fetched_at < CATALOG_CACHE_TTL_MS {
             return ModelRefreshOutcome::unchanged();
         }
     }
@@ -286,14 +300,24 @@ pub async fn refresh(
     // 「刷新失败（保留旧目录）」还是「刷新失败（仍在用静态兜底清单）」。
     // 写成闭包而不是提前算好：判据是**失败那一刻**的缓存状态，提前到请求前
     // 求值会因为期间别处刷新成功而说错（与改造前逐处内联的求值时机一致）
-    let kept = || if remote_refreshed() { "旧缓存" } else { "静态兜底" };
+    let kept = || {
+        if remote_refreshed() {
+            "旧缓存"
+        } else {
+            "静态兜底"
+        }
+    };
     let payload = match outcome {
         Ok(response) => {
             if !response.ok {
                 let reason = format!("上游返回 HTTP {}", response.status);
                 logging::verbose(
                     "[Models]",
-                    &format!("小浣熊模型目录拉取失败（沿用{}）: HTTP {}", kept(), response.status),
+                    &format!(
+                        "小浣熊模型目录拉取失败（沿用{}）: HTTP {}",
+                        kept(),
+                        response.status
+                    ),
                 );
                 return ModelRefreshOutcome::failed(reason);
             }
@@ -321,12 +345,22 @@ pub async fn refresh(
         .filter_map(|model| model.get("name").map(super::jwt::js_text))
         .collect();
     let count = models.len();
-    let next = CatalogState { models, fetched_at: logging::now_ms() };
+    let next = CatalogState {
+        models,
+        fetched_at: logging::now_ms(),
+    };
+    // 落持久化缓存（进程重启后由 `restored_state` 读回）：放在写内存状态之前，
+    // 因为 `next` 要被 `write` 消费。**不在目录锁内** —— 缓存写入要拿库连接锁，
+    // 两把锁不能嵌套（本目录的硬约束是「持锁期间不做 IO」）。
+    catalog_cache::save(catalog_cache::SCOPE_RACCOON, &next.models, next.fetched_at);
     match catalog().write() {
         Ok(mut guard) => *guard = next,
         Err(poisoned) => *poisoned.into_inner() = next,
     }
-    logging::log("[Models]", &format!("✅ 小浣熊模型目录已更新（{count} 个）"));
+    logging::log(
+        "[Models]",
+        &format!("✅ 小浣熊模型目录已更新（{count} 个）"),
+    );
     // 默认规则种子（raccoon-* 内部模型默认禁用 / sn-* 默认加去前缀映射）。
     // 只对首次出现的 id 生效，用户的手动调整不会被这里覆盖。
     if let Some(summary) = model_rules::seed_raccoon_defaults(&ids) {
@@ -421,10 +455,7 @@ fn normalize_catalog_entry(entry: &Value) -> Option<Value> {
             if let Some(number) = object.get(*key).and_then(int_of) {
                 return Value::from(number);
             }
-            if let Some(number) = params
-                .and_then(|params| params.get(*key))
-                .and_then(int_of)
-            {
+            if let Some(number) = params.and_then(|params| params.get(*key)).and_then(int_of) {
                 return Value::from(number);
             }
         }
@@ -465,8 +496,14 @@ fn normalize_catalog_entry(entry: &Value) -> Option<Value> {
     // 上下文窗口/输出上限用 `Value::Null` 表示「目录没给」——
     // 聚合出口的 `list_item` 对 null 的处理是**不输出该键**（与源实现的
     // `undefined` 一致），所以这里必须用 null 而不是 0
-    normalized.insert("contextWindow".to_string(), pick_int(&["context_window", "contextWindow"]));
-    normalized.insert("maxTokens".to_string(), pick_int(&["max_tokens", "maxTokens"]));
+    normalized.insert(
+        "contextWindow".to_string(),
+        pick_int(&["context_window", "contextWindow"]),
+    );
+    normalized.insert(
+        "maxTokens".to_string(),
+        pick_int(&["max_tokens", "maxTokens"]),
+    );
     normalized.insert("supportImage".to_string(), Value::Bool(support_image));
     // 源实现恒为 true（目录没有这个字段，客户端按「支持思考」渲染）
     normalized.insert("supportThinking".to_string(), Value::Bool(true));

@@ -334,7 +334,10 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         // 注册表与这里的分支必须同步（两者都由上面的 TASK_* 常量驱动）。
         // 走不到：调用方都先用 `find` 查过 id。给个默认值而不是 panic
         // —— release 是 panic=abort，任何 panic 都会带走整个应用。
-        config::IntervalTask { enabled: false, interval: 0 }
+        config::IntervalTask {
+            enabled: false,
+            interval: 0,
+        }
     }
 }
 
@@ -404,7 +407,11 @@ pub fn configure(id: &str, patch: IntervalTaskPatch) -> Result<Value, String> {
     }
     if let Some(interval) = patch.interval {
         if !(task.min..=task.max).contains(&interval) {
-            let unit = if task.unit == "seconds" { "秒" } else { "分钟" };
+            let unit = if task.unit == "seconds" {
+                "秒"
+            } else {
+                "分钟"
+            };
             return Err(format!(
                 "「{}」的间隔必须是 {}–{} {}",
                 task.label, task.min, task.max, unit
@@ -415,7 +422,11 @@ pub fn configure(id: &str, patch: IntervalTaskPatch) -> Result<Value, String> {
     let before = settings_of(config::scheduled_settings(), task.id);
     config::set_scheduled_task(task.id, patch, task.min, task.max);
     let after = settings_of(config::scheduled_settings(), task.id);
-    let unit = if task.unit == "seconds" { "秒" } else { "分钟" };
+    let unit = if task.unit == "seconds" {
+        "秒"
+    } else {
+        "分钟"
+    };
     if before.enabled != after.enabled {
         logging::log(
             "[Tasks]",
@@ -430,7 +441,10 @@ pub fn configure(id: &str, patch: IntervalTaskPatch) -> Result<Value, String> {
     } else if before.interval != after.interval {
         logging::log(
             "[Tasks]",
-            &format!("定时任务「{}」间隔已改为 {} {}", task.label, after.interval, unit),
+            &format!(
+                "定时任务「{}」间隔已改为 {} {}",
+                task.label, after.interval, unit
+            ),
         );
     }
     // ── 改完设置后的排期调整（三条分支互斥）──────────────────
@@ -475,7 +489,10 @@ pub async fn run_now(
 ) -> Result<String, String> {
     let task = find(id).ok_or_else(|| format!("未知的定时任务: {id}"))?;
     if task.runner != Runner::Backend {
-        return Err(format!("「{}」由界面自己刷新，无法在后端立即执行", task.label));
+        return Err(format!(
+            "「{}」由界面自己刷新，无法在后端立即执行",
+            task.label
+        ));
     }
     // 与调度循环共用同一条执行路径：手动跑与定时跑的行为必须完全一致
     //（否则「立即执行成功、定时那次却失败」这类分叉极难排查）
@@ -520,7 +537,9 @@ async fn run_backend(
                 // 全部成功是常态轮次：级别必须 info，不能让「失败 0 个」的文案把它抬成 error
                 logging::log_with_level(
                     "[Maintenance]",
-                    &format!("凭证自动维护：刷新 {refreshed} 个，跳过 {skipped} 个，失败 {failed} 个"),
+                    &format!(
+                        "凭证自动维护：刷新 {refreshed} 个，跳过 {skipped} 个，失败 {failed} 个"
+                    ),
                     if failed > 0 { "error" } else { "info" },
                 );
             }
@@ -550,7 +569,9 @@ async fn run_backend(
                     (count("refreshed"), count("skipped"), count("failed"));
                 logging::log_with_level(
                     "[Models]",
-                    &format!("定时任务触发刷新模型清单：成功 {refreshed}，跳过 {skipped}，失败 {failed}"),
+                    &format!(
+                        "定时任务触发刷新模型清单：成功 {refreshed}，跳过 {skipped}，失败 {failed}"
+                    ),
                     if failed > 0 { "error" } else { "info" },
                 );
                 format!("成功 {refreshed} 家，跳过 {skipped} 家，失败 {failed} 家")

@@ -32,7 +32,9 @@ fn manifest_for(kind: ProviderKind) -> Vec<Value> {
     for item in model_rules::custom_models_for(kind_id(kind)) {
         let id = model_id(&item);
         if !id.is_empty()
-            && !models.iter().any(|existing| model_id(existing).eq_ignore_ascii_case(&id))
+            && !models
+                .iter()
+                .any(|existing| model_id(existing).eq_ignore_ascii_case(&id))
         {
             models.push(item);
         }
@@ -55,7 +57,14 @@ fn autoclaw_catalog_state(region: Region) -> (bool, i64) {
     )
 }
 
-fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
+/// 这一家清单的「远程与否 + 拉取时刻」。
+///
+/// 两个消费方：本模块的对外视图（`meta.source` / 管理页的「来源」列）与
+/// **适配器层的手动刷新结果**（`adapter::refresh_implemented_forced` 的
+/// `refreshedAt`，界面「更新日期」列读它）—— 后者必须走这里而不是自己按
+/// kind 拼一遍：十家的取值路径（workbuddy 的全局目录、按地区分格的三家、
+/// Cline 的池）各不相同，抄一份就是一处会漂移的知识。
+pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
     match kind {
         ProviderKind::WorkBuddy => (
             workbuddy_catalog().remote_refreshed(),
@@ -88,11 +97,29 @@ fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::trae::models::remote_refreshed(),
             super::trae::models::last_refreshed_at(),
         ),
+        // Accio 两个地区各有自己的目录缓存（上游按 `x-package-region` 给清单）：
+        // 两家任一刷过就算「有远程来源」，时间取两者里更近的那次
+        ProviderKind::Accio | ProviderKind::AccioCn => {
+            let region = super::accio::endpoints::Region::from_kind(kind)
+                .unwrap_or(super::accio::endpoints::Region::Global);
+            (
+                !super::accio::models::remote_models(region).is_empty(),
+                super::accio::models::last_refreshed_at(region),
+            )
+        }
+        // ZCode 两个地区共用一份**静态**清单（上游没有列模型的公开接口，
+        // 见 `zcode::models` 的模块头）：永远不是远程来源，也没有刷新时刻。
+        // 这里如实回 `(false, 0)` 而不是编一个时间 —— 界面的「来源」列会显示成
+        // 内置清单，与事实相符。
+        ProviderKind::Zcode | ProviderKind::ZcodeIntl => (false, 0),
     }
 }
 
 fn all_kinds() -> Vec<ProviderKind> {
-    PROVIDERS.iter().filter_map(|meta| kind_from_id(meta.id)).collect()
+    PROVIDERS
+        .iter()
+        .filter_map(|meta| kind_from_id(meta.id))
+        .collect()
 }
 
 pub fn provider_available(store: &AccountStore, kind: ProviderKind) -> bool {
@@ -119,6 +146,12 @@ fn aggregate_source(active: &[(ProviderKind, Vec<Value>)]) -> (&'static str, i64
             (if remote { "remote" } else { "builtin" }, refreshed_at)
         }
         [] => ("none", 0),
-        _ => ("aggregate", active.first().map(|(kind, _)| refresh_meta(*kind).1).unwrap_or(0)),
+        _ => (
+            "aggregate",
+            active
+                .first()
+                .map(|(kind, _)| refresh_meta(*kind).1)
+                .unwrap_or(0),
+        ),
     }
 }

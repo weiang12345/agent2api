@@ -51,7 +51,10 @@ pub struct CheckinError {
 
 impl CheckinError {
     fn new(message: impl Into<String>, status_code: i32) -> Self {
-        Self { message: message.into(), status_code }
+        Self {
+            message: message.into(),
+            status_code,
+        }
     }
 }
 
@@ -62,9 +65,24 @@ impl std::fmt::Display for CheckinError {
 }
 
 /// 国际版没有签到活动，签到相关操作一律排除该版本账号
-/// （Node: `account.edition !== 'intl'`）
+/// （Node: `account.edition !== 'intl'`）。
+///
+/// Accio 系（两个地区）**整家**也没有签到活动：上游客户端全包检索不到
+/// 「签到 / checkin / 每日任务」的任何痕迹（见 `providers::accio` 的模块头）。
+/// 它按 **provider id** 排除而不是 edition —— 两个地区都没有活动，而 provider
+/// 是落盘契约，不会因为凭证里多一个字段而改变判定。
+///
+/// 这一步是**必需的**：`checkin_for` 的分派 match 里，不在范围的家会落到
+/// workbuddy 那个兜底分支，拿 Accio 的账号去打腾讯的签到接口只会稳定报错。
 pub fn supports_checkin(account: &Value) -> bool {
-    account.get("edition").and_then(Value::as_str) != Some("intl")
+    if account.get("edition").and_then(Value::as_str) == Some("intl") {
+        return false;
+    }
+    let provider = account
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    !crate::server::core::account_store::is_accio_family(provider)
 }
 
 /// 账号的提供商 id（缺失时按默认 provider 处理，与账号存储的兜底口径一致）。
@@ -166,12 +184,12 @@ pub fn resolve_checkin_targets(
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。三个分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
 /// 各家的 claim 都由各自的实现对齐成 `{success, msg}` 形状。
-pub async fn checkin_for(
-    store: &AccountStore,
-    billing: &BillingService,
-    account: &Value,
-) -> Value {
-    let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account: &Value) -> Value {
+    let id = account
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
     let display = name.as_str().unwrap_or(&id).to_string();
     // 分派的键就是账号的 provider id（`provider_of` 已归一）；AutoClaw 两个
@@ -187,10 +205,9 @@ pub async fn checkin_for(
             claim_result(id, name, &display, true, claim)
         }
         "autoclaw" | "autoclaw-intl" => {
-            let region = crate::server::core::providers::autoclaw::Region::from_provider_id(
-                provider_id,
-            )
-            .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
+            let region =
+                crate::server::core::providers::autoclaw::Region::from_provider_id(provider_id)
+                    .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
             let claim = crate::server::core::providers::autoclaw::checkin::claim_daily_signin(
                 region, store, &id,
             )
@@ -202,14 +219,13 @@ pub async fn checkin_for(
             let claim = async {
                 let credentials =
                     crate::server::core::providers::trae::credentials_for(store, &id)?;
-                let credentials =
-                    crate::server::core::providers::trae::refresh_if_needed(
-                        store,
-                        &id,
-                        &credentials,
-                        false,
-                    )
-                    .await?;
+                let credentials = crate::server::core::providers::trae::refresh_if_needed(
+                    store,
+                    &id,
+                    &credentials,
+                    false,
+                )
+                .await?;
                 let proxy = crate::server::core::providers::trae::account_proxy(store, &id)?;
                 let generation = store.trae_checkin_generation(&id);
                 crate::server::core::providers::trae::models::checkin(
@@ -266,7 +282,10 @@ fn claim_result(
 ) -> Value {
     match result {
         Ok(claim) => {
-            let success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let success = claim
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let msg = claim.get("msg").and_then(Value::as_str).unwrap_or("");
             if success {
                 if log_success_msg && !msg.is_empty() {
@@ -275,7 +294,10 @@ fn claim_result(
                     logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
                 }
             } else {
-                logging::log("[Accounts]", &format!("账号 {display}: 签到未领取（{msg}）"));
+                logging::log(
+                    "[Accounts]",
+                    &format!("账号 {display}: 签到未领取（{msg}）"),
+                );
             }
             json!({ "id": id, "name": name, "claim": claim, "error": Value::Null })
         }

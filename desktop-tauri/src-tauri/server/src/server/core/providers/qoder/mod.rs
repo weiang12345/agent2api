@@ -48,8 +48,8 @@
 pub mod auth;
 mod balance;
 pub mod chat;
-pub mod credentials;
 pub mod cosy;
+pub mod credentials;
 pub mod endpoints;
 mod machine;
 pub mod models;
@@ -63,10 +63,10 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
-use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
+use crate::server::core::providers::content_block;
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
@@ -112,7 +112,10 @@ fn record_limited(
     kind: protocol::UpstreamKind,
     message: &str,
 ) {
-    if !matches!(kind, protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate) {
+    if !matches!(
+        kind,
+        protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate
+    ) {
         return;
     }
     if account_id.is_empty() {
@@ -201,7 +204,9 @@ impl ProviderAdapter for QoderAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             refresh::ensure_fresh(store, account_id, false)
                 .await
@@ -218,7 +223,9 @@ impl ProviderAdapter for QoderAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             refresh::ensure_fresh(store, account_id, true)
                 .await
@@ -245,7 +252,8 @@ impl ProviderAdapter for QoderAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
+    {
         Box::pin(balance::query(store, account_id))
     }
 
@@ -433,7 +441,11 @@ impl ProviderAdapter for QoderAdapter {
                 &format!(
                     "POST {} model={} upstream={} stream={} region={} account={}",
                     plan.url,
-                    if model_name.is_empty() { "(默认)" } else { &model_name },
+                    if model_name.is_empty() {
+                        "(默认)"
+                    } else {
+                        &model_name
+                    },
                     plan.upstream_key,
                     stream,
                     context.credentials.region.id(),
@@ -499,8 +511,10 @@ impl ProviderAdapter for QoderAdapter {
                 // 客户端断开时 tokio 的 channel 发送端会失败，循环随即退出，
                 // drop 掉 source 就等价于断开上游连接。
                 crate::spawn_task(async move {
-                    piping::drive_stream(source, translator, telemetry, limit_ctx, sender, prefetched)
-                        .await;
+                    piping::drive_stream(
+                        source, translator, telemetry, limit_ctx, sender, prefetched,
+                    )
+                    .await;
                 });
                 return Ok(crate::server::core::upstream::ForwardOutcome::Stream {
                     status: 200,
@@ -564,7 +578,14 @@ async fn drive_aggregate(
             match stream::parse_sse_line(&data) {
                 SseEvent::Skip => {}
                 SseEvent::Done => break 'outer,
-                SseEvent::Error { status, kind, raw, message, pricing_url, .. } => {
+                SseEvent::Error {
+                    status,
+                    kind,
+                    raw,
+                    message,
+                    pricing_url,
+                    ..
+                } => {
                     record_limited(
                         &limit.store,
                         &limit.account_id,

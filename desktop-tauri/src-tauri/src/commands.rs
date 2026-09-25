@@ -295,7 +295,12 @@ pub fn login_state(app: AppHandle) -> LoginState {
             edition: Some(active.edition),
             provider: Some(active.provider),
         },
-        None => LoginState { active: false, mode: None, edition: None, provider: None },
+        None => LoginState {
+            active: false,
+            mode: None,
+            edition: None,
+            provider: None,
+        },
     }
 }
 
@@ -346,7 +351,9 @@ pub fn get_app_settings(app: AppHandle) -> AppSettings {
         current.autostart = enabled;
     }
     // 顺手把缓存与磁盘对齐：拦截关窗时要用到最新值
-    app.state::<AppState>().window.set_close_to_tray(current.close_to_tray);
+    app.state::<AppState>()
+        .window
+        .set_close_to_tray(current.close_to_tray);
     current
 }
 
@@ -384,7 +391,9 @@ pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettin
 
     settings::save(&saved)?;
     // 立即生效：配置改完不用重启，下一次关窗就走新行为
-    app.state::<AppState>().window.set_close_to_tray(saved.close_to_tray);
+    app.state::<AppState>()
+        .window
+        .set_close_to_tray(saved.close_to_tray);
     Ok(saved)
 }
 
@@ -459,11 +468,10 @@ pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
     let path = target
         .into_path()
         .map_err(|error| format!("文件路径无效: {error}"))?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("读取文件失败: {error}"))?;
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("读取文件失败: {error}"))?;
 
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("文件不是有效 JSON: {error}"))?;
+    let parsed: Value =
+        serde_json::from_str(&text).map_err(|error| format!("文件不是有效 JSON: {error}"))?;
     let document = unwrap_envelope_file(parsed);
     let accounts = match &document {
         // 整体导出文件
@@ -634,7 +642,9 @@ pub fn set_window_theme(app: AppHandle, theme: Option<String>) -> Result<(), Str
     let window = app
         .get_webview_window(crate::MAIN_WINDOW_LABEL)
         .ok_or_else(|| "主窗口不存在".to_string())?;
-    window.set_theme(theme).map_err(|error| format!("设置窗口主题失败: {error}"))
+    window
+        .set_theme(theme)
+        .map_err(|error| format!("设置窗口主题失败: {error}"))
 }
 
 // ── 自定义标题栏的窗口三键 ─────────────────────────────────────
@@ -655,7 +665,9 @@ pub fn set_window_theme(app: AppHandle, theme: Option<String>) -> Result<(), Str
 #[tauri::command]
 pub fn window_minimize(app: AppHandle) -> Result<(), String> {
     let window = main_window(&app)?;
-    window.minimize().map_err(|error| format!("最小化窗口失败: {error}"))
+    window
+        .minimize()
+        .map_err(|error| format!("最小化窗口失败: {error}"))
 }
 
 /// 切换主窗口最大化 / 还原（标题栏「最大化」按钮）。
@@ -686,7 +698,9 @@ pub fn window_toggle_maximize(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn window_close(app: AppHandle) -> Result<(), String> {
     let window = main_window(&app)?;
-    window.close().map_err(|error| format!("关闭窗口失败: {error}"))
+    window
+        .close()
+        .map_err(|error| format!("关闭窗口失败: {error}"))
 }
 
 /// 查询主窗口是否处于最大化（标题栏据此切换最大化 / 还原图标）。
@@ -697,7 +711,9 @@ pub fn window_close(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn window_is_maximized(app: AppHandle) -> Result<bool, String> {
     let window = main_window(&app)?;
-    window.is_maximized().map_err(|error| format!("查询窗口状态失败: {error}"))
+    window
+        .is_maximized()
+        .map_err(|error| format!("查询窗口状态失败: {error}"))
 }
 
 /// 取主窗口句柄：四个窗口命令共用的一步查找（不存在时报可读错误）。
@@ -788,8 +804,14 @@ pub async fn startup_maintenance(app: AppHandle) {
         }
     };
 
-    let _ = app.emit("accounts:auto-maintained", json!({ "refreshed": refreshed }));
+    let _ = app.emit(
+        "accounts:auto-maintained",
+        json!({ "refreshed": refreshed }),
+    );
     if !refreshed.is_empty() {
-        eprintln!("[startup] 已自动刷新 {} 个临期账号的 Token", refreshed.len());
+        eprintln!(
+            "[startup] 已自动刷新 {} 个临期账号的 Token",
+            refreshed.len()
+        );
     }
 }

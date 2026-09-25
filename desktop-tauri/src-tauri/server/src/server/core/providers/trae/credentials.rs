@@ -23,7 +23,10 @@ pub struct Credentials {
 impl Credentials {
     pub fn from_payload(payload: &Value) -> Result<Self, GatewayError> {
         if !payload.is_object() {
-            return Err(GatewayError::with_status(400, "Trae 账号内容必须是 JSON 对象"));
+            return Err(GatewayError::with_status(
+                400,
+                "Trae 账号内容必须是 JSON 对象",
+            ));
         }
         let access_token = secret(payload, &["accessToken", "access_token", "access", "token"])?;
         if access_token.is_empty() {
@@ -38,8 +41,14 @@ impl Credentials {
             refresh_token,
             expires_at,
             user_id: text(payload, &["userId", "user_id", "uid"]),
-            nickname: text(payload, &["nickname", "name", "screenName"]).chars().take(100).collect(),
-            enterprise_id: text(payload, &["enterpriseId", "tenantId"]).chars().take(128).collect(),
+            nickname: text(payload, &["nickname", "name", "screenName"])
+                .chars()
+                .take(100)
+                .collect(),
+            enterprise_id: text(payload, &["enterpriseId", "tenantId"])
+                .chars()
+                .take(128)
+                .collect(),
             machine_id: text(payload, &["machineId", "machine_id"]),
             device_id: text(payload, &["deviceId", "device_id"]),
         };
@@ -49,7 +58,10 @@ impl Credentials {
 
     pub fn complete_identity(&mut self) -> Result<(), GatewayError> {
         if self.user_id.is_empty() {
-            return Err(GatewayError::with_status(400, "缺少 Trae 用户标识，无法保存账号"));
+            return Err(GatewayError::with_status(
+                400,
+                "缺少 Trae 用户标识，无法保存账号",
+            ));
         }
         if self.machine_id.is_empty() {
             self.machine_id = random_hex(16)?;
@@ -73,17 +85,26 @@ impl Credentials {
 
     pub fn expiring(&self) -> bool {
         self.can_refresh()
-            && self.expires_at.is_some_and(|expiry| expiry <= logging::now_ms() + REFRESH_MARGIN_MS)
+            && self
+                .expires_at
+                .is_some_and(|expiry| expiry <= logging::now_ms() + REFRESH_MARGIN_MS)
     }
 
     pub fn to_value(&self) -> Value {
         let mut object = Map::new();
         let text = |value: &str| -> Value {
-            if value.is_empty() { Value::Null } else { Value::String(value.to_string()) }
+            if value.is_empty() {
+                Value::Null
+            } else {
+                Value::String(value.to_string())
+            }
         };
         object.insert("accessToken".into(), text(&self.access_token));
         object.insert("refreshToken".into(), text(&self.refresh_token));
-        object.insert("expiresAt".into(), self.expires_at.map(Value::from).unwrap_or(Value::Null));
+        object.insert(
+            "expiresAt".into(),
+            self.expires_at.map(Value::from).unwrap_or(Value::Null),
+        );
         object.insert("userId".into(), text(&self.user_id));
         object.insert("nickname".into(), text(&self.nickname));
         object.insert("enterpriseId".into(), text(&self.enterprise_id));
@@ -134,18 +155,26 @@ pub fn secret(payload: &Value, keys: &[&str]) -> Result<String, GatewayError> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("");
-    if value.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("Bearer ")) {
+    if value
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
+    {
         value = value[7..].trim();
     }
     if value.len() > MAX_TOKEN_LENGTH || value.chars().any(char::is_control) {
-        return Err(GatewayError::with_status(400, "Trae 凭证过长或包含非法控制字符"));
+        return Err(GatewayError::with_status(
+            400,
+            "Trae 凭证过长或包含非法控制字符",
+        ));
     }
     Ok(value.to_string())
 }
 
 pub fn timestamp(value: Option<&Value>) -> Option<i64> {
     let value = value?;
-    let number = value.as_i64().or_else(|| value.as_str()?.trim().parse::<i64>().ok())?;
+    let number = value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())?;
     if number <= 0 {
         return None;
     }

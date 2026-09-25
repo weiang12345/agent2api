@@ -82,7 +82,11 @@ pub fn build_plan(
     let model_config = model.get("config").cloned().unwrap_or(Value::Null);
 
     // ── 消息规整 ──────────────────────────────────────────────
-    let raw_messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let raw_messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let messages = protocol::normalize_messages(&raw_messages);
     // system 提示必须放进 messages 里（上游顶层 system 字段无效），
     // 且要排在**最前面** —— 源实现在调用处显式做了这一步
@@ -192,9 +196,8 @@ pub async fn send(
         Some(proxy) => format!("经代理 {}", proxy.host),
         None => "直连".to_string(),
     };
-    let budget = std::time::Duration::from_millis(
-        crate::server::config::timeout_settings().headers_ms(),
-    );
+    let budget =
+        std::time::Duration::from_millis(crate::server::config::timeout_settings().headers_ms());
     match tokio::time::timeout(budget, builder.send()).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) if error.is_timeout() => {
@@ -210,7 +213,10 @@ pub async fn send(
         }
         Ok(Err(error)) => Err(GatewayError::with_status(
             502,
-            format!("Qoder 上游请求失败（{via}）: {}", egress::describe_error_detail(&error)),
+            format!(
+                "Qoder 上游请求失败（{via}）: {}",
+                egress::describe_error_detail(&error)
+            ),
         )),
         Err(_elapsed) => Err(GatewayError::with_status(
             502,
@@ -241,7 +247,10 @@ pub async fn http_error(status: u16, response: reqwest::Response) -> GatewayErro
             .as_deref()
             .map(|url| format!(" 套餐与额度：{url}"))
             .unwrap_or_default();
-        format!("上游请求失败：{}{pricing}（上游原文：{detail}）", classified.message)
+        format!(
+            "上游请求失败：{}{pricing}（上游原文：{detail}）",
+            classified.message
+        )
     };
     // 额度/限流用 429、鉴权用 401：编排层按这两档决定「换账号」与「刷新后重试」
     let mapped = match classified.kind {
@@ -406,15 +415,17 @@ impl Translator {
                         entry.name = name.to_string();
                     }
                 }
-                if let Some(arguments) =
-                    call.pointer("/function/arguments").and_then(Value::as_str)
+                if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
                 {
                     entry.arguments.push_str(arguments);
                 }
                 out.push(TranslatedDelta::ToolCall {
                     index,
                     id: call.get("id").and_then(Value::as_str).map(str::to_string),
-                    name: call.pointer("/function/name").and_then(Value::as_str).map(str::to_string),
+                    name: call
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     arguments: call
                         .pointer("/function/arguments")
                         .and_then(Value::as_str)
@@ -500,7 +511,9 @@ impl Translator {
         if !self.tool_state.is_empty() {
             return "tool_calls".to_string();
         }
-        self.finish_reason.clone().unwrap_or_else(|| "stop".to_string())
+        self.finish_reason
+            .clone()
+            .unwrap_or_else(|| "stop".to_string())
     }
 
     /// 流式 chunk 帧（OpenAI `chat.completion.chunk`）
@@ -510,7 +523,9 @@ impl Translator {
         choice.insert("delta".to_string(), delta);
         choice.insert(
             "finish_reason".to_string(),
-            finish.map(|text| Value::String(text.to_string())).unwrap_or(Value::Null),
+            finish
+                .map(|text| Value::String(text.to_string()))
+                .unwrap_or(Value::Null),
         );
         json!({
             "id": self.response_id,
@@ -591,7 +606,12 @@ pub fn delta_json(delta: &TranslatedDelta) -> Value {
     match delta {
         TranslatedDelta::Content(text) => json!({ "content": text }),
         TranslatedDelta::Reasoning(text) => json!({ "reasoning_content": text }),
-        TranslatedDelta::ToolCall { index, id, name, arguments } => {
+        TranslatedDelta::ToolCall {
+            index,
+            id,
+            name,
+            arguments,
+        } => {
             let mut function = Map::new();
             if let Some(name) = name {
                 function.insert("name".to_string(), Value::String(name.clone()));
@@ -632,7 +652,9 @@ pub fn business_error(
     let message = if message.is_empty() {
         format!("上游返回 {status}: {detail}")
     } else {
-        let pricing = pricing_url.map(|url| format!(" 套餐与额度：{url}")).unwrap_or_default();
+        let pricing = pricing_url
+            .map(|url| format!(" 套餐与额度：{url}"))
+            .unwrap_or_default();
         format!("上游请求失败：{message}{pricing}（上游原文：{detail}）")
     };
     let mapped = match kind {

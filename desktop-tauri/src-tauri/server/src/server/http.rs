@@ -105,10 +105,7 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/session/login/trae-callback",
             get(api::session::login_trae_callback),
         )
-        .route(
-            "/authorize",
-            get(api::session::login_trae_callback),
-        )
+        .route("/authorize", get(api::session::login_trae_callback))
         // AutoClaw OAuth（国际版）的 loopback 回调：**浏览器 302 到这里**
         // （授权页完成后顶层导航到我们交给上游的 navigate_uri，见
         // `providers::autoclaw::oauth`），所以同样必须免鉴权 —— 调用方是用户的
@@ -123,6 +120,15 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/auth/callback-{vendor}",
             get(api::session::login_autoclaw_oauth_callback),
+        )
+        // Accio 网页登录的 loopback 回调：**浏览器 302 到这里**（授权页完成后
+        // 顶层导航到我们交给它的 return_url，查询串带 code / state）。
+        // 与上面 AutoClaw 那条同一形态、同一理由免鉴权；路径是我们自己定的
+        // （Accio 的 return_url 由发起方给，不必与官方客户端逐字同款），
+        // 见处理函数的说明。
+        .route(
+            "/auth/callback-accio",
+            get(api::session::login_accio_callback),
         );
 
     // 需鉴权：Node 版对这些路径都调用了 checkApiKey
@@ -273,12 +279,18 @@ pub fn panel_router(state: ServerState) -> Router {
         // ── 会话与登录 ──
         .route("/api/session/login/start", post(api::session::login_start))
         .route("/api/session/login/wait", get(api::session::login_wait))
-        .route("/api/session/login/cancel", post(api::session::login_cancel))
+        .route(
+            "/api/session/login/cancel",
+            post(api::session::login_cancel),
+        )
         // 网页登录的回调入口：壳侧登录窗口把 `office-raccoon://auth/callback?…`
         // 原样 POST 到这里（Tauri 不能像 Electron 那样在会话里注册协议处理器，
         // 见 api::session::login_callback 的说明）。与其他 login/* 一样在
         // protected 组 —— 它写账号库，必须过 API Key。
-        .route("/api/session/login/callback", post(api::session::login_callback))
+        .route(
+            "/api/session/login/callback",
+            post(api::session::login_callback),
+        )
         // AutoClaw 的手机号验证码登录（**不是**网页登录，见 api::session 模块头）：
         // 上游没有授权码 / 回调这条路，登录就是「发码 → 用码换 token」两次请求，
         // 因此不需要登录窗口与轮询。两条都挂 protected —— 它们都写账号库，
@@ -322,10 +334,16 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/models/manage", get(api::model_manage::get_manage))
         .route("/api/models/state", post(api::model_manage::set_state))
         .route("/api/models/mappings", post(api::model_manage::add_mapping))
-        .route("/api/models/mappings/remove", post(api::model_manage::remove_mapping))
+        .route(
+            "/api/models/mappings/remove",
+            post(api::model_manage::remove_mapping),
+        )
         // 自定义模型（手动登记上游目录里没有的模型）
         .route("/api/models/custom", post(api::model_manage::add_custom))
-        .route("/api/models/custom/remove", post(api::model_manage::remove_custom))
+        .route(
+            "/api/models/custom/remove",
+            post(api::model_manage::remove_custom),
+        )
         // ── 自定义提供商（用户自建上游端点：存储 + 管理）──
         // 与 /api/models/manage 同级敏感：写配置（customProviders 键）且「新建」
         // 会顺带写账号库，挂 protected。账号侧不经这里 —— 客户端走
@@ -344,6 +362,13 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/custom-providers/remove",
             post(api::custom_providers::remove_custom_provider),
         )
+        // ── 「从其他工具导入」（「导入」分段的数据源）──
+        // 扫描本机 cc-switch 数据库，响应携带 API Key 明文（导入动作需要），
+        // 与上面的管理接口同级敏感，挂 protected。
+        .route(
+            "/api/import/cc-switch",
+            get(api::import_sources::scan_cc_switch),
+        )
         // 模型清单的两条（第二阶段）：整表保存 / 服务端代理拉取上游清单。
         // 挂 protected 的理由与上面的管理四条相同；fetch-models 还会真打上游
         // （一次 GET {baseUrl}/models），与 /api/models/refresh 同级敏感。
@@ -355,8 +380,14 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/custom-providers/fetch-models",
             post(api::custom_providers::fetch_custom_models),
         )
-        .route("/api/keys", get(api::keys_api::list_keys).post(api::keys_api::create_key))
-        .route("/api/keys/{id}", patch(api::keys_api::update_key).delete(api::keys_api::delete_key))
+        .route(
+            "/api/keys",
+            get(api::keys_api::list_keys).post(api::keys_api::create_key),
+        )
+        .route(
+            "/api/keys/{id}",
+            patch(api::keys_api::update_key).delete(api::keys_api::delete_key),
+        )
         // ── 出站指纹脱敏开关 ──
         // 与 /api/debug 同形的单开关端点（GET 读 / PUT 写），挂 protected：
         // 它决定出站请求体要不要剥离审核指纹，敏感度与调试模式同级。
@@ -522,7 +553,11 @@ async fn cors(request: Request, next: Next) -> Response {
     // ——只有开了 AGENT2API_VERBOSE=1（旧名 WORKBUDDY_VERBOSE 仍可读）才入库，
     // 普通启动只是控制台多一行
     if logging::is_verbose() && !path.starts_with("/v1/") {
-        let query = request.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+        let query = request
+            .uri()
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
         logging::verbose("[HTTP]", &format!("← {method} {path}{query}"));
     }
 
@@ -613,7 +648,9 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
     //   · `/api/panel/` 前缀：注册 / 状态 / 登录本身就在这个前缀里。
     if !panel_auth && crate::server::access::panel_gate() && path.starts_with("/api/") {
         if !path.starts_with("/api/panel/")
-            && !(keys.iter().any(|expected| request_matches_key(&request, expected)))
+            && !(keys
+                .iter()
+                .any(|expected| request_matches_key(&request, expected)))
         {
             return errors::panel_login_required_response();
         }
@@ -644,7 +681,10 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
     }
 
     let method = request.method().as_str().to_string();
-    logging::log("[Security]", &format!("❌ 拒绝未授权的请求: {method} {path}"));
+    logging::log(
+        "[Security]",
+        &format!("❌ 拒绝未授权的请求: {method} {path}"),
+    );
     errors::unauthorized_response()
 }
 
@@ -667,7 +707,9 @@ pub fn key_scope_from_headers(
     if keys.is_empty() {
         return None;
     }
-    let matched = keys.iter().find(|expected| headers_match_key(headers, expected))?;
+    let matched = keys
+        .iter()
+        .find(|expected| headers_match_key(headers, expected))?;
     scope_for_key(&snapshot.raw(), matched)
 }
 
@@ -684,7 +726,10 @@ fn scope_for_key(
 /// （`GET /v1/models` 的 handler）。实现与 `request_matches_key` 逐字一致 ——
 /// 后者委托给它，保证两处不可能漂移。
 fn headers_match_key(headers: &axum::http::HeaderMap, expected: &str) -> bool {
-    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         if strip_bearer_prefix(value) == expected {
             return true;
         }
