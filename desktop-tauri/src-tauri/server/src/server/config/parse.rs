@@ -329,4 +329,31 @@ pub(super) fn timeouts_from(map: &Map<String, Value>) -> TimeoutSettings {
     }
 }
 
+// ─── 排队等待的解析（两项，次数与秒数）──────────────────────────
+
+/// 由原始 JSON 解析排队等待的两项（缺字段各自用默认值；越界回落默认）。
+///
+/// 与 `timeouts_from` 同一口径：范围校验在写侧（`queue_api`）是 400 报错，
+/// 在这里是回落默认 —— 手改库写进一个越界值时，宁可回到 2 次 / 跟随建议，
+/// 也不要让转发层拿到一个必然坏事的值（例如负数次数会让重试变成死循环）。
+pub(super) fn queue_from(map: &Map<String, Value>) -> QueueSettings {
+    let defaults = QueueSettings::default();
+    QueueSettings {
+        max_waits: bounded_int_field(
+            map,
+            KEY_QUEUE_MAX_WAITS,
+            defaults.max_waits,
+            QUEUE_MIN_MAX_WAITS,
+            QUEUE_MAX_MAX_WAITS,
+        ),
+        wait_seconds: bounded_int_field(
+            map,
+            KEY_QUEUE_WAIT_SECONDS,
+            defaults.wait_seconds,
+            QUEUE_MIN_WAIT_SECONDS,
+            QUEUE_MAX_WAIT_SECONDS,
+        ),
+    }
+}
+
 // ─── 历史路由优先级（providerRoute，只读，供账号迁移）───────────

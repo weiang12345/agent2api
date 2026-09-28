@@ -39,6 +39,7 @@ use crate::server::core::providers::adapter::ModelRefreshOutcome;
 use crate::server::core::providers::catalog_cache;
 use crate::server::logging;
 
+use super::context;
 use super::cosy::{self, CosyIdentity};
 use super::credentials::Credentials;
 use super::endpoints::Region;
@@ -779,6 +780,19 @@ fn parse_catalog(payload: &Value) -> Vec<Value> {
                     }
                 }
             }
+            // 上下文档位（请求时按 prompt 估算升级，见 `context.rs`）：含上游**当前**
+            // 选中的那档（`max_input_tokens`）—— 升档判据要与它比，不能与最大档比。
+            if let Some(config) = object.get_mut("config").and_then(Value::as_object_mut) {
+                let tiers = context::tiers_from_catalog(item);
+                if !tiers.is_empty() {
+                    config.insert("tiers".to_string(), Value::Array(tiers));
+                }
+                if let Some(current) = item.get("max_input_tokens").and_then(Value::as_i64) {
+                    if current > 0 {
+                        config.insert("max_input_tokens".to_string(), Value::from(current));
+                    }
+                }
+            }
         }
         models.push(model);
     }
@@ -787,14 +801,7 @@ fn parse_catalog(payload: &Value) -> Vec<Value> {
 
 /// 上下文窗口：取 `context_config` 里各档位的最大 `token_count`（源实现同款）
 fn context_window_of(item: &Value) -> i64 {
-    let Some(config) = item.get("context_config").and_then(Value::as_object) else {
-        return DEFAULT_CONTEXT_WINDOW;
-    };
-    let max = config
-        .values()
-        .filter_map(|entry| entry.get("token_count").and_then(Value::as_i64))
-        .max()
-        .unwrap_or(0);
+    let max = context::max_tokens(&context::tiers_from_catalog(item));
     if max > 0 {
         max
     } else {

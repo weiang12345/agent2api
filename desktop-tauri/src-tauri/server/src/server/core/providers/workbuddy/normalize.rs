@@ -1,5 +1,5 @@
 //! WorkBuddy 出站请求体归一化管线（对照 Sliverkiss/workbuddy2api 的
-//! `internal/upstream/payload.go` + `tool_pairing.go` + `cache_key.go` 移植）。
+//! `internal/upstream/payload.go` + `cache_key.go` 移植）。
 //!
 //! ── 为什么需要这一层 ────────────────────────────────────────
 //! 上游是「腾讯自己的 Go struct」，对请求体的宽容度远小于 OpenAI 规范：
@@ -15,6 +15,12 @@
 //! `upstream::payload::send_body` 的时机契约一致），且天然对同一家同池的
 //! 重试复用（`provider_loop` 的 `send_cache`）。
 //!
+//! ── 参考项目的 `tool_pairing.go` 去哪了 ─────────────────────
+//! 那份「tool 结果重排 + 孤儿裁剪」原先是本文件的一部分（本家是唯一实现）。
+//! 但同类坏历史会流到**任意一家**上游（自定义家同样会因为空工具名、错序的
+//! tool 结果被严格上游 400），所以它已提升为所有家共用的转发入口 sanitize：
+//! `protocol::history`。本文件不再重复实现，只留本家形态相关的那几步。
+//!
 //! ── 与 system 兜底注入的顺序（不可调换）────────────────────────
 //! `normalize_roles` 必须**先**把 `developer` 归一成 `system`，随后适配器才调
 //! `ensure_leading_system_message` —— 客户端若用 `developer` 打头，先归一成
@@ -23,10 +29,10 @@
 //! （`ensureConsoleSystem` 在 `prepareBody` 之后套用）。
 //!
 //! ── 只管「让请求通过」，不管内容 ────────────────────────────
-//! 本文件的每一步都是**形态转换或剔除无法配对的条目**，不涉及语义改写：
-//! 改 role 名（同义）、把对象拆成字符串（上游的等价表达）、把字符串包成对象
-//! （规范形态）、把别名译成上游认的键（同名语义）。内容层面的处理在
-//! `core::sanitize`（剥离审核指纹），两者互不替代。
+//! 本文件的每一步都是**形态转换**，不涉及语义改写：改 role 名（同义）、把对象
+//! 拆成字符串（上游的等价表达）、把字符串包成对象（规范形态）、把别名译成上游
+//! 认的键（同名语义）。内容层面的处理在 `core::sanitize`（剥离审核指纹）、
+//! 历史结构层面的在 `core::protocol::history`，三者互不替代。
 
 use serde_json::{json, Map, Value};
 
@@ -34,10 +40,12 @@ use serde_json::{json, Map, Value};
 ///
 /// ── 为什么要有这份报告 ──────────────────────────────────────
 /// 几个步骤是**静默修复**：修好了用户不会知道（请求从此不 400 了），但一旦
-/// 出问题（工具上下文「少了一轮」、max_tokens 没生效）就需要能回答「网关对
-/// 我的请求动了什么」。字段只统计**值得解释的修复**，不统计常规注入
+/// 出问题（role 没归一、max_tokens 没生效）就需要能回答「网关对我的请求动了
+/// 什么」。字段只统计**值得解释的修复**，不统计常规注入
 /// （`prompt_cache_key` 几乎每次都会加，写进日志只是噪声）——唯一例外是
 /// 它取不到账号 UID 的情形，那会让跨账号隔离失效，必须可见。
+/// （历史结构类的修复——工具名补空、配对重排、孤儿剔除——报告在
+/// `protocol::history`，那一层对所有家生效。）
 #[derive(Clone, Debug, Default)]
 pub struct NormalizeReport {
     /// 归一成 system 的 developer 角色消息数
@@ -48,10 +56,6 @@ pub struct NormalizeReport {
     pub image_urls_wrapped: usize,
     /// 是否把 max_completion_tokens 译成了 max_tokens
     pub max_tokens_translated: bool,
-    /// 剔除的孤儿 tool_call / tool 结果条目数
-    pub orphans_removed: usize,
-    /// 是否把插在 tool 结果中间的消息移到组后（配对断裂重排）
-    pub tool_results_repacked: bool,
     /// 缓存键是否**缺少账号隔离段**（取不到账号 UID）——
     /// 这一条会让跨账号前缀缓存隔离失效，需要显式警告（见 `inject_prompt_cache_key`）
     pub cache_key_unscoped: bool,
@@ -64,8 +68,6 @@ impl NormalizeReport {
             || self.tool_choice_rewritten
             || self.image_urls_wrapped > 0
             || self.max_tokens_translated
-            || self.orphans_removed > 0
-            || self.tool_results_repacked
             || self.cache_key_unscoped
     }
 
@@ -86,15 +88,6 @@ impl NormalizeReport {
         }
         if self.max_tokens_translated {
             parts.push("max_completion_tokens→max_tokens".to_string());
-        }
-        if self.tool_results_repacked {
-            parts.push("tool 结果重排（配对断裂修复）".to_string());
-        }
-        if self.orphans_removed > 0 {
-            parts.push(format!(
-                "剔除无法配对的 tool 条目 {} 个",
-                self.orphans_removed
-            ));
         }
         if self.cache_key_unscoped {
             parts.push("警告：缓存键缺少账号隔离段（未取到账号 UID）".to_string());
@@ -121,7 +114,9 @@ pub fn normalize_outbound(body: &Value, account: &Value) -> (Value, NormalizeRep
     normalize_image_url(&mut next, &mut report);
     translate_max_completion_tokens(&mut next, &mut report);
     ensure_stream_options(&mut next);
-    repair_tool_pairing(&mut next, &mut report);
+    // tool 配对（重排 + 孤儿裁剪）**不在这里**：它已提升为所有上游共用的
+    // 转发入口 sanitize（`protocol::history`），跑在本管线之前；两处都做
+    // 同一件事只会漂移（本家曾经是唯一实现，见模块头）。
     inject_prompt_cache_key(&mut next, account, &mut report);
     (Value::Object(next), report)
 }
@@ -289,12 +284,15 @@ fn translate_max_completion_tokens(object: &mut Map<String, Value>, report: &mut
         return; // 显式 max_tokens 优先：别名只删不译
     }
     // 整数（含 JSON 里恰好是整数的浮点）才译；1.5 这类上游 struct 也收不了
-    let translated = alias.as_i64().filter(|number| *number > 0).or_else(|| {
-        alias
-            .as_f64()
-            .filter(|number| *number > 0.0 && number.fract() == 0.0)
-            .map(|number| number as i64)
-    });
+    let translated = alias
+        .as_i64()
+        .filter(|number| *number > 0)
+        .or_else(|| {
+            alias
+                .as_f64()
+                .filter(|number| *number > 0.0 && number.fract() == 0.0)
+                .map(|number| number as i64)
+        });
     if let Some(number) = translated {
         object.insert("max_tokens".to_string(), Value::from(number));
         report.max_tokens_translated = true;
@@ -319,195 +317,6 @@ fn ensure_stream_options(object: &mut Map<String, Value>) {
         "stream_options".to_string(),
         json!({ "include_usage": true }),
     );
-}
-
-/// tool 配对修复：先「重排」再「清理」（对照参考项目 `tool_pairing.go` 两个函数）。
-///
-/// ── 为什么这是「让请求通过」的安全网 ─────────────────────────
-/// OpenAI 兼容协议要求带 `tool_calls` 的 assistant 消息，其每个 `tool_call.id`
-/// 都必须有对应的 `role:"tool"` 结果消息，反之亦然。缺任一侧，上游都以 HTTP 400
-/// 拒绝**整个请求**。工具执行失败时（参数非法、超时、工具不存在）客户端会把
-/// `tool_calls` 持久化进会话历史，却写不回结果消息 —— 这条坏历史此后被每次请求
-/// 原样重放，上游对**之后每一条用户消息**都返回 400，整条会话报废。
-/// 网关是最后一道防线：宁可丢一轮工具上下文，也好过整条会话死亡。
-fn repair_tool_pairing(object: &mut Map<String, Value>, report: &mut NormalizeReport) {
-    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
-    };
-    repack_tool_results(messages, report);
-    cleanup_orphan_tools(messages, report);
-}
-
-/// 把插在 `assistant.tool_calls` 与其 tool 结果之间的非 tool 消息挪到整组之后。
-///
-/// 背景：Codex 的 `image_resize_notice` 等特性会把一条 developer/system 消息插在
-/// tool 输出中间，并行调用时它落在两份 tool 结果**之间**：
-///
-/// ```text
-/// assistant tool_calls=[c00 c01] → tool c00 → developer <notice> → tool c01
-/// 改写为：assistant tool_calls=[c00 c01] → tool c00 → tool c01 → developer <notice>
-/// ```
-///
-/// 只调顺序、不改内容。同批 tool 结果的原相对顺序保持不变（不引入新的顺序敏感
-/// 问题）；无插入消息时不做任何改动（不重排、不分配新 vec）。
-fn repack_tool_results(messages: &mut Vec<Value>, report: &mut NormalizeReport) {
-    if messages.len() < 3 {
-        return;
-    }
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
-    let mut changed = false;
-    let mut index = 0usize;
-    while index < messages.len() {
-        let calls = assistant_call_ids(&messages[index]);
-        if calls.is_empty() {
-            out.push(messages[index].clone());
-            index += 1;
-            continue;
-        }
-        out.push(messages[index].clone());
-        index += 1;
-        let mut results: Vec<Value> = Vec::new();
-        let mut between: Vec<Value> = Vec::new();
-        let mut saw_non_tool = false;
-        while index < messages.len() {
-            let Some(fields) = messages[index].as_object() else {
-                break;
-            };
-            let role = fields.get("role").and_then(Value::as_str).unwrap_or("");
-            if role == "tool" {
-                let id = fields
-                    .get("tool_call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !calls.iter().any(|call| call == id) {
-                    break; // 不属于本批：交还外层
-                }
-                results.push(messages[index].clone());
-                if saw_non_tool {
-                    changed = true; // 前面插过东西 = 确实需要重排
-                }
-                index += 1;
-                continue;
-            }
-            if results.is_empty() {
-                break; // assistant 后没有结果：交给 cleanup 处理
-            }
-            // 下一组 assistant.tool_calls 是新组头，绝不能当插入物吞掉：
-            // 一旦收进 between，它自己那批结果就永远得不到重排。
-            if role == "assistant" && !assistant_call_ids(&messages[index]).is_empty() {
-                break;
-            }
-            between.push(messages[index].clone());
-            saw_non_tool = true;
-            index += 1;
-        }
-        out.extend(results);
-        out.extend(between);
-    }
-    if changed {
-        *messages = out;
-        report.tool_results_repacked = true;
-    }
-}
-
-/// 剔除无法配对的 `tool_call` 与 tool 结果（双侧按同一份 keep 集对称裁剪）。
-///
-///   - 收集全线 `role:"tool"` 的 `tool_call_id`（结果集）与
-///     `assistant.tool_calls[].id`（调用集）；
-///   - `assistant.tool_calls` 按 keep 集裁剪：只留有结果配对的调用，裁空则删掉
-///     整个 `tool_calls` 键；
-///   - `role:"tool"` 只在对应调用被保留时才保留，孤儿结果整条删除。
-///
-/// **两侧必须共用同一份 keep 集**：若只裁调用侧（保留整个 tool_calls 键或整批删除），
-/// 会留下「无 tool_calls 的 assistant + 孤儿 tool」这种半截配对，上游判 11148
-/// （tool calls and tool results do not match）并顶死会话。
-fn cleanup_orphan_tools(messages: &mut Vec<Value>, report: &mut NormalizeReport) {
-    if messages.is_empty() {
-        return;
-    }
-    let mut call_ids: Vec<String> = Vec::new();
-    let mut result_ids: Vec<String> = Vec::new();
-    for message in messages.iter() {
-        let Some(fields) = message.as_object() else {
-            continue;
-        };
-        match fields.get("role").and_then(Value::as_str).unwrap_or("") {
-            "tool" => {
-                if let Some(id) = non_empty_str(fields.get("tool_call_id")) {
-                    result_ids.push(id);
-                }
-            }
-            "assistant" => {
-                if let Some(calls) = fields.get("tool_calls").and_then(Value::as_array) {
-                    for call in calls {
-                        if let Some(id) = call
-                            .as_object()
-                            .and_then(|call| non_empty_str(call.get("id")))
-                        {
-                            call_ids.push(id);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if call_ids.is_empty() && result_ids.is_empty() {
-        return; // 无工具流量：零改动
-    }
-    // keep 集 = 调用与结果双侧齐全的 id
-    let keep: Vec<&String> = call_ids
-        .iter()
-        .filter(|id| result_ids.iter().any(|result| result == *id))
-        .collect();
-    // 1) 调用侧裁剪
-    for message in messages.iter_mut() {
-        let Some(fields) = message.as_object_mut() else {
-            continue;
-        };
-        if fields.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let Some(calls) = fields.get("tool_calls").and_then(Value::as_array) else {
-            continue;
-        };
-        if calls.is_empty() {
-            continue;
-        }
-        let kept: Vec<Value> = calls
-            .iter()
-            .filter(|call| {
-                call.as_object()
-                    .and_then(|call| non_empty_str(call.get("id")))
-                    .map(|id| keep.iter().any(|kept| **kept == id))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        if kept.len() == calls.len() {
-            continue; // 整批齐全：零改动
-        }
-        report.orphans_removed += calls.len() - kept.len();
-        if kept.is_empty() {
-            fields.remove("tool_calls");
-        } else {
-            fields.insert("tool_calls".to_string(), Value::Array(kept));
-        }
-    }
-    // 2) 结果侧裁剪：孤儿 tool 消息整条删除
-    let before = messages.len();
-    messages.retain(|message| {
-        let Some(fields) = message.as_object() else {
-            return true;
-        };
-        if fields.get("role").and_then(Value::as_str) != Some("tool") {
-            return true;
-        }
-        non_empty_str(fields.get("tool_call_id"))
-            .map(|id| keep.iter().any(|kept| **kept == id))
-            .unwrap_or(false)
-    });
-    report.orphans_removed += before - messages.len();
 }
 
 /// 注入上游前缀缓存键 `prompt_cache_key`（费用优化）。
@@ -617,33 +426,11 @@ fn account_uid(account: &Value) -> String {
         .to_string()
 }
 
-/// 取一个非空字符串字段（`tool_calls[].id` / `tool_call_id` 的判据）。
+/// 取一个非空字符串字段（会话标识等取值用的判据）。
 fn non_empty_str(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
-}
-
-/// 取 assistant 消息里 `tool_calls[].id` 的集合（非 assistant 或无 tool_calls 则空 vec）。
-fn assistant_call_ids(message: &Value) -> Vec<String> {
-    message
-        .as_object()
-        .and_then(|fields| {
-            if fields.get("role").and_then(Value::as_str) != Some("assistant") {
-                return None;
-            }
-            fields.get("tool_calls").and_then(Value::as_array)
-        })
-        .map(|calls| {
-            calls
-                .iter()
-                .filter_map(|call| {
-                    call.as_object()
-                        .and_then(|call| non_empty_str(call.get("id")))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }

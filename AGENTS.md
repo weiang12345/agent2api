@@ -41,8 +41,16 @@
 
 ```powershell
 npm --prefix desktop-tauri ci
+npm --prefix desktop-tauri/ui-kit ci
+npm --prefix desktop-tauri/ui-islands ci
+npm --prefix desktop-tauri/ui-islands run build
 npm run tauri:build
 ```
+
+上游 2.7.10 已把桌面端账号页迁入 React 岛，并新增 `desktop-tauri/ui-kit`。
+`desktop-tauri/ui/islands/ui.js` 是随仓库提交的构建产物；修改
+`desktop-tauri/ui-islands/` 或 `desktop-tauri/ui-kit/` 后，必须先重新执行上面的
+React 岛构建，再执行 Tauri 构建。
 
 Rust 侧验证命令：
 
@@ -136,14 +144,14 @@ $response.assets[0].size
 
 ## 8. 当前部署基线
 
-- 当前 Release：`v2.7.7-fork.1`
-- 当前发布基线提交：`498dbac`
+- 当前上游基线：`v2.7.10`
+- 当前 Release：`v2.7.10-fork.1`
 - 当前更新仓库：`weiang12345/agent2api`
-- 当前构建产物：`Agent2API_2.7.7_x64-setup.exe`
+- 当前构建产物：`Agent2API_2.7.10_x64-setup.exe`
 - 当前 SHA256：
 
 ```text
-B9B70B270F108CF6B068CB1E7AB763BAA683F8878517F4C3BC85892C95A955A3
+8B1C92D086781F4A7B65431076CA5C5498D81B24D44D6F8B54C348D6B5198A2E
 ```
 
 ## 9. AtomCode 云直连与上游合并
@@ -152,7 +160,7 @@ B9B70B270F108CF6B068CB1E7AB763BAA683F8878517F4C3BC85892C95A955A3
 - 同步上游时必须保留：
   - `desktop-tauri/src-tauri/server/src/server/core/providers/atomcode/`
   - `desktop-tauri/src-tauri/server/src/server/core/account_store/atomcode_accounts.rs`
-  - `desktop-tauri/ui/add-atomcode.js`
+  - `desktop-tauri/ui-islands/src/islands/add-account-configs.ts`
   - `ProviderKind::AtmCode`
   - `adapter_for(ProviderKind::AtmCode)`
 - 上游若重构 provider 契约，优先把 AtomCode 模块迁移到新契约，不要直接删除。
@@ -170,7 +178,8 @@ B9B70B270F108CF6B068CB1E7AB763BAA683F8878517F4C3BC85892C95A955A3
 - 同步上游时必须保留：
   - `desktop-tauri/src-tauri/server/src/server/core/providers/trae/`
   - `desktop-tauri/src-tauri/server/src/server/core/account_store/trae_accounts.rs`
-  - `desktop-tauri/ui/add-trae.js`
+  - `desktop-tauri/ui-islands/src/islands/add-account-configs.ts`
+  - `desktop-tauri/ui-islands/src/islands/accounts-data.ts`
   - `ProviderKind::Trae`
   - `adapter_for(ProviderKind::Trae)`
 - 上游若重构 provider 契约，优先把 Trae 模块迁移到新契约，不要直接删除。

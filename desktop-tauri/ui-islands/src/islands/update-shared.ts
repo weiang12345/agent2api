@@ -1,0 +1,336 @@
+/**
+ * 「软件更新」面板（update-panel.tsx）与「更新设置」弹窗（update-settings.tsx）
+ * 共用的**类型与桥读取**（非岛：`.ts` 不被 import.meta.glob 当岛加载）。
+ *
+ * 拆这个文件的原因：面板与两个弹窗（update-settings / update-modal）是几棵
+ * React 树（弹窗经 Portal 挂到 body），但读同一批 window 桥。若各 declare 一份
+ * `SharedWindow` / `UpdateBridge`，接口合并会因同名属性类型不一致直接报 TS2717
+ * （账号页拆 accounts-shared.ts 是同一个理由）。这里**只此一份**：类型、桥读取、
+ * 播报与外链工具都在这。
+ *
+ * 出网代理的三件套（拉取 / 保存 / 选项构建）也放这：面板头部已不放代理下拉
+ * （改成了「更新设置」按钮），这三件事只有弹窗用，但它们不依赖任何 React 状态，
+ * 收在这里可以让 update-settings.tsx 只剩「弹窗的排版与流程」。
+ */
+
+import type * as React from 'react'
+
+/* ─── 类型 ─────────────────────────────────── */
+
+/** 更新检查结果（checkUpdate 的壳命令返回 / getUpdateStatus 的缓存）。字段按可选收：
+ *  后端在「仓库暂无发布版本」「版本号无法解析」等情形下会给 null */
+export type UpdateInfo = {
+  currentVersion?: string | null
+  latestVersion?: string | null
+  /** true / false / null（版本号无法比较时后端给 null，界面显示「无法比较」） */
+  hasUpdate?: boolean | null
+  /** 最新一版的发布说明（Markdown 原文，渲染交给 wbMarkdown） */
+  notes?: string | null
+  /** UTC 的 ISO 串 */
+  publishedAt?: string | null
+  /** GitHub 发布页（外链，交给 openReleasePage 打开） */
+  pageUrl?: string | null
+  prerelease?: boolean
+  /** 可下载资产；没有资产时「下载并安装」不给 */
+  asset?: { url?: string; name?: string } | null
+  /** owner/repo：作者主页与仓库地址由它现拼，代码里不写死账号 */
+  repository?: string
+  /** 'nsis'（Windows，要 UAC 提权）/ 'dmg'（macOS，挂载后手动拖） */
+  installerKind?: string
+  /** 检查时刻（后端给的；前端不用本地时钟冒充） */
+  checkedAt?: number
+  /** 仅 getUpdateStatus 有：后端定时任务还没查过时为 false */
+  checked?: boolean
+}
+
+/** 下载任务快照（downloadUpdate / updateProgress 的返回） */
+export type DownloadTask = {
+  active?: boolean
+  done?: boolean
+  canceled?: boolean
+  error?: string | null
+  filename?: string
+  path?: string | null
+  received?: number
+  total?: number
+  percent?: number
+}
+
+/** Clash 出口快照（`/api/proxies` 的 clash 段，与账号页代理列同源同一形状） */
+export type ClashSnapshot = {
+  available?: boolean
+  error?: string
+  options?: Array<{ uid?: string; name?: string; port?: number }>
+}
+
+/**
+ * 已存的「更新出网线路」（`/api/update/proxy` 的 proxy 字段）。
+ * 与账号代理是**同一个描述形态**（label / config / error），null = 直连 ——
+ * 下拉值取 `config.listenerUid`、失效标注读 `error`，口径照账号页的 ProxyCell。
+ */
+export type UpdateProxyChoice = {
+  source?: string
+  label?: string
+  error?: string
+  config?: { source?: string; listenerUid?: string } | null
+} | null
+
+/** GitHub 令牌状态（`/api/update/token` 的返回）：**没有本体**，只有有没有、来自哪 */
+export type UpdateTokenStatus = {
+  filled?: boolean
+  /** 'stored'（界面保存）/ 'env'（环境变量）· null（没配） */
+  origin?: string | null
+  /** 已存令牌解不开时的原因（界面据此提示重新保存一次） */
+  error?: string | null
+  /** 仅 POST 有：是否落盘成功（false = 本次运行已生效，重启会丢） */
+  saved?: boolean
+}
+
+/** 「软件更新」这一族用到的壳侧接口（见 bridge.rs 的「软件更新」一节） */
+export type UpdateBridge = {
+  /** 壳命令：当前版本号只有壳知道，由壳带上去交给后端比较 */
+  checkUpdate(): Promise<UpdateInfo | null | undefined>
+  /** 后端缓存里的最近一次检查结果（定时任务写入） */
+  getUpdateStatus(): Promise<UpdateInfo | null | undefined>
+  /** 更新出网线路的当前设置（proxy 为 null = 直连） */
+  getUpdateProxy(): Promise<{ proxy?: UpdateProxyChoice } | null | undefined>
+  /** 换更新出网线路：proxy 传 null = 直连、{source:'clash', listenerUid} = 指定出口 */
+  setUpdateProxy(payload: { proxy: unknown }): Promise<{
+    proxy?: UpdateProxyChoice
+    saved?: boolean
+  } | null | undefined>
+  /** GitHub 令牌状态（filled / origin，永不回显本体） */
+  getUpdateToken(): Promise<UpdateTokenStatus | null | undefined>
+  /** 保存 / 清除 GitHub 令牌（token 传 null = 清除） */
+  setUpdateToken(payload: { token: string | null }): Promise<UpdateTokenStatus | null | undefined>
+  /** Clash 出口列表（账号页代理列同款；出网代理下拉的选项来自它） */
+  getProxies(): Promise<{ clash?: ClashSnapshot } | null | undefined>
+  downloadUpdate(payload: { url: string; name?: string }): Promise<DownloadTask | null | undefined>
+  updateProgress(): Promise<DownloadTask | null | undefined>
+  cancelUpdate(): Promise<{ canceled?: boolean } | null | undefined>
+  runInstaller(
+    path: string,
+    restart: boolean,
+  ): Promise<{ launched?: boolean; path?: string; restart?: boolean } | null | undefined>
+  /** 打开外链的唯一出口（只放行 http(s)，见 commands.rs） */
+  openReleasePage(url: string): Promise<{ url?: string } | null | undefined>
+}
+
+/**
+ * window 上由其它脚本 / 其它岛挂载的共享桥。
+ *
+ * 刻意用「局部窄类型 + 转型」而不是 declare global 往 Window 上加属性：
+ * workbuddyDesktop / wbApp / wbMarkdown 是多个岛共用的桥，各岛各 declare 一份会因
+ * 同名属性类型不一致直接报 TS2717。update-panel 自己独占的 wbUpdatePanel
+ * 仍在 update-panel.tsx 里 declare。
+ */
+export type SharedWindow = {
+  workbuddyDesktop?: UpdateBridge
+  wbApp?: {
+    toast?: (message: string, kind?: 'err' | 'ok') => void
+    /** 把「有新版本」翻译成「设置」导航项上的「新」提示（app.js 的出口） */
+    updateUpdateBadge?: (info: unknown) => void
+    /** 切页：弹窗「去更新」要跳到设置页（与旧 app.js 的实现同一条路） */
+    showPage?: (name: string, options?: { persist?: boolean }) => void
+    /** 当前页标识：人已经在设置页时不弹窗（照抄旧 app.js 的判定） */
+    readonly currentPage?: string
+  }
+  /** 设置页自己的分类切换（「去更新」要显式切到「更新」） */
+  wbSettingsPanel?: { showCategory?: (category: string) => void }
+  /** 更新日志的 Markdown 渲染（保持调用，不在这里重写它） */
+  wbMarkdown?: { render?: (text: string) => string }
+}
+
+export function shared(): SharedWindow {
+  return window as unknown as SharedWindow
+}
+
+/* ─── 小工具（播报 / 错误 / 外链）───────────────── */
+
+/** toast 的统一出口（运行期读 wbApp，不在模块顶层解构） */
+export function toast(message: string, kind?: 'err' | 'ok'): void {
+  shared().wbApp?.toast?.(message, kind)
+}
+
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** 外链白名单：只放行 http(s)（与后端 open_release_page 的口径一致，这里先挡一道） */
+export function safeExternal(value: unknown): string {
+  const url = String(value || '').trim()
+  return /^https?:\/\//i.test(url) ? url : ''
+}
+
+/**
+ * 打开外链：一律交给系统默认浏览器。webview 里直接导航会白屏，而且本程序持有
+ * 桥接权限，外部链接不该在应用内部打开（「更新设置」里的 GitHub 令牌页也走它）。
+ */
+export async function openExternal(url: string): Promise<void> {
+  const target = safeExternal(url)
+  if (!target) {
+    toast('链接地址不受支持', 'err')
+    return
+  }
+  try {
+    await shared().workbuddyDesktop?.openReleasePage(target)
+  } catch (error) {
+    toast(`打开链接失败：${errorMessage(error)}`, 'err')
+  }
+}
+
+/** 更新日志正文：渲染交给 wbMarkdown（不重写它），只做缺失兜底 */
+export function markdownHtml(notes: string): string {
+  return shared().wbMarkdown?.render?.(notes) || ''
+}
+
+/**
+ * 事件委托：更新日志与 Markdown 正文里的外链是动态渲染出来的，逐个绑定既费事又
+ * 容易漏。面板与两个弹窗各自把 onClick 挂在自己的容器上（React 合成事件冒泡到
+ * 那里），弹窗经 Portal 挂在 body 上、不冒泡到面板，所以各挂一份。
+ */
+export function handleExternalClick(event: React.MouseEvent<HTMLElement>): void {
+  const target = event.target as HTMLElement | null
+  const trigger = target?.closest?.('[data-external]') as HTMLElement | null
+  if (!trigger) return
+  event.preventDefault() // 掐掉 webview 自己的导航（跳过去只会白屏）
+  void openExternal(trigger.dataset.external || '')
+}
+
+/* ─── 出网代理（「更新设置」弹窗里的那一节）────── */
+
+/**
+ * 下拉里代表「已设置但不是 Clash 出口」的占位值。
+ *
+ * 弹窗的选项只有直连与 Clash 出口，但接口同时收 custom 形状（直接调
+ * `/api/update/proxy` 写进来的）：那种值映射不到任何出口 uid，给一条占位项
+ * 显示当前值 —— **绝不能回落成「直连」**，那会把「设置了代理」显示成「没设」。
+ */
+export const PROXY_OTHER_CURRENT = '__proxy_other__'
+
+/** 出网代理一节的全部读数（弹窗的本地状态就是它） */
+export type ProxySelection = {
+  proxyChoice: UpdateProxyChoice
+  /** null = 还没读到 / 读取失败（原因在 clashError） */
+  clash: ClashSnapshot | null
+  /** 出口列表读取失败的原因（空串 = 没失败） */
+  clashError: string
+}
+
+export const EMPTY_PROXY_SELECTION: ProxySelection = {
+  proxyChoice: null,
+  clash: null,
+  clashError: '',
+}
+
+/**
+ * 读当前线路与 Clash 出口列表（每次打开弹窗都拉，不另做缓存）。
+ *
+ * 两个请求互不依赖、失败互不拖累：设置读不到按「直连」显示（保存动作会把
+ * 真实值带回来）；出口列表读不到与「没装 Clash」是两种处境，clashError
+ * 单独记，下拉里各给一条置灰说明。
+ */
+export async function fetchProxySelection(): Promise<ProxySelection> {
+  const api = shared().workbuddyDesktop
+  const selection: ProxySelection = { ...EMPTY_PROXY_SELECTION }
+  if (!api?.getUpdateProxy || !api?.getProxies) return selection
+  try {
+    selection.proxyChoice = (await api.getUpdateProxy())?.proxy ?? null
+  } catch {
+    /* 设置读不到：按直连显示，保存动作会把真实值带回来 */
+  }
+  try {
+    const clash = (await api.getProxies())?.clash ?? null
+    // 桥异常时可能 resolve 出 undefined 而不是 reject：不校验会伪装成「没有出口」
+    if (!clash) throw new Error('代理列表响应异常')
+    selection.clash = clash
+  } catch (error) {
+    selection.clash = null
+    selection.clashError = errorMessage(error)
+  }
+  return selection
+}
+
+/**
+ * 切换线路：选中即保存（与账号页代理列同一交互），值只有两种 ——
+ * 空串 = 直连（proxy 传 null），否则是 Clash 出口 uid。
+ *
+ * 失败在内部 toast 并返回 null（下拉是受控的，界面自动回原值）；
+ * 占位项不是值，选它等于「维持现状」，直接忽略。
+ */
+export async function saveProxy(value: string): Promise<{ choice: UpdateProxyChoice; saved: boolean } | null> {
+  if (value === PROXY_OTHER_CURRENT) return null
+  const api = shared().workbuddyDesktop
+  if (!api?.setUpdateProxy) return null
+  const proxy = value ? { source: 'clash', listenerUid: value } : null
+  try {
+    const result = await api.setUpdateProxy({ proxy })
+    // 以后端回报的描述形态为准（含解析失败时的 error），不从本地猜
+    const choice = result?.proxy ?? null
+    const saved = result?.saved !== false
+    if (!saved) toast('出网线路已切换，但写入磁盘失败（重启后会恢复原线路）', 'err')
+    else toast(choice ? `✅ 更新出网已切换为 ${choice.label || '指定代理'}` : '✅ 更新出网已切换为直连')
+    return { choice, saved }
+  } catch (error) {
+    toast(`保存失败：${errorMessage(error)}`, 'err')
+    return null
+  }
+}
+
+/**
+ * 代理下拉的选项与当前值。
+ *
+ * 逐格照账号页 ProxyCell 的口径：直连 + 各 Clash 出口（`节点名 :端口`），
+ * Clash 不可用 / 列表读取失败各给一条置灰的说明项；「当前出口已不在列表」
+ * 补一条占位项（后端解析它的 label），别让已存的值在下拉里凭空消失。
+ */
+export function buildProxyPick(selection: ProxySelection): {
+  current: string
+  items: Array<{ value: string; label: string; disabled?: boolean }>
+  selected: { value: string; label: string } | undefined
+  broken: boolean
+  title: string
+} {
+  const proxy = selection.proxyChoice
+  const source = proxy?.config?.source || proxy?.source
+  const label = proxy?.label || (source === 'custom' ? '自定义代理' : '已设置')
+  const broken = Boolean(proxy?.error)
+  const options = selection.clash?.options
+  const exits = Array.isArray(options) ? options : []
+
+  // 当前值：「有线路但取不到 Clash 出口 uid」（custom / 坏形状）落到占位项
+  let current = ''
+  if (source === 'clash' && proxy?.config?.listenerUid) current = String(proxy.config.listenerUid)
+  else if (proxy) current = PROXY_OTHER_CURRENT
+
+  const staleExit = source === 'clash' && Boolean(current) && !exits.some(exit => String(exit.uid) === current)
+
+  const items: Array<{ value: string; label: string; disabled?: boolean }> = [{ value: '', label: '直连' }]
+  for (const exit of exits) items.push({ value: String(exit.uid), label: `${exit.name} :${exit.port}` })
+  if (selection.clash && selection.clash.available === false) {
+    items.push({
+      value: '__hint__',
+      label: selection.clash.error ? 'Clash 配置不可用' : '未检测到 Clash Verge',
+      disabled: true,
+    })
+  } else if (selection.clash && !exits.length) {
+    items.push({ value: '__hint__', label: '没有可用的 Clash 出口', disabled: true })
+  } else if (!selection.clash && selection.clashError) {
+    items.push({ value: '__hint__', label: 'Clash 出口列表读取失败', disabled: true })
+  }
+  if (source === 'clash') {
+    if (staleExit) items.push({ value: current, label: `${label}${broken ? '（不可用）' : '（不在列表）'}` })
+  } else if (current === PROXY_OTHER_CURRENT) {
+    const prefix = source === 'custom' ? '自定义：' : ''
+    items.push({ value: PROXY_OTHER_CURRENT, label: `${prefix}${label}${broken ? '（不可用）' : ''}` })
+  }
+  return {
+    current,
+    items,
+    selected: items.find(item => item.value === current),
+    broken,
+    title: broken
+      ? `当前线路不可用：${proxy?.error}；请重新选择出口或切回直连`
+      : `检查更新与下载安装包走哪条线路（当前：${proxy ? label : '直连'}）；选择即保存。直连失败时会自动借 Clash 混合端口重试一次；选定指定出口后只走该出口`,
+  }
+}

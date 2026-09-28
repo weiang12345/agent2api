@@ -111,14 +111,14 @@
 //! 校验里：`/v1/models` 不会广告清单为空的那家。
 
 use axum::http::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
 use super::qoder;
 use super::raccoon;
-use super::{catalog_cache, kind_id, meta, ProviderKind};
+use super::{catalog_cache, ProviderKind};
 
 /// 转发前对「账号 + 请求体」的完整构造计划（架构文档 §4.2 的 ChatRequestPlan）。
 ///
@@ -468,7 +468,9 @@ pub trait ProviderAdapter: Send + Sync {
         store: &'a AccountStore,
         account_id: &'a str,
         force: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
+    >;
 
     /// 模型目录刷新是否走「账号」这一维（默认 true；Cline 覆写为 false）。
     ///
@@ -553,12 +555,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// 「同一账号重试」那一档给出（见 `config::RetrySettings`）。
     /// 适配器据此判断该不该再退避 —— 而不是自己去读全局设置：那样写的话
     /// 「哪一档管什么」这条规则就会漏进每个适配器里各实现一遍。
-    fn retry_advice(
-        &self,
-        _error_body: &Value,
-        _attempt: usize,
-        _budget: usize,
-    ) -> Option<RetryAdvice> {
+    fn retry_advice(&self, _error_body: &Value, _attempt: usize, _budget: usize) -> Option<RetryAdvice> {
         None
     }
 
@@ -812,8 +809,9 @@ pub trait ProviderAdapter: Send + Sync {
         &'a self,
         _store: &'a AccountStore,
         _account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
         let kind = self.kind();
         Box::pin(async move {
             Err(GatewayError::with_status(
@@ -980,11 +978,7 @@ pub struct ModelRefreshOutcome {
 impl ModelRefreshOutcome {
     /// 真刷新成功（`count` 是落地后的条目数）
     pub fn refreshed(count: usize) -> Self {
-        Self {
-            refreshed: true,
-            count,
-            message: None,
-        }
+        Self { refreshed: true, count, message: None }
     }
 
     /// 没有刷（按缓存/TTL 跳过、上游没给可用清单、没有可用的家等）——
@@ -995,11 +989,7 @@ impl ModelRefreshOutcome {
 
     /// 尝试刷新但失败（`reason` 是会显示给用户的原因）
     pub fn failed(reason: impl Into<String>) -> Self {
-        Self {
-            refreshed: false,
-            count: 0,
-            message: Some(reason.into()),
-        }
+        Self { refreshed: false, count: 0, message: Some(reason.into()) }
     }
 }
 
@@ -1075,31 +1065,29 @@ fn seed_current_cline_defaults() {
     }
 }
 
-/// 让所有**已实现**的 provider 各刷新一次模型目录（后台任务入口）。
+/// 让所有**已实现**的 provider 各刷新一次模型目录（**自动**路径入口）。
 ///
-/// 调用点：`api::chat::spawn_catalog_refresh`（GET /v1/models 的异步刷新）
-/// 与 `ServerState::bootstrap`（启动刷新）。逐个 await（而不是并发）：
-/// provider 数量是个位数、刷新是低频后台动作，串行更好排查（日志顺序稳定）。
-/// 失败不会中断循环 —— 各适配器的 `refresh_models` 已把失败收敛成
-/// 「保留现有清单 + 打日志」。
+/// 调用点：`api::chat::spawn_catalog_refresh`（客户端拉 `/v1/models` 的后台刷新）
+/// 与「模型目录刷新」定时任务。真正的循环在 `providers::catalog_refresh` ——
+/// 与手动路径共用同一段实现，两条入口只在 `manual` 这一个开关上分叉。
 ///
-/// **传 `force = false`**：这是**自动**路径，各家照用自己的缓存/TTL（小浣熊的
-/// 10 分钟 TTL 就是为它设的）。手动按钮走 [`refresh_implemented_forced`]。
-pub async fn refresh_implemented(store: &AccountStore) {
+/// **自动路径受排期与冷却约束**：每家的刷新间隔、在途占位、失败冷却都由
+/// `core::task_state` 持久化（`modelRefresh:<provider>`），因此「重启一次就重刷
+/// 一遍」「客户端每次拉列表都真打一次上游」都不会再发生。这也是它返回逐家结果
+/// 的原因：定时任务要按状态统计（成功 / 跳过 / 失败）并写进任务摘要。
+///
+/// 各家自身的缓存/TTL 仍然生效（`force = false`）：排期说「可以刷了」之后，
+/// 由各家决定这次是否真的打网络。手动按钮走 [`refresh_implemented_forced`]。
+pub async fn refresh_implemented(store: &AccountStore) -> Vec<Value> {
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
     seed_current_cline_defaults();
-    for kind in implemented_kinds() {
-        let adapter = adapter_for(kind);
-        // 注册表与适配器自报的 kind 必须一致（不一致说明 `adapter_for`
-        // 的 match 分支接错了）；只在 debug 断言，release 不 panic（panic=abort）
-        debug_assert_eq!(adapter.kind(), kind);
-        // 自动路径不看结果：各适配器内部已经把「成功 / 没刷 / 失败」都打进了日志
-        // （`refresh_models` 的契约就是失败不返回错误），这里再处理一遍只会重复。
-        // 账号传空串 = 各家按默认选取（队首可用账号），自动路径没有「点名」的概念
-        adapter.refresh_models(store, "", false).await;
-    }
+    let results = super::catalog_refresh::refresh(store, &serde_json::Map::new(), None, false).await;
+    // 刷新落地后补种一次：新增的带前缀 / 别名模型在这一刻才出现在清单里
+    // （与开头那次同一件事 —— 那时种的是缓存恢复的清单）
+    seed_current_cline_defaults();
+    results
 }
 
 /// 启动时恢复各家的持久化清单缓存（`ServerState::bootstrap` 在库句柄就绪后
@@ -1169,10 +1157,14 @@ pub fn restore_cached_catalogs() {
 ///   1. **`force = true`**：用户按下按钮的全部预期是「现在真的去拉一次」。
 ///      小浣熊的 TTL 早退会让「点了没反应、清单没变」，与功能坏掉无法区分。
 ///      缓存只该为后台自动路径服务，用户显式要求时一律绕过。
+///      同理，**普通排期也一并跳过**（`manual` 开关，见 `catalog_refresh`）——
+///      手动刷新可以提前，但仍受在途占位与失败冷却约束（那两条是上游限流，
+///      不该由界面按钮解除）。
 ///   2. **只刷支持的家**：静态清单的家不去打那次必然白跑的网络请求。
 ///   3. **返回逐家结果**：自动路径失败只写日志（没有人在等它）；手动路径必须
 ///      把「哪家刷到了几个、哪家为什么没刷」交给界面 —— 一句笼统的「已刷新」
 ///      会让「其实失败了」和「其实跳过了」都显示成成功。
+///      （自动路径现在同样返回逐家结果：定时任务要按它统计本轮摘要。）
 ///
 /// ── `skipped` 与 `failed` 的区别（界面的文案完全依赖这个区分）──
 ///   - `skipped`：**这次没有可刷的东西，且不是错误**。两种来源：这家没有
@@ -1202,84 +1194,12 @@ pub async fn refresh_implemented_forced(
     accounts: &serde_json::Map<String, Value>,
     providers: Option<&[String]>,
 ) -> Vec<Value> {
-    let mut results: Vec<Value> = Vec::new();
-    // 手动刷新前对缓存清单补一次种子（刷新成功落地新清单后 raccoon / workbuddy
-    // 内部还会再种一次）
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
     seed_current_cline_defaults();
-    for kind in implemented_kinds() {
-        let adapter = adapter_for(kind);
-        debug_assert_eq!(adapter.kind(), kind);
-        let provider_id = kind_id(kind);
-        // 范围白名单（见上方说明）：名单外直接跳过，不打网络也不进结果
-        if let Some(allowed) = providers {
-            if !allowed.iter().any(|id| id == provider_id) {
-                continue;
-            }
-        }
-        let provider_label = meta(kind).label;
-        // 这家在弹窗里点名的账号（空串 = 默认选取）
-        let requested = accounts
-            .get(provider_id)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if !adapter.supports_model_refresh() {
-            // 不支持的家**不进网络**：静态清单刷十次还是同一份，打上游只是白跑。
-            // `fixed: true` 是给前端的机器可识别标记（理由见上方「结果字段」）。
-            // **当前五家都支持远程目录，本分支在生产路径上走不到** ——
-            // 保留它是给将来新接入的 provider 用的（与 trait 的默认 false 配对）
-            results.push(json!({
-                "provider": provider_id,
-                "providerLabel": provider_label,
-                "status": "skipped",
-                "fixed": true,
-                "message": "该提供商使用固定模型清单（上游没有远程目录接口）",
-                // 与其它分支同一契约：这家没有远程目录，时刻恒为 0（界面显示占位）
-                "refreshedAt": 0,
-            }));
-            continue;
-        }
-        let outcome = adapter.refresh_models(store, requested, true).await;
-        // 本次实际使用的账号：不走账号维度的家（Cline）不带这个键；点名了就用
-        // 点名的那条；没点名按同一套判据解析队首（与各家实现的默认选取一致）。
-        // 没有账号的家（如从未添加过账号）解析为 None，也不带这个键。
-        let used = if !adapter.refresh_uses_account() {
-            None
-        } else if requested.is_empty() {
-            store
-                .current_entry_for_provider(provider_id)
-                .map(|entry| entry.id)
-        } else {
-            Some(requested.to_string())
-        };
-        let mut item = json!({
-            "provider": provider_id,
-            "providerLabel": provider_label,
-        });
-        if let Some(account_id) = used {
-            item["accountId"] = json!(account_id);
-        }
-        if outcome.refreshed {
-            item["status"] = json!("refreshed");
-            item["count"] = json!(outcome.count);
-        } else if let Some(message) = outcome.message {
-            item["status"] = json!("failed");
-            item["message"] = json!(message);
-        } else {
-            item["status"] = json!("skipped");
-            item["message"] = json!("本次刷新没有取到新清单（上游未返回可用的模型列表）");
-        }
-        // 这家清单**当前**的拉取时刻（毫秒；0 = 从未成功过），界面的「更新日期」
-        // 列读它。必须在 `refresh_models` **之后**取：本次成功的家拿到的是刚刚
-        // 那一刻，失败 / 跳过的家拿到的是上次成功那次的时刻 —— 那正是「这份清单
-        // 是什么时候的」这个问题要的答案（用「本次请求的时刻」会在失败行上撒谎，
-        // 显示成刚更新过）。
-        item["refreshedAt"] = json!(super::catalog::refresh_meta(kind).1);
-        results.push(item);
-    }
+    let results = super::catalog_refresh::refresh(store, accounts, providers, true).await;
+    seed_current_cline_defaults();
     results
 }
 

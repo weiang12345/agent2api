@@ -84,11 +84,6 @@ button.icon.sm { width: 26px; }
 .badge.warn { background: var(--warn-soft); border-color: var(--warn-bd); color: var(--warn); }
 .badge.bad { background: var(--danger-soft); border-color: var(--danger-bd); color: var(--danger); }
 .badge.brand { background: var(--primary-soft); border-color: var(--primary-bd); color: var(--primary-fg); }
-
-/* 版本标签：固定配色，国内版附带签到入口 */
-.badge.edition-cn { background: var(--cn-soft); border-color: var(--cn-bd); color: var(--cn); }
-.badge.edition-intl { background: var(--intl-soft); border-color: var(--intl-bd); color: var(--intl); }
-
 /* 行内状态标签：比徽章更方、更小 */
 .badge.tag { min-height: 19px; padding: 0 8px; border-radius: var(--r-xs); font-size: 11px; }
 .badge.tag.ok { background: var(--ok-soft); border-color: var(--ok-bd); color: var(--ok); }
@@ -167,27 +162,6 @@ button.icon.sm { width: 26px; }
 }
 
 .hint strong, .detail strong { color: var(--text); }
-
-/* 提示条 */
-.banner {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 11px 13px;
-  border: 1px solid var(--info-bd);
-  border-radius: var(--r-md);
-  background: var(--info-soft);
-  color: var(--text-2);
-  font-size: 12px;
-  line-height: 1.65;
-}
-
-.banner .ico { flex: 0 0 auto; color: var(--info); font-size: 13px; line-height: 1.5; }
-.banner.warn { border-color: var(--warn-bd); background: var(--warn-soft); }
-.banner.warn .ico { color: var(--warn); }
-.banner.danger { border-color: var(--danger-bd); background: var(--danger-soft); }
-.banner.danger .ico { color: var(--danger); }
-.banner strong { color: var(--text); }
 
 /* ─── 空状态 ─── */
 .empty {
@@ -302,37 +276,6 @@ input[type="number"] { max-width: 130px; }
 
 .field-row > label { color: var(--text-2); font-size: 12.5px; white-space: nowrap; }
 
-/* 输入框 + 前后缀（affix 的左偏移与 input 自身 10px 内边距对齐） */
-.input-affix { position: relative; display: flex; align-items: center; flex: 1 1 auto; }
-.input-affix .affix { position: absolute; left: 10px; color: var(--text-3); font-size: 12px; pointer-events: none; }
-.input-affix input { padding-left: 28px; }
-
-/* ─── 单选卡片（账号版本 / 代理模式） ─── */
-.edition-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 13px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  color: var(--text-2);
-  font-size: 12.5px;
-  cursor: pointer;
-  user-select: none;
-  transition: border-color .15s ease, background .15s ease, color .15s ease;
-}
-
-.edition-option:hover { border-color: var(--border-strong); background: var(--surface-3); }
-.edition-option input { accent-color: var(--primary); margin: 0; }
-
-.edition-option:has(input:checked) {
-  border-color: var(--primary-bd);
-  background: var(--primary-soft);
-  color: var(--primary-fg);
-  font-weight: 600;
-}
-
 /* ─── 复选 / 单选 ─── */
 .check, .radio {
   display: inline-flex;
@@ -388,154 +331,6 @@ input[type="number"] { max-width: 130px; }
 .switch input:checked + .track::after { transform: translateX(15px); }
 .switch input:focus-visible + .track { box-shadow: var(--ring); }
 .switch input:disabled + .track { opacity: .5; }
-
-/* 开关卡片：整行可点，附说明 */
-.switch-card {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface-inset);
-}
-
-.switch-card .switch { color: var(--text); font-weight: 500; }
-.switch-card .desc { color: var(--text-3); font-size: 11.5px; }
-.switch-card.stack { flex-direction: column; align-items: stretch; gap: 10px; }
-
-/* 带 time 控件的 .switch：内部不是开关，要覆盖上面的隐藏处理 */
-.switch-time { gap: 9px; cursor: default; }
-
-.switch-time input[type="time"] {
-  position: static;
-  width: auto;
-  height: 28px;
-  opacity: 1;
-  pointer-events: auto;
-}
-
-/* 分段控件（账号页筛选）：槽取 --control-* 一组，与按钮同源 ——
-   它现在坐在内容表面上，需要靠自身填充而不是反衬底色来立住。 */
-.seg {
-  display: inline-flex;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--control-border);
-  border-radius: var(--r-md);
-  background: var(--control-bg);
-}
-
-/* 分段项嵌在 .seg 里，圆角要按「外圆角 - 内边距」收一号，
-   否则 24px 的项配上控制件的 12.8px 会比容器还圆，接缝处露出毛边。
-   user-select 显式关掉：报表页那一条由 React 岛渲染成 span（Base UI 的 Radio），
-   不像 button 那样自带「文字不可拖选」，不关掉拖一下就会把标签文字选中。 */
-.seg-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 24px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: var(--r-sm);
-  background: transparent;
-  box-shadow: none;
-  color: var(--text-2);
-  font-size: 12px;
-  font-weight: 500;
-  white-space: nowrap;
-  user-select: none;
-  transition: background .15s ease, color .15s ease;
-}
-
-/* 未选中项用中性叠加：深色叠白、浅色叠黑，同一行声明两边都成立。
-   `[data-disabled]` 是 Base UI 的禁用标记（span 没有 :disabled 伪类，只能靠属性）。 */
-.seg-item:hover:not(:disabled):not([data-disabled]) { background: var(--nav-hover); color: var(--text); }
-
-/* 选中项走品牌浅底，与导航选中态、单选卡片保持一致 */
-.seg-item.active {
-  background: var(--primary-soft);
-  color: var(--primary-fg);
-  font-weight: 600;
-}
-
-/* ─── 滑动指示器：报表页的时间范围档位（由 React 岛渲染）───
-   与上面「选中项自己变色」是两条不同的路子：这条把底色交给一枚绝对定位的
-   滑块，切换档位时它平移过去，而不是硬切。思路取自 OmniUI 的 SegmentedControl
-   —— 组件量出选中项的矩形喂进 style（见组件里的 measure）。 */
-.seg-sliding { position: relative; }
-
-/* top / bottom 取容器的 padding，滑块才与选项上下齐平；
-   left: 0 落在容器 padding box 的原点上，组件量出的 left 正是相对这个原点。
-   首次量到值之前先藏起来，过渡也先关着 —— 否则入场时它会从左上角滑到目标位。 */
-.seg-thumb {
-  position: absolute;
-  top: 2px;
-  bottom: 2px;
-  left: 0;
-  border-radius: var(--r-sm);
-  background: var(--primary-soft);
-  pointer-events: none;
-}
-.seg-thumb[data-ready='false'] { opacity: 0; }
-.seg-thumb[data-animate='true'] {
-  transition: transform .2s ease-in-out, width .2s ease-in-out;
-}
-
-/* 选项必须压在滑块之上。
-   绝对定位的元素默认绘制在**非定位**元素之上 —— 层叠顺序里「z-index: auto 的
-   定位后代」那一档排在「行内非定位后代」之后，与 DOM 先后无关。不显式提层级的话，
-   滑块那层不透明的浅蓝会把选中项的文字整块盖掉：浅色模式下整条控件只剩一个
-   空白蓝块（账号页那两处带计数徽标的尤其明显）。 */
-.seg-sliding .seg-item {
-  position: relative;
-  z-index: 1;
-}
-
-/* 滑块版里选中项让出底色（底色归滑块画），只留文字色。
-   而且不加粗 —— 字重会改元素宽度，切换瞬间整条控件重新排版、滑块动画的
-   目标位置跟着跳一下；有滑块托底之后，靠颜色区分已经足够醒目。 */
-.seg-sliding .seg-item[data-checked] {
-  background: transparent;
-  color: var(--primary-fg);
-}
-
-/* 选中项不参与 hover 底色：滑块是独立一层，被 item 那层半透明灰蒙上去会发浑，
-   也丢掉了「这是当前档位」的持续提示。非选中项的 hover 照旧。
-   特异性与上面那条 hover 规则相同，靠位置靠后取胜，别往上挪。 */
-.seg-sliding .seg-item[data-checked]:hover:not([data-disabled]) {
-  background: transparent;
-}
-
-.seg-item .seg-count {
-  min-width: 16px;
-  padding: 0 5px;
-  border-radius: var(--r-pill);
-  background: var(--surface-3);
-  color: var(--text-3);
-  font-size: 10.5px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-  opacity: 1;
-}
-
-.seg-item.active .seg-count,
-.seg-item[data-checked] .seg-count { background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary-fg); }
-
-/* 计数为 0 的分段弱化，减少视觉噪音。
-   `data-zero` 由岛按 count === 0 自动挂上（账号页筛选的那两处）；
-   后面半条 `:not([data-checked])` 是给滑块版留的 —— 当前选中的那一档即使计数为 0
-   也要保持正常不透明度，否则选中的空段看起来像被禁用了。
-   前半条 `.zero` 是改造前 JS 加类的写法，保留以防还有没岛化的地方在用。 */
-.seg-item.zero:not(.active),
-.seg-item[data-zero='true']:not([data-checked]) { opacity: .45; }
-.seg-item:disabled,
-.seg-item[data-disabled] { cursor: not-allowed; opacity: .4; }
-.seg-item.active:disabled,
-.seg-item[data-checked]:disabled,
-.seg-item[data-checked][data-disabled] { opacity: .7; }
-
 /* 工具条：一行收住筛选与主操作 */
 .toolbar {
   display: flex;
@@ -555,17 +350,6 @@ input[type="number"] { max-width: 130px; }
 @media (max-width: 1120px) {
   .toolbar .actions { flex-basis: 100%; margin-left: 0; }
 }
-
-/* 提供商筛选下拉：它决定列表里显示哪些家的账号，
-   比同排普通下拉重一档，边框取强调色而不是用字重硬顶 */
-.model-select {
-  max-width: 200px;
-  height: 30px;
-  border-color: var(--border-strong);
-  background-color: var(--surface);
-  font-weight: 600;
-}
-
 /* ─── 进度条 ─── */
 .progress {
   height: 6px;
@@ -580,113 +364,23 @@ input[type="number"] { max-width: 130px; }
   background: var(--primary);
   transition: width .3s ease;
 }
-
-/* ─── 弹窗 ─── */
-/* 遮罩要「两个主题都压暗背景」，但令牌里没有这样的颜色：--text、--bg、--surface
-   都随主题翻转，拿它们当蒙层会在深色模式刷出一层白雾。所以按 tokens.css 里
-   浅色 tint 同款手法派生，只把基底换成黑，深浅两模式的方向就一致了。 */
-.modal-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 30;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: color-mix(in srgb, black 46%, transparent);
-  backdrop-filter: blur(3px);
-}
-
-.modal-mask.open { display: flex; animation: mask-in .16s ease; }
-
-/* 确认弹窗是「弹窗之上的弹窗」：它从别的弹窗里发起（请求详情的「终止请求」、
+/* 确认弹窗曾是「弹窗之上的弹窗」：它从别的弹窗里发起（请求详情的「终止请求」、
    账号设置的「删除提供商」、⋯ 菜单的「删除账号」…），而所有 .modal-mask 同为
-   30 —— 同档时谁在上面由 DOM 顺序决定，于是声明在 #confirm-modal 之后的那些
-   弹窗（#req-detail-modal / #mapping-modal / #key-modal …）会把确认框盖住：
+   30 —— 同档时谁在上面由 DOM 顺序决定，声明在后面的弹窗会把确认框盖住：
    用户点了「终止请求」，界面看起来毫无反应，实际确认框在底下等着。
-   抬到浮层（下拉 / 列设置 / 提示气泡，35）之上、轻提示（toast，40）之下：
-   确认框永远在最上层，但它出现时不该盖住 toast。 */
-#confirm-modal { z-index: 38; }
+   所以要抬到浮层（下拉 / 列设置 / 提示气泡，35）之上、轻提示（toast，40）之下。
+
+   那条规则（#confirm-modal { z-index: 38 }
+
+）随弹窗迁到组件库一并移除了：
+   现在是 ui-kit 的 AlertDialogContent 自带 z-38（见 ui-kit/src/alert-dialog.tsx），
+   层级口径不变，只是不再由这里管。 */
 
 @keyframes mask-in { from { opacity: 0; } to { opacity: 1; } }
-
-.modal {
-  display: flex;
-  flex-direction: column;
-  width: min(620px, 100%);
-  max-height: 100%;
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  box-shadow: var(--shadow-3);
-  overflow: hidden;
-  animation: modal-in .2s cubic-bezier(.2, .9, .3, 1);
-}
-
 @keyframes modal-in {
   from { opacity: 0; transform: translateY(10px) scale(.985); }
   to { opacity: 1; transform: none; }
 }
-
-.modal-head {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 15px 20px;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.modal-head h2 { flex: 1 1 auto; font-size: 14.5px; font-weight: 650; }
-
-/* 关闭按钮是透明底图标钮，圆角沿用 button 的 --r-md */
-.modal-head > button {
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
-  box-shadow: none;
-  color: var(--text-3);
-}
-
-.modal-head > button:hover { background: var(--surface-3); border-color: transparent; color: var(--text); }
-
-.modal-body {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  padding: 18px 20px;
-  overflow-y: auto;
-}
-
-.modal-section {
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface-inset);
-}
-
-.modal-section h3 { font-size: 12.5px; font-weight: 650; }
-.modal-section p { color: var(--text-2); font-size: 12px; line-height: 1.65; }
-
-.modal-foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 13px 20px;
-  border-top: 1px solid var(--hairline);
-  background: var(--surface-2);
-}
-
-.modal-foot .spacer { flex: 1 1 auto; }
-
-/* 说明性小字（弹窗内） */
-.modal .detail { color: var(--text-3); font-size: 11.5px; }
-
 /* ─── 表格列宽拖动把手 ───
    四张表的表头右缘共用这一枚把手（账号表由 accounts-columns.js 委托，
    模型管理 / 网关 Key / 请求日志由 table-columns.js 委托）：
@@ -694,9 +388,9 @@ input[type="number"] { max-width: 130px; }
    按住时变主色加粗。
    靠绝对定位挂在宿主单元格上，所以宿主必须是定位元素 —— 三张 table 表的
    表头是 position: sticky（本来就是），请求日志的表头格也单独声明了 relative。
-   right: -4px 让竖线正好压住列边界；代价是最后一列不能插把手（钉在表格右缘
-   会顶出滚动容器），这一条由各自的脚本负责（请求日志是网格布局、整行填满
-   不滚动，末列照插）。
+   right: -4px 让竖线正好压住列边界；钉在表格最右缘会凭空多出 4px 横向溢出，
+   所以**末列改用 .col-grip-end**（right: 0，往里挪 4px）—— 四张表的末列现在
+   都能拖，只是最后那枚把手贴在列内侧（见 table-columns.js 模块头）。
 
    竖线不随宿主撑满、改定高 20px 垂直居中：四张表的宿主高度参差 —— 账号表
    th 行高 32px（眼睛按钮撑起行盒），32 − 上下各 6px 恰是 20px；模型/网关
@@ -725,48 +419,8 @@ input[type="number"] { max-width: 130px; }
 
 .col-grip.active::after { left: 3.5px; width: 2px; background: var(--primary); }
 
+/* 末列的把手：整枚往左挪 4px，竖线正好落在列右缘内侧（表格边缘不再多出 4px 溢出） */
+.col-grip-end { right: 0; }
+
 /* 拖动中：全局换光标并禁用选中（拖过文本会触发原生的拖选，把手就「断」了） */
 body.col-resizing { cursor: col-resize; user-select: none; }
-
-/* 表格列设置（浮层与列对齐）在 css/table-col-settings.css ——
-   它必须排在页面样式之后（要盖过各表写死的默认对齐），所以独立成一层，
-   与 select.css / tooltip.css 同一编排。 */
-
-/* ─── 页面级分段布局辅助 ─── */
-/* 端点卡片（网关页 / 设置页） */
-.endpoint-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 10px;
-}
-
-.endpoint {
-  min-width: 0;
-  padding: 12px 13px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface-inset);
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.endpoint .k { color: var(--text-3); font-size: 11.5px; }
-
-.endpoint .v {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-}
-
-.endpoint .v .url {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
-  word-break: break-all;
-}
-
-.endpoint.accent { background: var(--primary-soft); border-color: var(--primary-bd); }

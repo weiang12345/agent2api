@@ -239,12 +239,10 @@ impl AuthService {
         Ok(Some(entry.session))
     }
 
-    /// 会话状态：已登录/未登录两分支的字段逐个对齐 Node 版 `getStatus()`。
-    ///
-    /// 未登录分支**不含** accountUid/nickname/tokenExpiresAt/canRefresh 等字段 ——
-    /// 那些只在已登录分支出现，前端用 `session.nickname || ...` 兜底。
-    pub async fn get_status(&self) -> Value {
-        let session = self.get_current_session().await.ok().flatten();
+    /// 会话状态只读本地凭证；续期由维护任务和实际转发按需触发。
+    pub fn get_status(&self) -> Value {
+        let session = Self::env_session()
+            .or_else(|| self.store.get_current_entry().map(|entry| entry.session));
         let Some(session) = session else {
             return self.unconfigured_status();
         };
@@ -323,8 +321,9 @@ impl AuthService {
     /// 上游配置摘要（对照 workbuddy-upstream-client.mjs 的 `getConfigSummary`）。
     ///
     /// **纯本地**：只查凭证是否存在，不发任何网络请求 —— 所以本切片就能给真值。
-    /// 它不做 token 临期刷新（那是 get_status 的职责），否则 /health 会被
-    /// 上游网络状况拖慢。
+    /// 它不做 token 临期刷新（`get_status` 同样只读，见那里的说明），
+    /// 否则 /health 会被上游网络状况拖慢 —— 它是壳侧的就绪探针，探一次就出网
+    /// 会让「网关是否就绪」取决于上游网络。
     pub fn get_config_summary(&self) -> Value {
         let Some(entry) = self.store.get_current_entry() else {
             return json!({

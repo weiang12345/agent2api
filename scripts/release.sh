@@ -22,11 +22,32 @@ case "$TAG" in
 esac
 
 command -v gh   >/dev/null || { echo "错误: 未安装 gh CLI" >&2; exit 1; }
+# gh 的 JSON 输出用 node 解析（不引入 jq 依赖，两端都有 node）
 command -v node >/dev/null || { echo "错误: 未安装 node" >&2; exit 1; }
 
+# gh 是 Go 程序：既不读 git 的 http.proxy，也不读 Windows 系统代理，只认代理
+# 环境变量。本机 git 配了代理而 gh 没配，下面的下载安装包与上传附件都是大文件
+# 传输，直连不稳时会中途失败 —— 故把 git 的代理透传给 gh。
+# 只设 HTTPS_PROXY：gh 的请求（含附件上传下载）全是 HTTPS，实测不读 HTTP_PROXY。
+# 从 git 读取而非写死端口，换代理只改 git 一处；git 未配代理就不设，退回直连
+# （外部已显式设过时不覆盖）。
+if [ -z "${HTTPS_PROXY:-}" ]; then
+  # 按 git/curl 查找代理的顺序依次尝试，兼容这几种配置写法：
+  #   http.<url>.proxy（按仓库配） / http.proxy / https.proxy
+  # 只取 --get-urlmatch 会漏掉 https.proxy，只取 https.proxy 会漏掉前两种。
+  GH_PROXY=$(git config --get-urlmatch http.proxy https://github.com || true)
+  [ -n "$GH_PROXY" ] || GH_PROXY=$(git config --get https.proxy || true)
+  if [ -n "$GH_PROXY" ]; then
+    export HTTPS_PROXY="$GH_PROXY"
+    echo "→ 已启用代理: $GH_PROXY"
+  fi
+fi
+
+# ── 1. 定位 build run 并下载 Windows 安装包 ───────────────────
 if [ -z "$RUN_ID" ]; then
   echo "→ 查找 $TAG 触发的 build 工作流…"
   # 不按 run 整体 conclusion 过滤：只验 Windows artifact 是否存在。
+  # 构建成功但别处失败的 run 里安装包照旧可用
   for id in $(gh run list --workflow=build --limit 30 --json databaseId,headBranch \
       | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{JSON.parse(s).filter(r=>r.headBranch===process.argv[1]).forEach(r=>process.stdout.write(r.databaseId+"\n"))})' "$TAG"); do
     if gh api "repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/actions/runs/$id/artifacts" \
@@ -47,6 +68,7 @@ gh run download "$RUN_ID" -D dist
 EXE=$(ls dist/windows-nsis/*.exe)
 echo "→ 已下载 $(basename "$EXE")"
 
+# ── 2. 更新日志 = tag 所指提交的提交信息 ──────────────────────
 NOTES_FILE=$(mktemp)
 trap 'rm -f "$NOTES_FILE"' EXIT
 git log -1 --format=%B "$TAG" > "$NOTES_FILE"
@@ -59,6 +81,7 @@ else
   gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" "$EXE"
 fi
 
+# ── 3. 验收提示 ───────────────────────────────────────────────
 echo
 echo "发版收尾完成。核对："
 echo "  [1] GitHub Release:  gh release view $TAG"

@@ -24,7 +24,9 @@
 //! 计数 → 放锁 → 写文件。写文件是同步 IO，在 tokio 的工作线程上执行
 //! （reqwest 的 bytes_stream 本身就是 async，每条 chunk 的落盘量很小）。
 
+mod check;
 mod client;
+mod token;
 mod version;
 
 use std::path::PathBuf;
@@ -40,14 +42,12 @@ pub use version::{
     assert_downloadable, compare_versions, installer_kind, pick_installer, safe_file_name,
     UpdateError, DEFAULT_REPO, GITHUB_API, MAX_INSTALLER_BYTES,
 };
+/// 「更新设置」弹窗的 GitHub 令牌接口（api::update 走这两条；加解密本体
+/// 只在 token 模块内部，见它的模块头）
+pub use token::{set_token, status_json};
 
-/// 检查更新（GitHub API）请求的总超时（Node 版 REQUEST_TIMEOUT_MS）。
-/// 只传给 API 探测：reqwest 0.12 的请求级总超时覆盖到 body 读完为止，
-/// 下载安装包传 None，否则大包 30 秒内下不完必被掐断。
-const REQUEST_TIMEOUT_MS: u64 = 30_000;
-
-/// 请求 GitHub 的 UA（Node 版字面量）
-const USER_AGENT: &str = "workbuddy-local-proxy";
+/// 请求 GitHub 的 UA（Node 版字面量，随项目改名同步）
+const USER_AGENT: &str = "agent2api-local-proxy";
 
 /// 本应用的当前版本号（编译期取自 Cargo.toml，发布流程与 tauri.conf.json
 /// 同步更新）。壳的 `checkUpdate` 命令用的是运行时 package_info —— 两者常态
@@ -107,12 +107,6 @@ struct Inner {
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 最近一次拉到的 Release（内存缓存）
     latest: Option<Value>,
-    /// 最近一次「检查更新」的结果（内存缓存）。
-    ///
-    /// 只在 check 成功后写入：定时任务（scheduled_tasks 的「软件版本检查」）
-    /// 到点跑一次 check，前端轮询 `/api/update/status` 读这里来亮侧栏徽标，
-    /// 不必自己再打一遍 GitHub（匿名限额 60 次/小时，双端各查一遍就翻倍了）。
-    last_check: Option<Value>,
     repository: String,
     download_dir: PathBuf,
 }
@@ -139,7 +133,6 @@ impl UpdateManager {
                 task: None,
                 cancel_flag: None,
                 latest: None,
-                last_check: None,
                 repository,
                 download_dir: directory.join("updates"),
             })),
@@ -161,112 +154,6 @@ impl UpdateManager {
     /// 下载目录（`{config_dir}/updates`）—— 与壳侧 `update::download_dir()` 同源
     pub fn download_dir(&self) -> PathBuf {
         self.lock().download_dir.clone()
-    }
-
-    // ─── 检查新版本 ─────────────────────────────────────────
-
-    /// 检查是否有新版本（对应 Node 版 check）。
-    ///
-    /// `current_version` 由桌面端传入（后端不知道自己被哪个壳打包）；
-    /// 缺省时只回报最新版本，不做「是否有更新」的判断。
-    /// 成功的结果缓存进 `last_check`（见 Inner 字段说明）。
-    pub async fn check(&self, current_version: &str) -> Result<Value, UpdateError> {
-        self.refresh_latest().await?;
-        let result = self.build_check_result(current_version);
-        self.lock().last_check = Some(result.clone());
-        Ok(result)
-    }
-
-    /// 最近一次「检查更新」的结果；本进程还没检查过时返回 `checked:false`。
-    ///
-    /// 供 `/api/update/status`（前端 60 秒轮询）与定时任务共用同一份缓存。
-    pub fn last_check(&self) -> Value {
-        match self.lock().last_check.clone() {
-            Some(result) => result,
-            None => json!({ "checked": false }),
-        }
-    }
-
-    /// 拉取最新 Release（对应 refreshLatest）。
-    /// 404 表示仓库还没有发布任何版本，按「无更新」处理（latest = null）。
-    async fn refresh_latest(&self) -> Result<(), UpdateError> {
-        let repository = self.repository();
-        let url = format!("{GITHUB_API}/repos/{repository}/releases/latest");
-        let headers = client::github_headers();
-        let response = client::fetch_with_egress(&url, &headers, Some(REQUEST_TIMEOUT_MS)).await?;
-
-        let status = response.status().as_u16();
-        if status == 404 {
-            self.lock().latest = None;
-            return Ok(());
-        }
-        if status == 403 || status == 429 {
-            // 文案照抄 Node（含环境变量提示）：403 多为匿名请求限额用尽
-            let hint = "，或设置 WORKBUDDY_GITHUB_TOKEN 提高限额";
-            return Err(UpdateError::new(format!(
-                "GitHub 接口访问受限（可能是请求频率超限）。稍后再试{hint}"
-            )));
-        }
-        if !response.status().is_success() {
-            return Err(UpdateError::new(format!("GitHub 返回 HTTP {status}")));
-        }
-
-        let payload: Value = response
-            .json()
-            .await
-            .map_err(|error| UpdateError::new(format!("解析 GitHub 响应失败: {error}")))?;
-        let text = |key: &str| {
-            payload
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-        // tag 剥掉可选的 `v` 前缀（Node: `String(payload.tag_name || '').replace(/^v/i, '')`）
-        let raw_tag = text("tag_name");
-        let tag = raw_tag
-            .strip_prefix('v')
-            .or_else(|| raw_tag.strip_prefix('V'))
-            .unwrap_or(&raw_tag)
-            .to_string();
-        let name = {
-            let name = text("name");
-            if name.is_empty() {
-                raw_tag.clone()
-            } else {
-                name
-            }
-        };
-        // notes 截断到 4000 字符（HTML 正文字段，直接给界面展示）
-        let notes: String = text("body").chars().take(4000).collect();
-        let page_url = {
-            let url = text("html_url");
-            if url.is_empty() {
-                format!("https://github.com/{repository}/releases")
-            } else {
-                url
-            }
-        };
-        // 发布时间：正常都带 published_at；缺失时回落到 created_at（防御）
-        let published_at = {
-            let value = text("published_at");
-            if value.is_empty() {
-                text("created_at")
-            } else {
-                value
-            }
-        };
-        let latest = json!({
-            "tag": tag,
-            "name": name,
-            "notes": notes,
-            "publishedAt": published_at,
-            "pageUrl": page_url,
-            "prerelease": payload.get("prerelease").and_then(Value::as_bool) == Some(true),
-            "asset": pick_installer(payload.get("assets")),
-        });
-        self.lock().latest = Some(latest);
-        Ok(())
     }
 
     /// 组装 check 的响应（对应 buildCheckResult，字段逐个对齐）
@@ -296,11 +183,7 @@ impl UpdateManager {
             .as_ref()
             .and_then(|value| value.get("asset"))
             .filter(|value| {
-                value
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .map(|url| !url.is_empty())
-                    .unwrap_or(false)
+                value.get("url").and_then(Value::as_str).map(|url| !url.is_empty()).unwrap_or(false)
             })
             .cloned();
         let latest_text = |key: &str| -> Value {
@@ -394,11 +277,7 @@ impl UpdateManager {
             .and_then(|mut segments| segments.next_back())
             .unwrap_or("")
             .to_string();
-        let filename = safe_file_name(if name.is_empty() {
-            &fallback_name
-        } else {
-            name
-        });
+        let filename = safe_file_name(if name.is_empty() { &fallback_name } else { name });
         let download_dir = self.download_dir();
         if let Err(error) = std::fs::create_dir_all(&download_dir) {
             return Err(UpdateError::new(format!("创建下载目录失败: {error}")));
@@ -446,9 +325,7 @@ impl UpdateManager {
         file_path: PathBuf,
         cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        let outcome = self
-            .download_stream(&target, &file_path, &cancel_flag)
-            .await;
+        let outcome = self.download_stream(&target, &file_path, &cancel_flag).await;
         let canceled = cancel_flag.load(std::sync::atomic::Ordering::SeqCst);
         let succeeded = matches!(&outcome, Ok(_)) && !canceled;
 
@@ -624,9 +501,7 @@ impl UpdateManager {
             return Ok(received);
         }
         // 磁盘写入完成后再核一次大小，避免「进度 100% 但文件不完整」
-        let size = std::fs::metadata(file_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+        let size = std::fs::metadata(file_path).map(|meta| meta.len()).unwrap_or(0);
         if declared > 0 && size != declared {
             return Err(UpdateError::new(format!(
                 "安装包不完整（期望 {declared} 字节，实际 {size} 字节）"
@@ -658,6 +533,12 @@ async fn wait_cancel(flag: &Arc<std::sync::atomic::AtomicBool>) {
 /// 进程级更新管理器（与 config / logging 同一模式）：
 /// bootstrap 时装入一次，路由层与服务启动路径共用同一实例。
 static GLOBAL: std::sync::OnceLock<UpdateManager> = std::sync::OnceLock::new();
+
+/// 更新检查的排期按仓库隔离，缓存里的版本比较仍使用当前二进制版本。
+pub fn global_check_key() -> String {
+    GLOBAL.get().map(UpdateManager::check_key)
+        .unwrap_or_else(|| format!("updateCheck:{DEFAULT_REPO}"))
+}
 
 /// 初始化进程级管理器（幂等）
 pub fn init_global(manager: UpdateManager) -> UpdateManager {

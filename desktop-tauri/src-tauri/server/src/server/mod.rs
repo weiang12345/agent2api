@@ -323,6 +323,7 @@ impl ServerState {
         // 结果 —— 老用户升级后第一次启动拿到的就是他真正的旧配置，
         // 下面日志裁剪天数与旧文件候选目录才不会用错值。
         let snapshot = config::init(db.clone());
+        core::task_state::install(db.clone());
         // 模型清单的持久化缓存：把**同一个 `Db`** 传进去（与配置 / 日志库 /
         // 账号库同一形态）。各家的远程清单在进程重启后由它读回，不再回落到
         // 内置清单（见 `core::providers::catalog_cache` 的模块头）。

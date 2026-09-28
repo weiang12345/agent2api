@@ -72,6 +72,52 @@ function applyTheme(mode) {
   document.querySelectorAll('#theme-switch button').forEach(item => {
     item.classList.toggle('active', item.dataset.mode === mode);
   });
+  // 通知其它控制面（设置页「显示 → 显示模式」那组档位）：主题有两个入口
+  // （侧边栏三键与设置页），谁改了都要让另一处跟上 —— 事件单向广播，
+  // 两边都不去读对方的状态。detail 是本函数最初收到的 mode 原值。
+  window.dispatchEvent(new CustomEvent('wb:theme', { detail: mode }));
+}
+
+// ─── 界面缩放 ────────────────────────────────
+// 「显示 → 界面缩放」：80%–130%、一档 5%（共 11 档，设置页的下拉就是这份口径）。
+//
+// app.js 是缩放的**唯一应用入口**（与主题同一取向）：设置页只调 wbApp.applyZoom
+// 并听 'wb:zoom' 事件，不自己碰 localStorage、也不直接调桥 —— 缩放要落到
+// WebView 层（壳命令 set_zoom，语义与浏览器 Ctrl +/- 相同），那是页面脚本
+// 之外的事，由这里统一转达。
+const ZOOM_KEY = 'workbuddy-desktop-zoom';
+const ZOOM_MIN = 80;
+const ZOOM_MAX = 130;
+const ZOOM_STEP = 5;
+
+/** 从 localStorage 读一个百分数：缺失 / 空白 / 非数字都算「没设过」，返回 null */
+function readStoredPercent(key) {
+  const text = localStorage.getItem(key);
+  // 空串要单独挡：Number('') 是 0（不是 NaN），不挡就会被当成「0%」一路夹到 80%
+  if (text === null || text.trim() === '') return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** 读上次的缩放（百分数）：越界 / 非档位值 / 读不到一律回落 100（不写回，等下次显式设置） */
+function storedZoom() {
+  const raw = readStoredPercent(ZOOM_KEY);
+  if (raw === null) return 100;
+  const snapped = Math.round(raw / ZOOM_STEP) * ZOOM_STEP;
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, snapped));
+}
+
+function applyZoom(percent) {
+  const raw = Number(percent);
+  if (!Number.isFinite(raw)) return;
+  const value = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(raw / ZOOM_STEP) * ZOOM_STEP));
+  localStorage.setItem(ZOOM_KEY, String(value));
+  // 浏览器直开（网页端）时没有桥：可选链静默跳过 —— 那边的缩放归浏览器自己的
+  // Ctrl +/-，设置页同一项也是禁用状态（见 DisplayPane）。
+  try {
+    window.workbuddyDesktop?.setZoom?.(value / 100);
+  } catch { /* 非桌面环境忽略 */ }
+  window.dispatchEvent(new CustomEvent('wb:zoom', { detail: value }));
 }
 
 // ─── 页面导航 ────────────────────────────────
@@ -188,7 +234,12 @@ function renderTopbarStatus() {
   const mirror = id => {
     const badge = $(id);
     if (!badge || !badge.textContent || badge.textContent === '—') return '';
-    return `<span class="badge ${badge.className.replace('badge', '').trim()}">${esc(badge.textContent)}</span>`;
+    // 语义色优先读 data-tone：徽标可能已是组件库的 Badge，它的 className 是一串
+    // Tailwind 工具类（inline-flex / bg-*-soft …），按「className 去掉 badge」拆修饰
+    // 会拆出一串垃圾类名塞进顶栏。迁到组件库的面板都挂 data-tone（ok / warn / bad，
+    // 无修饰为空串）；还没迁的老徽标没有该属性，回落到原来的 className 拆法。
+    const kind = badge.dataset.tone ?? badge.className.replace('badge', '').trim();
+    return `<span class="badge ${kind}">${esc(badge.textContent)}</span>`;
   };
 
   const views = {
@@ -512,71 +563,12 @@ function syncUpdateBadge() {
 function updateUpdateBadge(info) {
   lastUpdateInfo = info || null;
   syncUpdateBadge();
-  maybeShowUpdateModal(info);
+  // 「检测到更新」弹窗已迁到组件库（见 ui-islands/src/islands/update-panel.tsx）：
+  // 弹与不弹的判定（跳过此次更新的版本号 / 本会话已弹过 / 人已在设置页）与弹窗本体
+  // 都在那边，这里只把结果递过去。app.js 不再持有弹窗 DOM、跳过键与会话守卫 ——
+  // 那套状态若两边各留一份，判定必然漂移（这正是本次迁移要避免的）。
+  window.wbUpdatePanel?.showUpdateModal?.(info);
 }
-
-// ─── 「检测到更新」弹窗 ────────────────────────
-
-/** 「跳过此次更新」记在 localStorage 的键（值 = 跳过的版本号） */
-const UPDATE_SKIP_KEY = 'workbuddy-desktop-update-skip';
-/** 本会话内已弹过提示的版本号：用户选「取消」后，同一版本不再连着弹
- *  （后端的定时检查每 5 分钟就会再次发现它，弹一次/轮是预期节奏） */
-let promptedUpdateVersion = '';
-
-function closeUpdateModal() {
-  $('update-modal')?.classList.remove('open');
-}
-
-/**
- * 检测到新版本时弹出提示弹窗（标题「检测到更新」+ Markdown 更新日志）。
- *
- * 弹与不弹的判定：
- *   - 「跳过此次更新」记的是**版本号**：该版本不再弹，将来更新的版本照常弹；
- *   - 「取消」什么都不记：下一次检测到（定时任务的下一轮）还会再弹；
- *   - 人已经在设置页时不弹 —— 软件更新面板就在眼前，再盖一层弹窗纯属打扰
- *     （与 syncUpdateBadge 的取向一致）。
- */
-function maybeShowUpdateModal(info) {
-  const mask = $('update-modal');
-  if (!mask || !info || info.hasUpdate !== true) return;
-  const latest = String(info.latestVersion || '').trim();
-  if (!latest || wbApp.currentPage === 'settings') return;
-  let skipped = '';
-  try { skipped = localStorage.getItem(UPDATE_SKIP_KEY) || ''; } catch { /* 隐私模式等：当作没跳过 */ }
-  if (latest === skipped || latest === promptedUpdateVersion) return;
-  promptedUpdateVersion = latest;
-
-  $('update-modal-version').textContent = latest;
-  $('update-modal-current').textContent = info.currentVersion || '未知';
-  const notes = String(info.notes || '').trim();
-  $('update-modal-notes').innerHTML = notes
-    ? (window.wbMarkdown?.render?.(notes) || `<p>${esc(notes)}</p>`)
-    : '<p>这个版本没有填写发布说明。</p>';
-  mask.classList.add('open');
-}
-
-$('update-modal-go')?.addEventListener('click', () => {
-  closeUpdateModal();
-  showPage('settings');
-  // 更新面板在设置页的「关于」分类下；设置页自己会按 localStorage 恢复上次
-  // 手点过的分类（比如「数据」），所以跳过去之后要显式切到「关于」。
-  // 只切视图、不写偏好 —— 这是弹窗带来的深链，不该改用户手点的默认分类。
-  window.wbSettingsPanel?.showCategory?.('about');
-  // 跳到设置页后直接把下载跑起来，别让人再点一次「下载并安装」——
-  // 他点「去更新」的意图就是要更新，停在面板上等下一步是多余的。
-  // 用 lastUpdateInfo（弹窗自己那次 checkUpdate 的结果）而不是让面板重查：
-  // 省一次往返，也避免「弹窗说有新版、面板查到没有」的不一致。
-  void window.wbUpdatePanel?.openAndDownload?.(lastUpdateInfo);
-});
-$('update-modal-skip')?.addEventListener('click', () => {
-  try { localStorage.setItem(UPDATE_SKIP_KEY, promptedUpdateVersion); } catch { /* 忽略：下次照常弹 */ }
-  closeUpdateModal();
-});
-$('update-modal-cancel')?.addEventListener('click', closeUpdateModal);
-$('update-modal-close')?.addEventListener('click', closeUpdateModal);
-$('update-modal')?.addEventListener('click', event => {
-  if (event.target === $('update-modal')) closeUpdateModal();
-});
 
 // ─── 渲染：网关 / 模型 / 配置 ──────────────────
 
@@ -744,6 +736,10 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () 
   if ((localStorage.getItem('workbuddy-desktop-theme') || 'system') === 'system') applyTheme('system');
 });
 applyTheme(localStorage.getItem('workbuddy-desktop-theme') || 'system');
+// 界面缩放同样在这里落一次（index.html 的头部内联脚本已按同一份 localStorage
+// 抢先交过一次，见那边的说明）：这里这行是**权威**的一次 —— 头部那次只是
+// 尽力而为的反闪烁，若桥当时还没就绪就会静默失败，由这行补齐。
+applyZoom(storedZoom());
 
 api.onStateChanged(next => {
   if (!next?.accounts && !next?.session && !next?.health) return;
@@ -767,16 +763,17 @@ window.wbApp = {
   syncLogsBadge,
   // 软件更新面板在每次检查结束后回调它，把「有新版本」翻译成导航上的提示
   updateUpdateBadge,
+  // 显示偏好（设置页「显示」分类的两个入口）：主题与缩放都只有这一处实现，
+  // 设置页改完调这里，再靠 'wb:theme' / 'wb:zoom' 事件跟随变化
+  applyTheme,
+  applyZoom,
 };
 
-// ─── 启动自动维护：主进程会拉一次临期 token 刷新 ───
-// 余额不在这里：它归「定时查询积分」那条定时任务（首轮在网关就绪后立刻跑一次，
-// 见 commands.rs 的 startup_maintenance），界面由下面的轮询读快照应用。
-api.onAutoMaintained?.(({ refreshed }) => {
-  const count = Array.isArray(refreshed) ? refreshed.length : 0;
-  if (count) window.wbAccountsView?.render();
-  if (count) toast(`已自动刷新 ${count} 个临期账号的 Token`);
-});
+// ─── 账号的自动维护结果 ───────────────────────
+// 启动时不再由主进程额外拉一次临期凭证：凭证维护是「定时任务」页里的一条后端
+// 任务，排期（含失败冷却）持久化，重启只补跑已经到期的那一轮 —— 见
+// `core::scheduled_tasks`。维护完成后账号页按 20 秒主状态轮询自然跟上，
+// 因此这里不再订阅 `accounts:auto-maintained`（那条事件随启动维护一并删除）。
 
 // ─── 初始化 ───────────────────────────────────
 
@@ -823,18 +820,24 @@ refresh();
 void window.wbPortPanel?.sync?.();
 
 /**
- * 启动即自动检查一次更新：有新版本时在「设置」导航项上给提示。
+ * 启动即把更新状态铺一次：读**后端缓存**里的最近一次检查结果（定时任务按间隔
+ * 查一次并落库，默认 20 分钟），有新版本时在「设置」导航项上给提示。
+ *
+ * 这里**不自己打 GitHub**：dev 模式热重载一天要重载几十次，每次加载都
+ * 查一遍会把匿名限额（60 次/小时，按出口 IP 计）耗光 —— 见底之后连定时任务
+ * 也跟着失败，而本该做的只是等下一个检查窗口。要立刻查有设置页的「检查更新」
+ * 按钮。
  *
  * 放在 DOMContentLoaded 里而不是直接调用：app.js 在 index.html 里排得比
  * update-panel.js 靠前，脚本执行到这里时 window.wbUpdatePanel 还没挂上，
  * 直接调会静默什么都不做；DOMContentLoaded 在所有同步脚本执行完之后触发，
- * 那时面板已经就位。不 await（void 触发）—— 这是网络请求，首屏不该等它；
- * 失败静默（面板里留一条失败记录，导航提示不显示）。
+ * 那时面板已经就位。不 await（void 触发）—— 首屏不该等它；失败静默
+ * （面板按「未检查」显示，导航提示不亮）。
  *
- * 面板的 load() 只读下载进度、不查版本，所以这里这一下不会和它重复请求。
+ * 面板的 load() 同样只读缓存，所以这里这一下不会和它重复请求。
  */
 document.addEventListener('DOMContentLoaded', () => {
-  void window.wbUpdatePanel?.check?.();
+  void window.wbUpdatePanel?.syncFromCache?.();
   // 数据结构升级：这次更新把数据存储换成了单个 SQLite 库，启动时后端只探测
   // 「还有没有旧文件没搬进库」，有待迁移就直接导入（**不弹窗** —— 升级没有
   // 选项也不能取消，弹窗只是多余的一道坎）。同样放 DOMContentLoaded：
@@ -862,18 +865,35 @@ setInterval(() => {
   void window.wbAccountsView?.syncBalancesSnapshot?.();
 }, 20_000);
 
-// 定时「软件版本检查」的结果轮询（1 分钟）。
+// 「软件版本检查」结果的轮询：读**后端缓存**，不自己打 GitHub。
 //
-// 真正的检查在**后端定时任务**里跑（定时任务页的「软件版本检查」，默认 5 分钟
-// 一次，结果缓存于 UpdateManager）；这里只是低频读一次缓存来亮/灭侧栏徽标，
-// 不自己打 GitHub —— 匿名限额 60 次/小时，双端各查一遍就贴顶了。
-// hasUpdate 为 null（无法比较）或 false 时 syncUpdateBadge 自会不亮标；
-// 读到 checked:false（本进程还没查过）不覆盖 lastUpdateInfo ——
-// 启动那次壳命令检查的结果仍是最准的一份。
-setInterval(() => {
-  if (document.hidden) return;
+// 真正的检查在后端定时任务里跑（定时任务页的「软件版本检查」，默认每 20 分钟一次，
+// 排期与结果都持久化在库里）；这里只是读一次缓存来亮/灭侧栏徽标与弹更新弹窗 ——
+// 匿名限额 60 次/小时且**按出口 IP 计**，前端再自己查一遍就是白白多花一份额度。
+//
+// ── 为什么是自适应节奏而不是固定 1 分钟 ──────────────────────
+// 首屏可能正好落在「后端刚起、定时任务那一轮还在跑」的窗口里：这时缓存还没有
+// 结果（checked:false），固定 1 分钟会让用户盯着「未检查」等满一分钟 —— 而改造
+// 前前端自己查，结果是立刻出来的。所以没有结果时加密到 5 秒一次，拿到结果
+// （或等满 2 分钟仍没有，例如用户关掉了这条任务）就回到常态的 1 分钟。
+// 用 setTimeout 自排期而不是 setInterval：节奏要变，固定间隔做不到。
+let updatePollDelay = 5_000;
+const updatePollStartedAt = Date.now();
+
+function pollUpdateStatus() {
+  const settle = () => { setTimeout(pollUpdateStatus, updatePollDelay); };
+  if (document.hidden) { settle(); return; }
   void api.getUpdateStatus?.().then(info => {
-    if (!info || info.checked === false) return;
-    wbApp.updateUpdateBadge(info);
-  }).catch(() => { /* 静默：下一次轮询自然重试 */ });
-}, 60_000);
+    if (info && info.checked !== false) {
+      // 有结果了（含「已是最新」）：回到常态节奏，徽标/弹窗由同一出口处理
+      updatePollDelay = 60_000;
+      wbApp.updateUpdateBadge(info);
+      return;
+    }
+    if (Date.now() - updatePollStartedAt > 120_000) updatePollDelay = 60_000;
+  }).catch(() => {
+    // 静默：下一次轮询自然重试
+  }).finally(settle);
+}
+
+setTimeout(pollUpdateStatus, updatePollDelay);

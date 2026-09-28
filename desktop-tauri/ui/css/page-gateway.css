@@ -59,10 +59,6 @@
   font-weight: 600;
   letter-spacing: .04em;
 }
-
-/* ─── 模型管理 ─── */
-.models-count { color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
-
 /* 工具栏：提供商分段 + 状态分段 + 搜索，排成一行。
    它挂在 .panel-body 上（那条规则是 flex 纵向），这里必须显式改回横向，
    否则三个控件会各占一行并居中 */
@@ -79,53 +75,21 @@
 #models-search { flex: 0 0 auto; width: 240px; }
 
 /* 刷新说明与逐家结果：常驻在表格下方，不随 toast 消失；有失败才标红 */
-/* ─── 「获取模型」弹窗（models-fetch-modal.js）───
-   形态对照 OmniProxy 的 ModelDiscoveryModal：上面一行工具（汇总 / 搜索 / 选择 /
-   获取），中间一张表，底部导入。表格沿用 .models-table（与模型管理页同一张脸的
-   列宽与字号），这里只补列宽与表格区的高度上限。
-   工具行的左右分工：**汇总在左、动作在右**（获取模型是最右那颗）—— 用户扫一眼
-   左边就知道这次的结果（N 家 · 成功 X · 失败 Y），右边的按钮才是下一个动作。 */
-.fm-tools { align-items: center; }
-.fm-search { flex: 0 0 auto; width: 240px; }
-.fm-wrap { max-height: min(48vh, 460px); }
-/* 列宽写在 <col> 上（合计 100%，table-layout: fixed 下按 colgroup 分配）——
-   与模型管理页同一口径：没拖过的列走这里的百分数，拖过的列由 table-columns.js
-   写 col 的 inline width 覆盖（th 上不能写宽度，它会盖过 col，拖动就失效）。
-   百分数按弹窗实际表宽折算：内置家约 872px（920 减内边距）、三列形态约 504px。
+/* ─── 「获取模型」弹窗的样式已随迁移移除 ───────────────
+   弹窗迁到组件库后（ui-islands/src/islands/models-fetch-modal.tsx），这里原先那套
+   .fm-tools / .fm-search / .fm-wrap / #fm-table-* .f-* 列宽 / .fm-table .detail /
+   .modal-narrow 全部失去消费者，一并删除。搬走的口径（都是逐字照抄的，改之前先读
+   岛里对应的注释）：
 
-   六列怎么分（每格还要减去 td 的左右 14px padding）：更新日期 19%（约 166px，
-   减 padding 后 138px）装下 `formatTime` 的完整输出（等宽 11.5px 下
-   2026/9/25 14:03:11 约 131px）—— 只给「日期」会在同一天的两次刷新之间
-   分不出先后，而这个弹窗的用处之一正是看清单有多旧；模型来源 25% 不动（那列
-   的下限由邮箱长度定，见下）；说明 24%（约 209px）比最长的那句「远程目录已
-   更新，「来源」列会显示为「远程」」窄一点，它会折成两行 —— `.detail` 的行高
-   就是为多行设的，折行比截断好，且只有「已刷新」的行吃这句长文案。差额由
-   提供商 / 状态 / 模型数三列各让一点：它们装的是短词（提供商名 / 两字徽章 /
-   「9 个」），让完仍够。 */
-#fm-table-intl .f-provider { width: 15%; }
-/* 模型来源 25%：这一格的展示名以邮箱为主（emailAsName 的家，见 models-fetch-modal
-   的 accountLabel），典型邮箱约 22 字符（如 oyl70969337@gmail.com ≈ 139px）——
-   22% 会把触发器上的文本截掉，25% 刚好装下；宽度从最宽的说明列借 */
-#fm-table-intl .f-source { width: 25%; }
-#fm-table-intl .f-state { width: 10%; }
-#fm-table-intl .f-count { width: 7%; }
-#fm-table-intl .f-note { width: 24%; }
-#fm-table-intl .f-updated { width: 19%; }
-/* 自定义家的窄形态（三列）：勾选 40px ≈ 8%、状态 92px ≈ 18%、上游模型吃剩余 */
-#fm-table-custom .f-pick { width: 8%; }
-#fm-table-custom .f-model { width: 74%; }
-#fm-table-custom .f-state { width: 18%; }
-/* 「模型来源」列：一格一个账号下拉（宽度交给原生 select 当锚，外壳自动跟随）。
-   外壳还须显式撑满单元格：inline-flex 的 shrink-to-fit 会把外壳收到「最长选项的
-   自然宽」，长文本（邮箱）时比单元格窄出右箭头那一档，触发器里的文本反而先被
-   截断；width:100% 让外壳与单元格同宽，文本区直接按单元格宽度算 */
-.fm-table .fm-source .select-shell { width: 100%; }
-.fm-table .fm-source select { width: 100%; }
-/* 自定义提供商的窄形态：表只有「勾选 / 上游模型 / 状态」三列，用 920px 的宽表
-   右半全是空白 —— 宽度收到 60%（920 × 0.6 ≈ 552px），与内置家那张宽表区分开 */
-.modal-narrow { width: min(552px, 100%); }
-/* 内置家那张结果表里「说明」列的小字：与表格其它列同基线，不抢主信息 */
-.fm-table .detail { color: var(--text-3); font-size: 11.5px; line-height: 1.5; }
+   · 列宽百分数：从「按 id 写的 CSS」搬到岛里 `<col>` 的 Tailwind 类上（列宽层
+     table-columns.js 仍按表 id + col 的 data-col 定位，所以表 id 保留了）；
+     六列 15/25/10/7/24/19、三列 8/74/18 —— 「更新日期」要给足 19% 才装得下完整
+     时间戳（只给日期会在同一天两次刷新间分不出先后），「模型来源」25% 由邮箱长度
+     定（emailAsName 的家以邮箱为主名）。
+   · 滚动盒高度上限 min(48vh, 460px)、工具行「汇总在左、动作在右」的分工、
+     窄形态 552px / 宽形态 920px：都改由岛里的 Tailwind 类表达。
+   · 「模型来源」下拉：旧实现靠原生 select 当宽度锚（.select-shell 撑满单元格），
+     新实现直接用组件库的 Select，宽度由单元格自己管。 */
 
 /* 表格（模型管理 / 网关 Key 共用）：贴面板左右边缘，表头粘顶。
    overflow-anchor 同 .page.active：tbody 重建时不做锚定补偿，行内点开关视口不动 */
@@ -141,11 +105,15 @@
   font-size: 12.5px;
 }
 
+/* 单元格内边距统一 8px（上下左右同值）：列宽本来就紧（七列分 100%），
+   14px 会从每列吃掉 12px 的内容宽度。表头与表体用同一档，两者才对得齐；
+   列宽拖动（table-columns.js）的可用宽度从 computed style 现读 padding，
+   跟着这条生效，不需要另改。 */
 .models-table thead th {
   position: sticky;
   top: 0;
   z-index: 2;
-  padding: 8px 14px;
+  padding: 8px;
   border-bottom: 1px solid var(--border);
   background: var(--table-head-bg);
   color: var(--text-3);
@@ -156,17 +124,22 @@
   white-space: nowrap;
 }
 
-.models-table td { padding: 8px 14px; border-bottom: 1px solid var(--hairline); vertical-align: middle; }
+.models-table td { padding: 8px; border-bottom: 1px solid var(--hairline); vertical-align: middle; }
 .models-table tbody tr:last-child td { border-bottom: 0; }
 .models-table tbody tr:hover td { background: var(--row-hover); }
 .models-table th.r, .models-table td.r { text-align: right; }
-.models-table td.empty { padding: 26px 14px; text-align: center; color: var(--text-3); }
+.models-table td.empty { padding: 26px 8px; text-align: center; color: var(--text-3); }
 
 /* 列宽（合计 100%，table-layout: fixed 下按 colgroup 分配） */
-.models-table .c-model { width: 25%; }
-.models-table .c-rate { width: 7%; }
-.models-table .c-source { width: 8%; }
-.models-table .c-alias { width: 48%; }
+.models-table .c-model { width: 22%; }
+.models-table .c-rate { width: 6%; }
+.models-table .c-source { width: 7%; }
+/* 能力位两列：数值一格（上下文 / 最大输出）、三枚布尔徽章一格。
+   并入映射列的宽度从这里来 —— 五列会把它挤到装不下 chips（见 models-page
+   文件头的列数取舍） */
+.models-table .c-budget { width: 11%; }
+.models-table .c-caps { width: 13%; }
+.models-table .c-alias { width: 29%; }
 .models-table .c-act { width: 12%; }
 .keys-table .k-name { width: 22%; }
 .keys-table .k-key { width: 44%; }
@@ -181,7 +154,7 @@
 /* 提供商分组行：表内的一条分组带。取 --surface-2，只比表体差一档 ——
    它仍是「表里的一行」，不该用卡内凹槽那档深色（那会把表切成几块）。 */
 .models-table .tr-group td {
-  padding: 5px 14px;
+  padding: 5px 8px;
   background: var(--surface-2);
   color: var(--text-2);
   font-size: 11.5px;
@@ -197,27 +170,91 @@
   background: var(--surface);
   font-weight: 700;
 }
-.models-table .tr-more td { padding: 4px 14px; text-align: center; }
+.models-table .tr-more td { padding: 4px 8px; text-align: center; }
 
-/* 模型 id：等宽加粗，悬浮出复制按钮 */
+/* 模型 id：等宽加粗。名字本身就是复制入口（上游模型列与映射别名 chip 的
+   `.t` 都带 data-copy，点击走 clipboard.js 的全局委托）—— 曾经另挂一颗
+   悬浮才显形的 ⧉ 按钮（.mid .cp），已去掉：点名字更省事，也少一个控件。
+   可点样式只给带 data-copy 的名字：`.mid .t` 是模型管理 / 网关 Key 两页
+   共用的，Key 页的名字不可复制，别把指针样式串过去。 */
 .mid { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .mid .t { font-family: var(--font-mono); font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .keys-table .mid .t { font-family: var(--font-sans); }
-.mid .cp {
-  flex: 0 0 auto;
-  opacity: 0;
-  height: 20px;
-  padding: 0 4px;
-  border: 0;
-  background: transparent;
-  box-shadow: none;
-  color: var(--text-3);
-  font-size: 12px;
+.models-table .mid .t[data-copy],
+.models-table .alias .t[data-copy] { cursor: pointer; }
+.models-table .mid .t[data-copy]:hover,
+.models-table .alias .t[data-copy]:hover {
+  color: var(--text);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
 }
-.models-table tr:hover .mid .cp { opacity: 1; }
-.mid .cp:hover:not(:disabled) { background: var(--surface-3); color: var(--text); }
+/* 点击瞬间压淡一下：复制没有可见的落点（toast 之外），这一下是「点到了」的凭据 */
+.models-table .mid .t[data-copy]:active,
+.models-table .alias .t[data-copy]:active { opacity: .55; }
 .mname { color: var(--text-3); font-size: 11.5px; }
 .rate { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+
+/* ── 能力位两列（「上下文 / 输出」与「能力」）─────────────────────────
+   cell 内容是一个按钮：点开「模型能力」弹窗。两列的入口语义相同（能力是一个
+   整体，没必要各开一个弹窗），所以共用 .caps-open 外壳 —— 无样式按钮、hover
+   给一层浅底、focus 有圈（键盘可达）。数值与徽章的三态样式只定义在这里；
+   弹窗里用的是组件库控件，不复用这一套。
+
+   负外边距 4px：hover 底比内容外扩一圈，又不会顶到列边界上（td 左右 8px 的
+   内边距减掉 4px 外扩，还剩 4px 呼吸）。 */
+.caps-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin: -3px -4px;
+  padding: 3px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  box-shadow: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.caps-open:hover { background: var(--surface-2); }
+.caps-open:focus-visible { outline: 2px solid var(--primary); outline-offset: -1px; }
+
+/* 数值格：上下文 / 最大输出（等宽、按位数对齐，两行的两个数能上下比） */
+.cap-num {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+/* 未声明：压淡而不是换成文字 —— 与「明确声明了 0 / 不支持」一眼可分 */
+.cap-num.unset { color: var(--text-3); opacity: .6; }
+.cap-sep { color: var(--text-3); font-size: 11px; }
+
+/* 三枚布尔徽章：支持 = 品牌淡底实心；不支持 = 描边压淡；未声明 = 虚线。
+   窄窗口下列宽会被压小，允许换行 —— 不换行只会让第三枚压到映射列上 */
+.caps-open.caps-badges { gap: 4px; flex-wrap: wrap; }
+.cap-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  font-size: 10.5px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.cap-badge.on { border-color: var(--primary-bd); background: var(--primary-soft); color: var(--primary-fg); font-weight: 600; }
+.cap-badge.off { border-color: var(--border); color: var(--text-3); }
+.cap-badge.unset { border-style: dashed; border-color: var(--border-strong); color: var(--text-3); opacity: .8; }
+
+/* 覆盖标记：被用户改过的那一项挂一枚小点（title 说明「已覆盖上游值」） */
+.cap-mark { flex: 0 0 auto; display: block; width: 4px; height: 4px; border-radius: 50%; background: var(--primary); }
 
 /* 映射名药丸：品牌色浅底；行禁用时随行压淡并加删除线。
    纵向排列（每条绑定独占一行，参照账号页模型管理弹窗）——映射一多条，
@@ -254,9 +291,7 @@
 .binding-default { flex: 0 0 auto; padding: 0 4px; border: 1px solid var(--border); border-radius: var(--r-xs); background: var(--surface); color: var(--text-3); font-family: var(--font-sans); font-size: 10px; font-weight: 500; }
 .alias .switch { flex: 0 0 auto; }
 .alias .alias-level, .alias .x { flex: 0 0 auto; }
-#custom-models-modal .binding-reasoning { width: 110px; flex: 0 0 110px; }
-#custom-models-modal .binding-add { display: flex; align-items: center; gap: 5px; margin-top: 4px; }
-#custom-models-modal .binding-add input { width: 150px; }
+
 /* chip 内的小号开关：复用 .switch 的结构与交互（components.css），只在这里
    收尺寸 —— 药丸高 22px，滑块压到 24×14 才放得下；滑块位移同步缩放 */
 .alias .switch { gap: 0; margin-right: 2px; }
@@ -277,86 +312,10 @@
   line-height: 1;
 }
 .alias .x:hover:not(:disabled) { opacity: 1; background: color-mix(in srgb, var(--text) 10%, transparent); color: inherit; border-color: transparent; }
-
-/* 思考等级标：贴在映射名药丸里的第二枚小按钮（`alias · high`）。
-   为什么是「药丸里的一枚按钮」而不是再加一枚独立的药丸：等级是**这条映射的属性**，
-   和对外名是同一件事的两个字段，放进同一枚药丸才读得出从属关系；
-   独立药丸会让一屏里出现两倍数量的 chip，哪个是名字哪个是等级要靠猜。
-   未绑定时（孤儿映射那组用）走虚线，与「已绑定」一眼分开。 */
-.alias .alias-level {
-  height: 16px;
-  padding: 0 5px;
-  border: 1px solid transparent;
-  border-radius: var(--r-pill);
-  background: color-mix(in srgb, var(--primary-fg) 12%, transparent);
-  box-shadow: none;
-  color: inherit;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  letter-spacing: .02em;
-}
-.alias .alias-level:hover:not(:disabled) {
-  border-color: var(--primary-bd);
-  background: var(--surface);
-  color: var(--primary-fg);
-}
-.alias .alias-level.unset {
-  background: transparent;
-  border: 1px dashed var(--border-strong);
-  color: var(--text-3);
-  font-weight: 600;
-}
-.alias .alias-level.unset:hover:not(:disabled) { border-style: solid; color: var(--primary-fg); }
-
-/* 弹窗里的思考等级控件行：下拉 + 问号并排（问号的说明很长，放在下拉右边
-   与设置页各面板标题的问号是同一个组件，见 css/tooltip.css）。 */
-.reasoning-pick { display: flex; align-items: center; gap: 7px; }
-.reasoning-pick select { flex: 1 1 auto; min-width: 0; }
-
-.alias-add {
-  height: 22px;
-  padding: 0 8px;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--r-pill);
-  background: transparent;
-  box-shadow: none;
-  color: var(--text-3);
-  font-size: 11px;
-}
-.alias-add:hover:not(:disabled) { border-color: var(--primary); background: transparent; color: var(--primary-fg); }
-
 /* 行内操作：默认略淡，悬浮行时恢复 */
 .row-actions { display: flex; gap: 4px; justify-content: flex-end; }
 .row-actions button { opacity: .75; }
 .models-table tr:hover .row-actions button { opacity: 1; }
-button.danger-text { color: var(--danger); }
-button.danger-text:hover:not(:disabled) { background: var(--danger-soft); color: var(--danger); }
-
-/* 映射弹窗：左右两栏 + 箭头 + 预览 */
-.mapping-row { display: grid; grid-template-columns: 1fr 24px 1fr; gap: 10px; align-items: end; }
-/* 单列行（提供商）：只占左栏，与下面两栏行的左半对齐；右栏留空不塌 */
-.mapping-row-single { grid-template-columns: 1fr 24px 1fr; }
-.mapping-row-single .mapping-col { grid-column: 1; }
-.mapping-col { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
-.mapping-col label { font-size: 12px; color: var(--text-2); font-weight: 600; }
-.mapping-col input, .mapping-col select { width: 100%; }
-/* 下拉被增强后原生 select 留壳里当尺寸锚，外壳就是可见控件 —— 宽度规则要落在壳上，
-   否则「上游模型」列里 select（外壳撑满）会与同行的 input 一宽一窄 */
-.mapping-col .select-shell { width: 100%; }
-.mapping-arrow { text-align: center; color: var(--text-3); padding-bottom: 8px; }
-.mapping-preview {
-  margin-top: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface-inset);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-2);
-}
-.mapping-preview b { color: var(--primary-fg); }
 
 /* 网关 Key 页：key 单元格 */
 .keycell { display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -509,7 +468,7 @@ button.danger-text:hover:not(:disabled) { background: var(--danger-soft); color:
   border-color: var(--nav-selected-border);
   font-weight: 600;
 }
-.pv .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 .pv .n { flex: 0 0 auto; color: var(--sidebar-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .pv.on .n { color: inherit; }
 
@@ -555,28 +514,6 @@ button.danger-text:hover:not(:disabled) { background: var(--danger-soft); color:
   background: var(--nav-hover);
   border-color: transparent;
 }
-
-/* 「＋ 新建自定义提供商」：虚线框，与上面那些「选一家」的实心项区分开 ——
-   它是动作，不是选项；配色仍走侧边栏那一套 */
-.pv-add {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  margin-top: 2px;
-  padding: 8px 10px;
-  border: 1px dashed var(--sidebar-border);
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--sidebar-muted);
-  font-size: 12px;
-  text-align: left;
-}
-.pv-add:hover {
-  border-color: var(--nav-selected-border);
-  background: var(--nav-hover);
-  color: var(--nav-selected-fg);
-}
-
 /* 窄窗口（约 900px 以下）改成上下堆叠：左栏在上一行，横向铺满、自己滚 */
 @media (max-width: 900px) {
   /* 窄窗口改成上下两行：左栏一行（自己的高度上限），表格区吃掉剩下的 */

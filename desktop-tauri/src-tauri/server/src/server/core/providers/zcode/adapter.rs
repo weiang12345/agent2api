@@ -89,6 +89,19 @@ impl ProviderAdapter for ZcodeAdapter {
     /// body **原样透传**：上游就是 OpenAI 协议，本家没有任何要改写的字段
     /// （不做模型改名、不注入思考等级 —— 后者靠 `reasoning_patch` 的默认
     /// `Skip`，那是「没证据就不注入」的正确默认）。
+    ///
+    /// ── 为什么要带一整套「客户端身份头」───────────────────────
+    /// 编码套餐的入口是**给官方客户端用的**，上游按客户端形态识别请求
+    /// （参考实现的 `buildLlmIdentityHeaders` 逐字复刻 bundle 的 `g6n`）。
+    /// 只发一个光秃秃的 `Authorization` 也能过鉴权，但上游一旦按形态限流或
+    /// 灰度，缺头就是难查的失败 —— 而这一套头是免费的。取值能对上的对上、
+    /// 对不上的用参考实现自己的兜底（`unknown`）。
+    ///
+    /// 两处**故意**与参考不同（别当成漏抄）：
+    ///   · 不发 `X-Os-Version`：参考实现取 `os.release()`，Rust 侧要为此引一个
+    ///     系统信息 crate；它是可选头，参考实现取不到时同样省略；
+    ///   · 不发 `X-Device-Mid`：参考实现明确注明推理路径**从不**发它
+    ///     （那是领取路径的活动期要求，见 `claim.rs`）。
     fn build_chat_request(
         &self,
         account: &Value,
@@ -105,14 +118,15 @@ impl ProviderAdapter for ZcodeAdapter {
         if token.is_empty() {
             return Err(GatewayError::with_status(
                 401,
-                "ZCode 账号缺少 accessToken，无法转发",
+                "ZCode 账号缺少推理凭证，请重新登录",
             ));
         }
-        let headers: Vec<(String, String)> = vec![
+        let mut headers: Vec<(String, String)> = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             ("Accept".to_string(), "*/*".to_string()),
             ("Authorization".to_string(), format!("Bearer {token}")),
         ];
+        headers.extend(identity_headers());
         Ok(ChatRequestPlan {
             url: format!("{}/chat/completions", self.openai_base_url()),
             headers,
@@ -236,5 +250,50 @@ fn session_access_token(
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| GatewayError::with_status(401, "ZCode 账号缺少 accessToken，请重新登录"))
+        .ok_or_else(|| GatewayError::with_status(401, "ZCode 账号缺少推理凭证，请重新登录"))
+}
+
+/// 推理请求上的「客户端身份头」（参考实现 `buildLlmIdentityHeaders` 的移植）。
+///
+/// 取值口径与那边逐条对齐，`unknown` 是**上游文档化的兜底值**（参考实现自己也
+/// 在拿不到语言/时区时发它）：
+///   - `User-Agent` / `X-ZCode-App-Version` 用 `claim::app_version()`
+///     （`ZCODE_APP_VERSION` 可覆盖，默认 ZCode 客户端版本）；
+///   - `X-Platform` 用 `claim::platform()`（`win32-x64` 这类「平台-架构」）；
+///   - `X-Title` 的 `@cli` 后缀对应参考实现的 `identity.sourceTitle` 默认值。
+///
+/// `X-Os-Category` 由编译期平台给出（与 `claim::platform()` 同源口径），
+/// 不引系统信息 crate —— 理由见 `build_chat_request` 的注释。
+fn identity_headers() -> Vec<(String, String)> {
+    let version = super::claim::app_version();
+    vec![
+        (
+            "HTTP-Referer".to_string(),
+            "https://zcode.z.ai".to_string(),
+        ),
+        ("User-Agent".to_string(), format!("ZCode/{version}")),
+        ("X-ZCode-App-Version".to_string(), version),
+        ("X-Title".to_string(), "Z Code@cli".to_string()),
+        ("X-Release-Channel".to_string(), "production".to_string()),
+        ("X-Client-Language".to_string(), "unknown".to_string()),
+        ("X-Client-Timezone".to_string(), "unknown".to_string()),
+        ("X-ZCode-Agent".to_string(), "glm".to_string()),
+        (
+            "X-Platform".to_string(),
+            super::claim::platform().to_string(),
+        ),
+        ("X-Os-Category".to_string(), os_category().to_string()),
+    ]
+}
+
+/// `X-Os-Category` 的取值（参考实现 `normalizeOsCategory`：macos / windows /
+/// linux，认不出的落 linux —— 与那边 `default` 分支同义）。
+fn os_category() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
 }

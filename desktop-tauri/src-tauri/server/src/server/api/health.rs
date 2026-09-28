@@ -45,7 +45,7 @@ pub async fn handle(State(state): State<ServerState>) -> Response {
     }
     let snapshot = config::current();
     let summary = state.auth().get_config_summary();
-    let status = state.auth().get_status().await;
+    let status = state.auth().get_status();
     let healthy = summary
         .get("configured")
         .and_then(Value::as_bool)

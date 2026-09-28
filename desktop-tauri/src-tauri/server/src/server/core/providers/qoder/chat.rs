@@ -37,8 +37,10 @@ use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
+use super::context;
 use super::cosy::{self, CosyIdentity};
 use super::credentials::Credentials;
+use super::errors;
 use super::protocol;
 use super::stream;
 
@@ -54,6 +56,81 @@ pub struct ChatPlan {
     pub upstream_key: String,
     /// 是否要下发思考内容（决定要不要启用标签拆解器）
     pub thinking: bool,
+}
+
+/// 上游排队态（业务码 10605：「模型请求排队中」）。
+///
+/// ── 为什么它是「可重试」而不是「错误」─────────────────────────
+/// 上游对免费模型（`qfmodel` = Qwen3.8-Flash）走排队制：空闲时几秒内直接出字，
+/// 繁忙时用 403 + 10605 回一句「暂不可服务，建议 N 秒后再来」。官方 CLI 的
+/// 处理是**等一会儿再发同一请求**（其二进制里有 `queuePollCount` /
+/// `queueRecoveryAttempt` 这类计数），参考实现（CLIProxyAPI 的 qoder2api 插件、
+/// 9router 的队列增强分支）同样按上游建议时长退避重试。因此这里把排队态单独
+/// 建模：调用方拿它睡一觉重发，而不是当成「登录态失效」把用户引去重新登录。
+pub struct Queued {
+    /// 上游建议的重试间隔（毫秒，已带缺省与钳制）
+    pub retry_after_ms: u64,
+    /// 面向客户端的说明（等待预算用尽时作为错误文案）
+    pub message: String,
+    /// 上游原文（截断；进日志与最终错误体，便于排障）
+    pub raw: String,
+    /// 排障信息（`queueType` / `queueCount` / 服务可用性），日志用
+    pub detail: String,
+}
+
+/// 一次上游往返的失败。
+///
+/// 排队与其它错误的**唯一**区别是「还能再试」：`Queued` 交给退避循环，
+/// `Fatal` 原样交回编排层。把这条区别做成类型而不是「看状态码猜」，
+/// 是因为排队态的状态码（403 → 曾经映射 401）会同时骗过刷新凭证与换账号
+/// 两条动作 —— 那种错误没有任何日志会提示。
+pub enum AttemptError {
+    Queued(Queued),
+    /// 鉴权失败（HTTP 401 / 业务码 105）：**可以强制续期凭证后同账号重试一次**。
+    ///
+    /// 与 `Fatal` 分开的理由与排队态同源：这一档要触发一个动作（续期），
+    /// 而动作只在「首帧之前」可行 —— 流已经开始下发时它退化成 `Fatal`
+    /// （见 `into_gateway`）。
+    Auth(GatewayError),
+    Fatal(GatewayError),
+}
+
+impl AttemptError {
+    /// 落定成客户端可见的错误（等待预算用尽 / 流已开始 / 续期已试过一次时）。
+    pub fn into_gateway(self) -> GatewayError {
+        match self {
+            Self::Fatal(error) | Self::Auth(error) => error,
+            Self::Queued(queued) => queued_error(&queued, 0),
+        }
+    }
+}
+
+/// 排队态落定：**503** + 一句「不是登录态或额度问题」。
+///
+/// 状态码不能是 401 / 429：那两档在编排层与本项目内部都带动作（刷新凭证 /
+/// 落账号限额冷却），排队既不是凭证问题也不是账号问题 —— 换账号也一样在排队。
+/// 与参考实现（qoder2api 插件的 `qoder_model_busy`）取同一档。
+pub fn queued_error(queued: &Queued, waited_ms: u64) -> GatewayError {
+    let detail: String = queued.raw.chars().take(300).collect();
+    let waited = if waited_ms >= 1000 { waited_ms / 1000 } else { 0 };
+    let waited_note = if waited > 0 {
+        format!("（已按上游建议等待 {waited} 秒仍不可服务）")
+    } else {
+        String::new()
+    };
+    GatewayError::with_status(503, format!("{}{waited_note}（上游原文：{detail}）", queued.message))
+        .with_code("qoder_model_busy")
+}
+
+/// 单次排队等待的时长（毫秒）：跟随上游建议，缺省 15 秒，钳在 5～30 秒。
+///
+/// 上限 30 秒与实测的建议值区间（9～30 秒）同档：等得比上游建议更久没有意义，
+/// 只会把客户端的首字等待拖长。
+pub fn queue_wait_ms(retry_after_secs: Option<u64>) -> u64 {
+    const MIN_SECS: u64 = 5;
+    const MAX_SECS: u64 = 30;
+    const FALLBACK_SECS: u64 = 15;
+    retry_after_secs.unwrap_or(FALLBACK_SECS).clamp(MIN_SECS, MAX_SECS) * 1000
 }
 
 /// 客户端请求体 → 一次上游调用的完整计划。
@@ -131,7 +208,7 @@ pub fn build_plan(
         .and_then(Value::as_str)
         .or_else(|| body.get("session_id").and_then(Value::as_str));
 
-    let upstream_body = protocol::build_upstream_body(
+    let mut upstream_body = protocol::build_upstream_body(
         &upstream_key,
         &model_config,
         &final_messages,
@@ -142,12 +219,22 @@ pub fn build_plan(
         session_seed,
     );
 
+    // ── 上下文档位：装了才升级 ────────────────────────────────
+    // 上游每个模型有多档上下文窗口（200K / 400K / 1M），默认只启用其中一档
+    // （见 `context.rs`）。prompt 超过当前档时升到「最小的够用档」—— 多数请求
+    // 不触发（`resolve` 返回 None），那时的请求体与改造前逐字相同。
+    if let Some(tier) = context::resolve(&model_config, &final_messages, tools.as_ref()) {
+        logging::verbose("[Qoder]", &format!("上下文升档 → {}", context::describe(&tier)));
+        context::apply(&mut upstream_body, &tier);
+    }
+
     // ── 编码 → 签名（顺序不能颠倒，理由见模块头）────────────────
     let encoded = cosy::encode_body(upstream_body.to_string().as_bytes());
     let url = format!(
         "{}algo/api/v2/service/pro/sse/agent_chat_generation\
          ?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
-        credentials.region.gateway()
+        // 对话链路按令牌前缀选主机（作业令牌 jt- 走 api2，见 `inference_base`）
+        credentials.region.inference_base(&credentials.access_token)
     );
     let identity = CosyIdentity {
         user_id: &credentials.user_id,
@@ -161,9 +248,16 @@ pub fn build_plan(
     headers.push(("Accept".to_string(), "text/event-stream".to_string()));
     headers.push(("Cache-Control".to_string(), "no-cache".to_string()));
     headers.push(("Accept-Encoding".to_string(), "identity".to_string()));
-    // 上游靠这两个头做模型路由与来源标记
+    // 上游靠这两个头做模型路由与来源标记。来源取目录条目自己的 `source`
+    // （兜底 "system"）：写死会让 BYOK 一类的条目在国际版上被标错来源。
+    let model_source = model_config
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("system")
+        .to_string();
     headers.push(("X-Model-Key".to_string(), upstream_key.clone()));
-    headers.push(("X-Model-Source".to_string(), "system".to_string()));
+    headers.push(("X-Model-Source".to_string(), model_source));
 
     Ok(ChatPlan {
         url,
@@ -225,7 +319,7 @@ pub async fn send(
     }
 }
 
-/// 把**失败**的上游响应转成客户端可用的错误。
+/// 把**失败**的上游响应转成「排队态或定论错误」。
 ///
 /// ── 为什么返回裸错误而不是 `Option`（调用方已经判过状态了）────────
 /// 成功响应是**流式**的：`response.text()` 会把整条 SSE 拉完并丢掉流句柄，
@@ -235,9 +329,12 @@ pub async fn send(
 /// 那是**不可达但类型上成立**的分支，只能靠调用方 `unwrap` 才能消掉，
 /// 而 release 是 panic=abort，不能 unwrap。返回裸错误即让类型如实反映契约：
 /// 「调用我 = 我已经不成功」。
-pub async fn http_error(status: u16, response: reqwest::Response) -> GatewayError {
+pub async fn http_error(status: u16, response: reqwest::Response) -> AttemptError {
     let text = response.text().await.unwrap_or_default();
-    let classified = protocol::classify_upstream_error(status, &text);
+    let classified = errors::classify_upstream_error(status, &text);
+    if classified.kind == errors::UpstreamKind::Queued {
+        return AttemptError::Queued(queued_of(&classified, &text));
+    }
     let detail: String = text.chars().take(300).collect();
     let message = if classified.message.is_empty() {
         format!("上游返回 {status}: {detail}")
@@ -252,13 +349,42 @@ pub async fn http_error(status: u16, response: reqwest::Response) -> GatewayErro
             classified.message
         )
     };
-    // 额度/限流用 429、鉴权用 401：编排层按这两档决定「换账号」与「刷新后重试」
+    // 额度/限流用 429、鉴权用 401：编排层按这两档决定「换账号」与「刷新后重试」。
+    // 裸 403（Forbidden）也走 401 出口 —— 文案里本来就写着「可能是登录态失效或
+    // 权限不足」，客户端按鉴权错误处理是改造前就有的口径；区别只在**适配器不**为
+    // 它刷新凭证（凭证没问题，刷了也白刷）。
     let mapped = match classified.kind {
-        protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate => 429,
-        protocol::UpstreamKind::Auth => 401,
+        errors::UpstreamKind::Quota | errors::UpstreamKind::Rate => 429,
+        errors::UpstreamKind::Auth | errors::UpstreamKind::Forbidden => 401,
         _ => 502,
     };
-    GatewayError::with_status(mapped, message).with_optional_code(Some(status as i64))
+    let error = GatewayError::with_status(mapped, message).with_optional_code(Some(status as i64));
+    if classified.kind == errors::UpstreamKind::Auth {
+        AttemptError::Auth(error)
+    } else {
+        AttemptError::Fatal(error)
+    }
+}
+
+/// 分类结果 + 上游原文 → 排队态（退避时长在这里钳制，见 `queue_wait_ms`）。
+pub fn queued_of(classified: &errors::ClassifiedError, raw: &str) -> Queued {
+    let queue = classified.queue.clone().unwrap_or_default();
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(kind) = &queue.queue_type {
+        notes.push(format!("队列 {kind}"));
+    }
+    if let Some(count) = queue.queue_count {
+        notes.push(format!("排队 {count}"));
+    }
+    if queue.service_available == Some(false) {
+        notes.push("上游声明服务不可用".to_string());
+    }
+    Queued {
+        retry_after_ms: queue_wait_ms(queue.retry_after_secs),
+        message: classified.message.clone(),
+        raw: raw.chars().take(300).collect(),
+        detail: notes.join("，"),
+    }
 }
 
 /// 上游帧 → 客户端帧 的翻译状态（流式与非流式共用同一套累积逻辑）。
@@ -274,6 +400,8 @@ pub struct Translator {
     model_name: String,
     /// 上游回传的模型名（映射回对外 id 后下发）
     model_reported: Option<String>,
+    /// 下发帧固定回客户端请求的那个名字（见 `new` 的说明）
+    echo_requested_model: bool,
     /// 工具调用按 index 累积
     tool_state: std::collections::BTreeMap<i64, ToolCallState>,
     /// 是否已下发过 role 帧（流式）
@@ -306,12 +434,26 @@ struct ToolCallState {
 }
 
 impl Translator {
+    /// ── 为什么「客户端给的名字认得出来」就固定回它 ────────────────
+    /// 上游回的 `model` 是**路由档位**而不是我们请求的那个模型：请求
+    /// `Qwen3.8-Flash`（上游 key `qfmodel`）时实测回的是 `"auto"`。按它做映射
+    /// 会把下游帧里的模型名换成另一个模型（`auto` → 清单里的 `Auto`），
+    /// 客户端日志与计费归集都会看到「我没请求过的模型」。
+    ///
+    /// 只有当客户端写的是**内部 key**（`qfmodel` 这类认不出来的名字）时才保留
+    /// 映射：那种情况的映射是在把它归一成可读的模型名，是需要的。
     pub fn new(response_id: String, model_name: String, thinking_enabled: bool) -> Self {
+        let echo_requested_model = super::models::resolve(
+            &model_name,
+            super::endpoints::Region::Global,
+        )
+        .is_some();
         Self {
             response_id,
             created: logging::now_ms() / 1000,
             model_name,
             model_reported: None,
+            echo_requested_model,
             tool_state: std::collections::BTreeMap::new(),
             role_sent: false,
             parser: if thinking_enabled {
@@ -461,8 +603,12 @@ impl Translator {
         out
     }
 
-    /// 下游要的 model 名：优先用上游回传值映射后的结果，否则用客户端请求的名字
+    /// 下游要的 model 名：客户端给的是清单里的名字时固定回它，否则用上游
+    /// 回传值映射后的结果（见 `new` 的说明）。
     pub fn model_out(&self) -> String {
+        if self.echo_requested_model {
+            return self.model_name.clone();
+        }
         self.model_reported
             .clone()
             .unwrap_or_else(|| self.model_name.clone())
@@ -631,23 +777,36 @@ pub fn delta_json(delta: &TranslatedDelta) -> Value {
     }
 }
 
-/// 上游业务错误（信封里的 statusCodeValue）→ 网关错误。
+/// 上游业务错误（信封里的 statusCodeValue）→ 排队态或网关错误。
 ///
 /// ── 状态码映射必须基于**分类结果**，不能只看业务码 ──────────────
-/// 上游用 403 表达多种情况：带 pricingUrl 是套餐/额度不足、裸 403 才是鉴权问题
-/// （见 `protocol::classify_upstream_error` 的说明）。所以编排层要看的**不是**
-/// 上游的业务码，而是「这条错误该触发哪个动作」：
+/// 上游用 403 表达多种情况：带 pricingUrl 是套餐/额度不足、裸 403 才是鉴权问题、
+/// 带 `isQueued` / 业务码 10605 则是**排队**（见 `errors::classify_upstream_error`
+/// 的说明）。所以编排层要看的**不是**上游的业务码，而是「这条错误该触发哪个
+/// 动作」：
+///   排队        → **`Queued`**（调用方退避重发；不是错误，也不该刷新凭证/换号）；
 ///   额度 / 限流 → **429**（编排层据此标记该账号冷却并换下一个账号）；
 ///   鉴权        → **401**（编排层据此刷新凭证后同账号重试一次）；
 ///   其余        → 502（原样透传给客户端）。
-/// 直接拿业务码当状态码会把「该充值」变成「登录失效」，客户端与用户都会走错方向。
+/// 直接拿业务码当状态码会把「该充值」变成「登录失效」、把「排会儿队」变成
+/// 「登录失效」，客户端与用户都会走错方向。
 pub fn business_error(
     status: u16,
-    kind: protocol::UpstreamKind,
+    kind: errors::UpstreamKind,
     raw: &str,
     message: &str,
     pricing_url: Option<&str>,
-) -> GatewayError {
+    queue: Option<errors::QueueInfo>,
+) -> AttemptError {
+    if kind == errors::UpstreamKind::Queued {
+        let classified = errors::ClassifiedError {
+            kind,
+            message: message.to_string(),
+            pricing_url: None,
+            queue,
+        };
+        return AttemptError::Queued(queued_of(&classified, raw));
+    }
     let detail: String = raw.chars().take(300).collect();
     let message = if message.is_empty() {
         format!("上游返回 {status}: {detail}")
@@ -658,11 +817,16 @@ pub fn business_error(
         format!("上游请求失败：{message}{pricing}（上游原文：{detail}）")
     };
     let mapped = match kind {
-        protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate => 429,
-        protocol::UpstreamKind::Auth => 401,
+        errors::UpstreamKind::Quota | errors::UpstreamKind::Rate => 429,
+        errors::UpstreamKind::Auth | errors::UpstreamKind::Forbidden => 401,
         _ => 502,
     };
-    GatewayError::with_status(mapped, message).with_optional_code(Some(status as i64))
+    let error = GatewayError::with_status(mapped, message).with_optional_code(Some(status as i64));
+    if kind == errors::UpstreamKind::Auth {
+        AttemptError::Auth(error)
+    } else {
+        AttemptError::Fatal(error)
+    }
 }
 
 /// 一次会话的凭证快照（跨 await 使用的形态）

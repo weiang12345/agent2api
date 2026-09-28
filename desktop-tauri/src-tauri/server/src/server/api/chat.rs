@@ -49,6 +49,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+use crate::server::config;
 use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
@@ -450,6 +451,9 @@ pub async fn count_tokens(State(state): State<ServerState>, body: Bytes) -> Resp
 /// 统一的 spawn 入口，避免以后有人把它挪到非 Tokio 上下文时 panic
 /// （release 是 panic=abort，那会带走整个进程）。
 pub fn spawn_catalog_refresh(state: &ServerState) {
+    if !config::scheduled_settings().model_refresh.enabled {
+        return;
+    }
     let store = state.store().clone();
     crate::spawn_task(async move {
         crate::server::core::providers::adapter::refresh_implemented(&store).await;

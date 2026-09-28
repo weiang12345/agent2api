@@ -1,30 +1,11 @@
-//! 余额 / 积分查询：目标集合解析、跨账号并发查询、单账号失败收敛。
-//!
-//! 余额查询是**四家混查**：目标集合跨全部启用账号，逐账号按所属 provider
-//! 分流到 `ProviderAdapter::query_usage`。本模块只负责并发调度与单账号失败的
-//! 收敛 ——「这个账号的余额怎么查」是 provider 知识，全在各家适配器里。
-//!
-//! ── 本模块为什么在 core ─────────────────────────────────────
-//! 它有两条调用点：`GET /api/accounts/usage`（用户手动点「查询积分」）与
-//! `core::scheduled_tasks` 的「定时查询积分」（后端按间隔自动查）。后者不认识
-//! axum，因此查询逻辑不能长在 api 层 —— 与「定时签到与
-//! `POST /api/accounts/checkin` 共用 `core::billing::checkin`」同一取舍：
-//! 规则只有一份，两条入口各自持有 store 句柄调用它。
-//!
-//! ── 定时那一轮的结果快照 ────────────────────────────────────
-//! 定时查询的结果存进本模块的内存快照（`store_snapshot`），由
-//! `GET /api/accounts/usage/snapshot` 供界面读取 —— 于是用户不点按钮也能看到
-//! 最新的余额，**失败的行同样进快照**（界面按「查询失败」渲染，不静默丢掉）。
-//! 快照不落盘：它是「本次运行的观察值」，重启后定时任务自会再查一次
-//!（与 `scheduled_tasks` 的运行状态同一取舍）。
-//!
-//! 本文件是 `api::accounts_usage` 的下沉版本：那里原先是「查询 + 结果组装」
-//! 全在一起，现在只剩把结果转成 HTTP 响应的薄壳，判据（`supports_usage` 的
-//! 能力过滤、401 的刷新重试、`skipped` 的口径）都跟着逻辑搬到了这里。
+//! 查询结果和每个账号的请求排期持久化，首屏读取快照不会触发上游请求。
 
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
+
+use crate::server::config;
+use crate::server::core::task_state;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::adapter::adapter_for;
@@ -243,6 +224,12 @@ pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, 
     let single = id.filter(|value| !value.is_empty());
     // `provider = None`：跨四家取目标（签到那条仍按 provider 过滤）
     let (targets, skipped) = resolve_batch_targets(store, None, single)?;
+    // 用户手动批量查询也是一次真实的上游轮询：把定时那轮的排期顺延一个间隔，
+    // 免得「刚点完查询、到点或重启后又立刻全量再查一遍」（单账号查询不动它 ——
+    // 那是针对某一行的问题，不代表整批刚查过）。
+    if single.is_none() {
+        note_external_run();
+    }
     let futures: Vec<_> = targets
         .iter()
         .filter(|account| single.is_some() || supports_usage(account))
@@ -254,12 +241,23 @@ pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, 
 
 // ─── 定时查询的结果快照 ──────────────────────────────────────
 
-/// 最近一次「定时查询积分」的结果。内含 `{at, results, skipped}`：
-/// `at` 是那一刻的毫秒时间戳，界面按它判断「这份快照我应用过了没」。
+/// 快照的持久化键（`kv` 的保留键，见 `task_state`）。
+const SNAPSHOT_KEY: &str = "usageQuerySnapshot";
+
+/// 进程内副本：快照是 20 秒一次的前端轮询读点，不必每次都读库。
+/// 未命中时从库里读回（重启后界面仍能看到上次结果与它的查询时刻）。
 static SNAPSHOT: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
 
 fn snapshot_slot() -> &'static Mutex<Option<Value>> {
     SNAPSHOT.get_or_init(|| Mutex::new(None))
+}
+
+/// 手动那一轮把定时排期顺延一个间隔（口径与「立即执行」一致）。
+fn note_external_run() {
+    let interval = config::scheduled_settings().usage_query.interval * 60_000;
+    if let Err(error) = task_state::note_external_run("usageQuery", interval) {
+        logging::verbose("[Usage]", &format!("余额查询排期顺延失败：{error}"));
+    }
 }
 
 /// 存下定时那一轮的查询结果，返回 `(成功数, 失败数)`。
@@ -269,6 +267,9 @@ fn snapshot_slot() -> &'static Mutex<Option<Value>> {
 ///
 /// 成功 / 失败的判据是 `usage` 键是否为 null —— 与前端 `cacheEntryOf` 同源
 /// （它也是「有 usage 就是结果，否则是失败行」）。
+///
+/// 快照落盘（`usageQuerySnapshot`）：重启后界面先展示上次结果与查询时刻，
+/// 而不是一片空白 —— 它同时是「重启后不必马上再查一遍」的另一半依据。
 pub fn store_snapshot(report: Value) -> (usize, usize) {
     let results = report
         .get("results")
@@ -285,9 +286,12 @@ pub fn store_snapshot(report: Value) -> (usize, usize) {
         "results": results,
         "skipped": report.get("skipped").cloned().unwrap_or(Value::from(0)),
     });
-    // 锁中毒时沿用「不写」而不是 panic：少一次快照更新远比整个应用退出轻
+    // 锁中毒时沿用「不写内存」而不是 panic：少一次快照更新远比整个应用退出轻
     if let Ok(mut slot) = snapshot_slot().lock() {
-        *slot = Some(snapshot);
+        *slot = Some(snapshot.clone());
+    }
+    if let Err(error) = task_state::store_value(SNAPSHOT_KEY, snapshot) {
+        logging::verbose("[Usage]", &format!("余额快照保存失败（下次启动看不到本次结果）：{error}"));
     }
     (ok, failed)
 }
@@ -295,9 +299,17 @@ pub fn store_snapshot(report: Value) -> (usize, usize) {
 /// 最近一次定时查询的快照。从未查过时给 `{at: 0, results: [], skipped: 0}` ——
 /// 界面据此显示「还没有定时查询结果」，而不是把空数组当成「一个账号都没有」。
 pub fn snapshot() -> Value {
-    snapshot_slot()
-        .lock()
+    if let Ok(slot) = snapshot_slot().lock() {
+        if let Some(value) = slot.as_ref() {
+            return value.clone();
+        }
+    }
+    let restored = task_state::read(SNAPSHOT_KEY)
         .ok()
-        .and_then(|slot| slot.clone())
-        .unwrap_or_else(|| json!({ "at": 0, "results": [], "skipped": 0 }))
+        .and_then(|state| state.value)
+        .unwrap_or_else(|| json!({ "at": 0, "results": [], "skipped": 0 }));
+    if let Ok(mut slot) = snapshot_slot().lock() {
+        *slot = Some(restored.clone());
+    }
+    restored
 }

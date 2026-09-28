@@ -103,6 +103,7 @@ pub mod catalog;
 /// 远程模型清单的**持久化缓存**（各家的清单在进程重启后由它读回，见模块头）。
 /// 不进身份体系：它是各家的共用基础设施，只按 scope 字符串存取 JSON。
 pub mod catalog_cache;
+pub mod catalog_refresh;
 pub mod catpaw;
 pub mod cline;
 pub mod content_block;

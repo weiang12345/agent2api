@@ -135,9 +135,9 @@ When adding an account you pick the provider first, then sign in however that ve
 
 ### Report
 
-The overview gives total requests, success rate, total tokens and the top model, with rankings by account and by provider beside it; underneath sits a fixed 365-day activity heatmap:
+The overview gives total requests, success rate, total tokens and the top model, with rankings by account and by provider beside it; below that come two usage donuts (by model and by provider), then a fixed 365-day activity heatmap:
 
-![Report overview: stat cards, top accounts / providers, activity heatmap](./assets/screenshots/report-overview.png)
+![Report overview: stat cards, top accounts / providers, model and provider usage donuts](./assets/screenshots/report-overview.png)
 
 Further down are the trends: the last 24 hours of **cache hit rate** (left axis, line) and **token consumption** (right axis, area) are overlaid in one chart so a dip in hit rate can be read as a change in traffic mix versus a cache miss; at the bottom is a per-day token bar chart whose range follows the time window at the top:
 
@@ -147,7 +147,7 @@ Further down are the trends: the last 24 hours of **cache hit rate** (left axis,
 
 Background tasks are managed on one page: toggle, interval, last result and next fire time all live here, and you can also run one immediately without waiting out the interval. The task list itself is stored in the `scheduledTasks` field of `~/.agent2api/config.json`, and edits take effect immediately — no restart needed.
 
-![Scheduled tasks page: toggles and intervals for check-in, credential maintenance, word list updates and more](./assets/screenshots/scheduled-tasks.png)
+![Scheduled tasks page: toggles and intervals for check-in, credential maintenance, model catalog refresh and more](./assets/screenshots/scheduled-tasks.png)
 
 ---
 

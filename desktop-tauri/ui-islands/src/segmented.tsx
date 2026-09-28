@@ -1,6 +1,6 @@
 import { createRoot } from 'react-dom/client'
 
-import { SegmentedControl, type SegmentedControlOption } from './segmented-control'
+import { SegmentedControl, type SegmentedControlOption } from '@ui'
 
 /**
  * 分段控件岛 —— 全站分段筛选的统一入口。

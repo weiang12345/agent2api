@@ -55,6 +55,22 @@ const WIN_MIN_HEIGHT: f64 = 600.0;
 /// 主窗口标签：托盘唤起、关闭拦截、单实例激活都按它查找
 pub const MAIN_WINDOW_LABEL: &str = "main";
 
+/// 应用标题：窗口标题、托盘提示、界面自绘标题栏共用同一份文案。
+///
+/// debug 构建（`tauri dev`）带 `[Dev]` 前缀 —— 开发版与正式版能同时运行
+/// （端口与 identifier 各自独立，见 `gateway::DEV_PORT` 与 `tauri.dev.conf.json`），
+/// 而两个实例的窗口与托盘图标长得一模一样，标题不带标记就分不清谁是谁。
+/// 前缀放在最前面，任务栏那种宽度受限的地方也能一眼看到。
+///
+/// 判据取 `debug_assertions`，与下面「开发态不做安装迁移 / 自启刷新」同一个口径。
+pub fn app_title() -> &'static str {
+    if cfg!(debug_assertions) {
+        "[Dev]Agent2API·多提供商本地网关"
+    } else {
+        "Agent2API · 多提供商本地网关"
+    }
+}
+
 /// 开机自启时附加的命令行参数。启动时见到它就不显示窗口，
 /// 只把托盘留在后台，避免开机弹窗打扰用户。
 const AUTOSTART_FLAG: &str = "--autostart";
@@ -161,6 +177,7 @@ pub fn run() {
             commands::cancel_update,
             commands::run_installer,
             commands::set_window_theme,
+            commands::set_zoom,
             commands::open_release_page,
             // 自定义标题栏的窗口三键（窗口已 decorations(false)，见建窗处）
             commands::window_minimize,
@@ -283,7 +300,7 @@ pub fn run() {
             // （NSIS 安装包），macOS 如需保留要用 titleBarStyle: Overlay
             // 另行适配，此处不做特殊处理。
             WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-                .title("Agent2API · 多提供商本地网关")
+                .title(app_title())
                 .decorations(false)
                 .inner_size(WIN_WIDTH, WIN_HEIGHT)
                 .min_inner_size(WIN_MIN_WIDTH, WIN_MIN_HEIGHT)
@@ -293,7 +310,7 @@ pub fn run() {
                 .initialization_script(bridge::bridge_js())
                 .build()?;
 
-            // 启动后端；就绪后再跑一次启动维护（临期 token 刷新 + 余额查询）
+            // 后端负责维护任务的持久化排期，桌面壳不额外触发刷新。
             tauri::async_runtime::spawn(async move {
                 if let Err(failure) = backend::ensure_ready(&handle).await {
                     eprintln!("[backend] 启动失败: {}", failure.message);
@@ -308,7 +325,6 @@ pub fn run() {
                     let _ = handle.emit("backend:error", failure);
                     return;
                 }
-                commands::startup_maintenance(handle).await;
             });
 
             Ok(())

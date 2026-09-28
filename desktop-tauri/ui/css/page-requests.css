@@ -1,13 +1,15 @@
 /* ─────────────────────────────────────────────
    请求日志页：转发明细表（列形态参考 OmniProxy 的请求日志）
-   列表容器与筛选行（.log-list / .log-empty / .log-filters / .log-pager）
-   沿用 page-logs.css 的同一套声明，本文件只写表格本身、两个维度筛选的
-   宽度上限与窄窗口重排。
+   列表容器与筛选行（.log-list / .log-empty / .log-filters）沿用 page-logs.css
+   的同一套声明，本文件只写表格本身、两个维度筛选的宽度上限与窄窗口重排。
+   页脚分页栏是通用件（islands/table-shell.tsx），样式在 layout.css。
    颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
    ───────────────────────────────────────────── */
 
 /* ── 提供商 / 模型两个维度筛选（本次新增）─────────────────────
-   宽度由 page-logs.css 的 `.log-filters select { width: auto }` 定成「按内容」，
+   宽度由 page-logs.css 的 `.log-filters select { width: auto }
+
+` 定成「按内容」，
    这里只加上限：模型名可以很长（claude-sonnet-4-5-20250929 之类），
    不设上限时它会按最长选项把触发器撑得很宽、把时间档位挤到换行。
    截断只发生在**触发器**上（显示省略号）；选项完整文案在浮层里
@@ -28,8 +30,9 @@
 
    --req-cols 是用户拖过的列宽（table-columns.js 写在 #req-list 上，靠继承
    作用到每一行 —— 表格是整体重绘的，变量不需要在渲染后再写一遍）：
-   拖过哪一列，那一条轨道就从 minmax(…fr) 换成固定像素，没拖过的仍是弹性权重，
-   于是这一行永远填满、不滚动、不留空。变量没设时走下面的默认值，
+   拖过哪一列，那一条轨道就从 minmax(…fr) 换成固定像素，没拖过的仍是弹性权重。
+   拖动只改被拖的那一列，其余列保持各自宽度；总宽超出容器就由下面的横向滚动
+   接手（列宽是绝对量，不做「按比例分完容器」那套）。变量没设时走下面的默认值，
    改默认列宽时与 table-columns.js 里对应列的 track 字段要同步。 */
 .req-row,
 .req-head {
@@ -61,6 +64,24 @@
 
 /* 表头格子是列宽把手的定位锚（.col-grip 绝对定位挂在它内側右缘，见 components.css） */
 .req-head > span { position: relative; }
+
+/* ── 横向滚动 ──────────────────────────────────────────────
+   拖动把列拖宽、或窗口窄到装不下所有列时，让列表横向滚动，而不是把列压没：
+   不会伸缩的列（时间 / 重试 / 详情，以及被拖过的那些）压不动时只能滚。
+
+   行宽下限由 table-columns.js 按「不会伸缩的列之和 + 列间距 + 左右内边距」算好，
+   写在 #req-list 的 --req-row-min 上：固定列把容器占满时，行与表头跟着撑到内容
+   宽，溢出那截才有背景与下边框（否则横向滚到右边，表头会缺一块、行底色只铺
+   半截）；不溢出时它正好等于容器宽，与 min-width: 100% 等效。
+
+   **不要改成 CSS 的 max-content**：那是按内容的固有宽度算的，同一列在表头
+   （「用量」两个字）和数据行（两行读数）里会算出两个宽度，表头与数据直接错位，
+   而且列被内容撑开就不再触发省略号。 */
+#req-list { overflow-x: auto; }
+#req-list > .req-row,
+#req-list > .req-head {
+  min-width: var(--req-row-min, 100%);
+}
 
 .req-row { border-bottom: 1px solid var(--hairline); transition: background .12s ease; }
 .req-row:last-child { border-bottom: none; }
@@ -127,11 +148,25 @@
   color: var(--warn);
 }
 
+/* 排队中：既不是失败（不取 warn）也不是正常推进（不取 ok），
+   用「信息」档的紫蓝，与「等待响应」的青蓝区分开 */
+.badge.tag.phase-queued {
+  background: oklch(0.62 0.14 285 / 12%);
+  border-color: oklch(0.62 0.14 285 / 32%);
+  color: oklch(0.5 0.16 290);
+}
+
 @media (prefers-color-scheme: dark) {
   .badge.tag.phase-waiting {
     background: oklch(0.72 0.11 200 / 15%);
     border-color: oklch(0.72 0.11 200 / 34%);
     color: oklch(0.8 0.1 200);
+  }
+
+  .badge.tag.phase-queued {
+    background: oklch(0.72 0.13 285 / 15%);
+    border-color: oklch(0.72 0.13 285 / 34%);
+    color: oklch(0.82 0.12 288);
   }
 }
 
@@ -155,10 +190,14 @@
 
 /* 阶段计时：等宽 + tabular-nums，相邻行的秒数竖着能直接比大小 */
 .req-row .req-status-line {
+  overflow: hidden;
+  /* 与 .req-usage-line 同一条道理：flex 子项不限宽就会被内容顶开、压到隔壁列 */
+  max-width: 100%;
   color: var(--text-3);
   font-family: var(--font-mono);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -201,49 +240,12 @@
 /* 选中态导航项底色更深，保持同样的分离度（对齐 layout.css 的 active 覆盖） */
 .nav-item.active #nav-count-requests.is-running { background: var(--surface); }
 
-/* ─── 清理请求日志弹窗（request-clear-modal.js）───────────────
-   两种清理方式做成单选卡片而不是 seg：两种方式的差别（删不删统计行、
-   动不动日报）必须写在选择的当下 —— seg 只放得下名字，放不下后果说明。 */
-
-.clear-modes {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.clear-mode {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 2px 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  cursor: pointer;
-  transition: border-color .15s ease, background .15s ease;
-}
-
-/* 单选钮独占左列竖向居中；标题与说明右列上下两行 */
-.clear-mode input[type="radio"] {
-  grid-row: 1 / 3;
-  align-self: center;
-  margin: 0;
-}
-
-.clear-mode .t { color: var(--text); font-size: 13px; font-weight: 600; }
-.clear-mode .d { color: var(--text-3); font-size: 11.5px; line-height: 1.55; }
-
-.clear-mode:hover { border-color: var(--border-strong, var(--border)); }
-
-/* 选中卡片走品牌浅底（与 .seg-item.active 同一观感），JS 负责切换 .active
-   （不依赖 :has —— 选择器支持面比 WebView 版本预期更挑） */
-.clear-mode.active {
-  border-color: var(--primary);
-  background: var(--primary-soft);
-}
-.clear-mode.active .t { color: var(--primary-fg); }
-
-/* 预览统计一行：贴在方式卡片下面，随每次 clear-preview 刷新 */
-.rcm-preview { margin-top: 10px; }
+/* ─── 清理请求日志弹窗 ───────────────────────────────
+   已迁到组件库（见 ui-islands/src/islands/request-clear-modal.tsx）：两种清理方式
+   的单选卡片改走 ui-kit 的 RadioGroup + Tailwind 类，下面那套 .clear-mode 一族
+   随之移除。保留这条说明是为了让「原先为什么是卡片而不是 seg」的口径可追 ——
+   两种方式的差别（删不删统计行、动不动日报）必须写在选择的当下，
+   seg 只放得下名字，放不下后果说明。 */
 
 /* 时间列：日期 + 时刻两行，等宽避免每一行的冒号错位。
    数据格与表头格共用同一个类名（窄窗口要按列重排，见文件末尾的媒体查询），
@@ -354,6 +356,11 @@
 
 .req-usage-line {
   overflow: hidden;
+  /* 必须限住宽度：它是 .req-usage（flex 列）的子项，只写 overflow: hidden 时
+     宽度仍按内容算（读数一行 nowrap，两百多像素），顶出格子压到右边列上 ——
+     列再窄也不会出现省略号。这里跟 .req-model-line / .req-dur-line 用同一个
+     写法（max-width: 100%）；单写 min-width: 0 实测压不住。 */
+  max-width: 100%;
   color: var(--text-2);
   font-family: var(--font-mono);
   font-size: 11px;
@@ -364,24 +371,6 @@
 
 /* 第二行（缓存读取 / 命中率）是附加说明：淡一档，不抢主读数 */
 .req-usage-line.sub { color: var(--text-3); }
-
-/* 错误列：红字，最多两行折行（完整值在 title 里）；它是排查的入口，
-   红着比藏着好。超时 / 中断这类长文案一行放不下 —— 给到两行，
-   仍放不下的部分照旧省略，口径与单行时代一致（title 是完整值）。 */
-.req-row .req-error {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--danger);
-  font-size: 11.5px;
-  /* 两行折行 + 超出省略：-webkit-box 是 line-clamp 的载体
-     （WebView2 与 WKWebView 都认这一套）；长英文 / URL 用 anywhere 断，
-     否则一个长 token 会把两行都撑成省略号 */
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  overflow-wrap: anywhere;
-}
-
 /* 窄窗口：拆成多行，免得八列都缩成省略号。
    断点取 1200px：默认窗口 1060px 时内容区约 772px，八列必然挤，
    以下面的四列重排为准；拉宽到 1200 以上才换八列横排。
@@ -421,16 +410,7 @@
   .req-row .req-target { grid-row: 2; grid-column: 1 / 3; }
   .req-row .req-dur { grid-row: 2; grid-column: 3 / 5; }
   /* 第三行：用量整行铺开（两行读数不再被列宽挤省略） */
-  .req-row .req-usage { grid-row: 3; grid-column: 1 / -1; }
-  /* 第四行：错误 + 详情。整行铺开（折行与两行上限由宽窗口那条规则管，
-     这里只重排位置）；没有错误的行不渲染错误那格。
-     详情排在错误之后（同一行右端）—— 有错误时它跟着换到这一行，
-     没错误时错误格不渲染，它自己占满这一行 */
-  .req-row .req-error {
-    grid-row: 4;
-    grid-column: 1 / 4;
-  }
-  .req-row .req-detail { grid-row: 4; grid-column: 4 / 5; justify-self: end; }
+  .req-row .req-usage { grid-row: 3; grid-column: 1 / -1; }  .req-row .req-detail { grid-row: 4; grid-column: 4 / 5; justify-self: end; }
   /* 「-」占位不再独占一行：窄窗口下空行比省略号更难解释 */
   .req-row .req-error-cell { display: none; }
   /* 详情列头在窄窗口下没有稳定的列位（位置随有没有错误而变），一并隐藏 */
@@ -453,73 +433,29 @@
 
 .req-row .req-detail { justify-self: end; }
 
+/* ─── 请求详情弹窗的样式已随迁移移除 ───────────────────
+   弹窗迁到组件库后（ui-islands/src/islands/request-detail.tsx），下面这些老类名
+   失去了消费者，一并删除：.modal-wide（宽度）、#req-detail-terminate[hidden]、
+   .req-detail-meta、.req-detail-segs、.seg-dot、.req-detail-pane 一族、
+   .req-detail-empty、.req-detail-grid 一族、.req-detail-sub / -error / -model-split。
+   宽度改由 DialogContent 的 className 表达；三标签改走组件库的 SegmentedControl；
+   详情网格改走 Tailwind 类。保留的只有下面两条 —— 它们服务的是**别的地方**：
+   · .req-detail-btn  列表行的「详情」按钮（requests-panel.js）
+   · .req-detail-pre  「预览对话」的原文折叠块（conversation-preview.js） */
+
 /* 详情按钮：小号、无边框感（一列里最轻的控件，不与状态徽章抢注意力） */
 .req-detail-btn {
   padding: 2px 8px;
   font-size: 11.5px;
 }
 
-.modal-wide { width: min(920px, 100%); }
+/* 「终止请求」按钮与详情网格的样式已随迁移移除（见上）。
+   原先这里有一条 #req-detail-terminate[hidden] 的规则，是为了压过
+   components.css 给 button 设的 display: inline-flex —— 新实现里「终止请求」
+   由 React 条件渲染（不渲染即不存在），不再需要 hidden 这条通路。 */
 
-/* 「终止请求」按钮（详情弹窗底部，仅进行中的行显示）。
-   必须显式写 [hidden] 的规则：components.css 给 button 设了
-   display: inline-flex，会压过浏览器对 hidden 的默认 display: none
-   （与 .add-provider-block[hidden]、.report-rank-grid > .panel[hidden]
-   同一个坑）。 */
-#req-detail-terminate[hidden] { display: none; }
-
-.req-detail-meta {
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--hairline);
-  color: var(--text-2);
-  font-size: 12px;
-  line-height: 1.7;
-  word-break: break-all;
-}
-
-/* ─── 详情弹窗的分段选择器（请求头 / 请求体 / 响应头 / 响应体）───
-   .seg / .seg-item 的形制来自 components.css（请求日志页的时间档位、
-   账号页的筛选分段用的是同一套），这里只补三处本场景特有的：
-
-   ① 分段条与下面的面板之间要有间距（.seg 自身没有下外边距，
-      在页头里靠父容器的 gap 分隔，这里是弹窗内的独立一行）；
-   ② 空段的标记：一枚小圆点（.seg-dot），并从 .seg-item.zero 的
-      半透明里继承「这一段没内容」的观感；
-   ③ 面板的显示切换靠 .is-active（一次渲染四块，切换只改 class ——
-      这样切换时当前段的滚动位置不会丢，见 switchDetailSeg 的说明）。 */
-
-.req-detail-segs { margin: 12px 0 10px; }
-
-/* 空段标记：4px 圆点，比文字淡一档。放在标签文字后面（gap 由 .seg-item 的
-   既有 gap: 5px 给出），不影响标签的点击区域 —— 它自己 pointer-events: none，
-   点在圆点上与点在文字上一样会命中按钮。 */
-.seg-item .seg-dot {
-  flex: 0 0 auto;
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: currentColor;
-  opacity: .5;
-  pointer-events: none;
-}
-
-/* 空段「仍可点」是这个控件的一条要求（见 request-hover 之外的说明：
-   点进去会看到一句空态文案，比「点不动」更能解释为什么没有内容）。
-   .seg-item.zero 的既有声明是 opacity: .45，这里不再压 —— 标签本身
-   已经是「有内容/没内容」的完整表达，再压会让它看起来像 disabled。 */
-.seg-item.zero:not(.active) { opacity: .6; }
-
-.req-detail-pane { display: none; }
-
-.req-detail-pane.is-active { display: block; }
-
-.req-detail-pane h3 {
-  margin-bottom: 6px;
-  color: var(--text-3);
-  font-size: 11.5px;
-  font-weight: 600;
-  letter-spacing: .02em;
-}
+/* 空段标记与面板切换的样式已随迁移移除（.seg-dot / .req-detail-pane 一族）：
+   新实现的三个 pane 常驻、用 hidden 切显示，标签由组件库的 SegmentedControl 渲染。 */
 
 .req-detail-pre {
   max-height: 320px;
@@ -537,14 +473,7 @@
   overflow: auto;
 }
 
-.req-detail-empty {
-  padding: 24px 0;
-  color: var(--text-3);
-  font-size: 12.5px;
-  text-align: center;
-}
-
-/* ─── 重试列的标签与悬停面板（request-hover.js）───────────────
+/* 重试列的标签与悬停面板（request-hover.js）───────────────
    这一列现在承载两件事：重试链（橙标签）与敏感词命中（紫标签），
    悬停弹出富文本面板。形态照 OmniProxy 的 FailoverTip / SensitiveMaskedTag，
    配色换算到本项目自己的变量（那边用 antd 的 Tag 色板）。
@@ -583,7 +512,7 @@
    token —— 全站只有这一处需要紫色，进 tokens.css 会让人以为它是通用语义色。
    浅深两套各写一份：同一组紫在浅底与深底上需要的明度不同。
    .badge.tag.sensitive 是详情弹窗「请求详情」网格里的展开形态（词 × 次数），
-   与列表的悬停标签共用同一套紫（见 request-detail.js 的 sensitiveHtml）。 */
+   与列表的悬停标签共用同一套紫（见 islands/request-detail.tsx 的 sensitiveHtml）。 */
 .req-hover-tag.sensitive,
 .badge.tag.sensitive {
   background: oklch(0.55 0.18 305 / 14%);
@@ -599,40 +528,6 @@
     color: oklch(0.82 0.12 305);
   }
 }
-
-/* 面板：深色底 + 浅字（与 .tip-bubble 同一档观感，但内容多、要能滚动）。
-   用 --surface 系而不是主色底：面板里有红/绿/灰三种状态的文字色，
-   压在 --primary 上会看不出差别。 */
-.req-hover {
-  position: fixed;
-  z-index: 35;              /* 与下拉浮层、.tip-bubble 同档：在弹窗遮罩（30）之上 */
-  display: none;
-  max-height: min(360px, 60vh);
-  padding: 10px 12px;
-  border-radius: var(--r-md);
-  background: color-mix(in srgb, var(--surface) 96%, black);
-  color: var(--text);
-  font-size: 12px;
-  line-height: 1.6;
-  overflow-x: hidden;
-  overflow-y: auto;
-  box-shadow: var(--shadow-3);
-  pointer-events: none;
-  /* 注意：不能整体写 overflow-wrap: anywhere —— 那会把中文长句拆得七零八落。
-     长英文 / URL 的换行只给 .rh-bad 那一类（见下）。 */
-  word-break: normal;
-}
-
-.req-hover.open { display: block; }
-
-/* 深色主题下深色面板与背景的分离度不够，改用带边框的抬升表面色 */
-@media (prefers-color-scheme: dark) {
-  .req-hover {
-    border: 1px solid var(--border-strong);
-    background: var(--surface-3);
-  }
-}
-
 /* 切换路径行：面板顶部一条，与下面的尝试列表用分隔线隔开（OmniProxy 同法） */
 .rh-chain {
   padding-bottom: 6px;
@@ -754,83 +649,6 @@
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-
-/* ─── 详情弹窗的三标签版（本次改造）：请求详情网格 / 预览对话气泡 ───
-   三个标签本体复用 .seg / .seg-item（与时间档位同一套）；「原始报文」标签
-   内的四段由原来的分段切换改为竖排（每段一个 .req-detail-pre，内部滚动），
-   所以这里补了段落之间的上边距。下方是请求详情网格与对话气泡两块新样式，
-   都只用现有 CSS 变量，深浅两套主题自动跟随。 */
-
-/* 原始报文：四块竖排之间的分隔（pre 自带 max-height 与滚动，见上） */
-.req-detail-pane h3:not(:first-child) { margin-top: 16px; }
-
-/* ① 请求详情：两列网格（label 列 + value 列）。整体不描边、只画行分隔线 ——
-   弹窗里内容已经分层，再包一层边框会显得过重（形制对齐 .req-detail-meta）。 */
-.req-detail-grid {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12.5px;
-  line-height: 1.6;
-}
-
-.req-detail-grid th,
-.req-detail-grid td {
-  padding: 7px 10px;
-  border-bottom: 1px solid var(--hairline);
-  text-align: left;
-  vertical-align: top;
-}
-
-.req-detail-grid tr:last-child th,
-.req-detail-grid tr:last-child td { border-bottom: 0; }
-
-.req-detail-grid th {
-  width: 76px;
-  color: var(--text-3);
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.req-detail-grid td { color: var(--text-2); word-break: break-word; }
-
-/* 网格里的辅助小字（账号括注、耗时注解等） */
-.req-detail-sub { color: var(--text-3); font-size: 11.5px; }
-
-/* 错误值：与列表错误列同一语义色 */
-.req-detail-error { color: var(--danger); }
-
-/* 模型两行：⬆️ 上游 / ⬇️ 下游（与列表模型列同构，字号随网格） */
-.req-detail-model-split { display: flex; flex-direction: column; gap: 2px; }
-.req-detail-model-split .sub { color: var(--text-3); }
-
-/* 尝试明细小表格（每次上游尝试一行） */
-.req-attempt-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 11.5px;
-}
-
-.req-attempt-table th,
-.req-attempt-table td {
-  padding: 4px 8px;
-  border: 1px solid var(--hairline);
-  text-align: left;
-  vertical-align: top;
-  word-break: break-word;
-}
-
-.req-attempt-table th {
-  color: var(--text-3);
-  font-weight: 600;
-  white-space: nowrap;
-  background: var(--surface-2, var(--surface));
-}
-
-/* 结果的三态配色与 request-hover 的尝试行同源：成功绿、失败红、未定论灰 */
-.req-attempt-ok { color: var(--ok); }
-.req-attempt-bad { color: var(--danger); overflow-wrap: anywhere; }
-.req-attempt-more td { color: var(--text-3); }
-
 /* ② 预览对话：气泡流（形态照 OmniProxy 的 ConversationPreview，
    配色换算到本项目的 tokens）。滚动收在 .cv 内，弹窗自身不被长对话撑破。 */
 .cv {
@@ -924,4 +742,3 @@ details.cv-tool > summary { cursor: pointer; color: var(--text-3); }
 
 /* 解析失败的说明行（原文折叠跟在它后面）/ 读取侧的截断提示 */
 .cv-parse-empty { color: var(--text-3); font-size: 12px; }
-.cv-truncated { margin-bottom: 8px; color: var(--warn); font-size: 11.5px; }

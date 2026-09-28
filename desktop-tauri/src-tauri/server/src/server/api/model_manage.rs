@@ -6,6 +6,7 @@
 //! - `POST /api/models/mappings/remove` `{alias, target, provider?}` 删除映射
 //! - `POST /api/models/custom`          `{provider, id}` 登记一个上游目录里没有的模型
 //! - `POST /api/models/custom/remove`   `{provider, id}` 移除该登记
+//! - `POST /api/models/capabilities`    `{provider, id, capabilities}` 覆盖对下游声明的能力位
 //!
 //! 写接口都返回最新的 `{models, mappings, reasoningLevels}`，前端就地重绘、不必再拉一次。
 //!
@@ -26,6 +27,7 @@ use axum::extract::State;
 use axum::response::Response;
 use serde_json::Value;
 
+use crate::server::core::capability;
 use crate::server::core::model_rules;
 use crate::server::core::providers::catalog;
 use crate::server::errors;
@@ -345,5 +347,81 @@ pub async fn remove_custom(State(state): State<ServerState>, body: Bytes) -> Res
         return errors::management_error(404, format!("自定义模型不存在: [{provider}] {id}"));
     }
     logging::log("[Models]", &format!("移除自定义模型 [{provider}] {id}"));
+    ok_json(catalog::manage_view(state.store()))
+}
+
+/// POST /api/models/capabilities
+///
+/// 覆盖某条模型**对下游声明**的能力位：`{provider, id, capabilities: {...}}`。
+/// 下游（客户端）按这些值决定怎么构造请求（发不发图片、按多大的窗口堆历史），
+/// 而上游目录给的值可能是错的 —— 这条接口就是那层纠正。覆盖只影响出口
+/// （`/v1/models` 与 Anthropic 列表、管理页），不改路由 / 启停 / 转发行为。
+///
+/// ── 为什么单独一条接口 ──────────────────────────────────────
+/// 覆盖面是 `(provider, id)` 二元组（启停也是，但值是五个键各自的三态；
+/// 映射是三元组）。塞进任何一条现有接口都会让那套三态协议变成两义。
+///
+/// ── `capabilities` 的三态（与 `add_mapping` 的 reasoning 同一套）──
+///   · 键**缺失**   → 不改这一项；
+///   · 键给 `null`  → 清除这一项的覆盖（回到清单原值）；
+///   · 键给值       → 覆盖（token 键要 1~1 亿正整数，能力开关要布尔）。
+/// 管理页弹窗保存时五个键一次全给（「全量提交」最不容易出歧义）；
+/// 只给一个键的单字段路径也支持，留给以后的行内编辑。
+///
+/// ── 只服务内置家 ────────────────────────────────────────────
+/// 自定义家的能力覆盖存在**提供商记录**的 `models[].capabilities` 里
+/// （与那家的启停 / 等级同一处存储），写入口是整表保存
+/// `POST /api/custom-providers/models`。这里对 `custom-` id 明确报 400 而不是
+/// 静默写进 modelRules —— 后者会得到一个**永远读不回来**的覆盖（自定义家的
+/// 出口压根不查 modelRules），是最难排查的一类静默失效。
+pub async fn set_capabilities(State(state): State<ServerState>, body: Bytes) -> Response {
+    let object = match body_object(&body) {
+        Ok(object) => object,
+        Err(response) => return response,
+    };
+    let provider = text_field(&object, "provider");
+    let id = text_field(&object, "id");
+    if provider.is_empty() || id.is_empty() {
+        return errors::management_error(400, "缺少提供商或模型 id");
+    }
+    if crate::server::core::providers::kind_from_id(&provider).is_none() {
+        return errors::management_error(
+            400,
+            format!("未知的内置提供商: {provider}（自定义提供商的能力走整表保存接口）"),
+        );
+    }
+    let patch = match object.get("capabilities") {
+        None => return errors::management_error(400, "缺少 capabilities 字段"),
+        Some(Value::Object(map)) => map.clone(),
+        Some(_) => return errors::management_error(400, "capabilities 必须是对象"),
+    };
+    // 值校验在这里就拦掉（与 add_mapping 的 reasoning 同一取向：不留一条
+    // 读回来会被归一丢弃的脏数据）；`null` 是合法的「清除」信号，不算非法值。
+    for (key, value) in &patch {
+        if !capability::KEYS.contains(&key.as_str()) {
+            return errors::management_error(400, format!("未知的能力字段: {key}"));
+        }
+        if !value.is_null() && capability::normalize_value(key, value).is_none() {
+            return errors::management_error(
+                400,
+                format!("能力字段 {key} 取值非法（token 键要 1~1 亿的正整数，能力开关要布尔）"),
+            );
+        }
+    }
+    if let Err(error) = model_rules::set_capabilities(&provider, &id, &patch) {
+        return errors::management_error(500, error);
+    }
+    // 日志把每一项写成「键=值 / 键=恢复」，否则排查时只看得到「保存了能力」
+    // 这一句，分不清清除了哪一项、改成了什么
+    let summary = capability::KEYS
+        .iter()
+        .filter_map(|key| patch.get(*key).map(|value| (key, value)))
+        .map(|(key, value)| match value {
+            Value::Null => format!("{key}=恢复"),
+            other => format!("{key}={other}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    logging::log("[Models]", &format!("保存模型能力 [{provider}] {id}: {summary}"));
     ok_json(catalog::manage_view(state.store()))
 }

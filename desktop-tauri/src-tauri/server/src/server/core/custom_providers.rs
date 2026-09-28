@@ -22,7 +22,8 @@
 //!   "enabled": true,
 //!   "createdAt": 1730000000000,
 //!   "models": [                     // 用户登记的模型清单（第二阶段起）
-//!     { "id": "gpt-x", "enabled": true, "reasoning": "" }
+//!     { "id": "gpt-x", "enabled": true, "reasoning": "",
+//!       "capabilities": { "maxInputTokens": 200000 } }  // 可选：能力位覆盖
 //!   ],
 //!   "mappings": [                   // 对外别名 → 上游模型 id 的映射（同上）
 //!     { "alias": "my-alias", "target": "gpt-x", "enabled": true, "reasoning": "" }
@@ -36,6 +37,12 @@
 //! 「enabled」天然是每条记录自己的字段 —— 再套一层 modelRules 等于把同一份
 //! 启停状态存两处（`set_models` 整表替换的语义也对不上「逐条开关」）。
 //! 因此 modelRules 的 disabled/hidden **不适用于**自定义家（管理页也不进）。
+//!
+//! `capabilities`（可选的 per-model 能力位覆盖）遵同一条取舍：内置家那层覆盖
+//! 存 `modelRules.capabilities`（清单是适配器给的，「上游值的纠正」是全局规则），
+//! 自定义家的清单与它的元数据**都是这条记录自己的东西**，覆盖就落在条目上。
+//! 两边的键名 / 归一 / 出口透出规则由 `core::capability` 统一（出口在
+//! `bindings::public_models`：别名继承 target 的能力位）。
 //!
 //! ── 三条设计约束（改代码前务必读）───────────────────────────
 //!   1. **id 用随机而不是时间戳/计数器**：卸载重装、多进程并发添加都不能
@@ -71,6 +78,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::config;
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::capability;
 use crate::server::core::egress;
 use crate::server::logging;
 
@@ -312,14 +320,26 @@ fn model_entries_of(value: Option<&Value>) -> Vec<Value> {
         if id.is_empty() {
             continue;
         }
-        entries.push(json!({
+        let mut entry = json!({
             "id": id,
             "enabled": object.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             "reasoning": truncate_chars(
                 object.get("reasoning").and_then(Value::as_str).map(str::trim).unwrap_or(""),
                 MAX_REASONING_CHARS,
             ),
-        }));
+        });
+        // 能力位覆盖（可选的稀疏表，键名与归一规则见 `core::capability`：
+        // 内置家的同一层覆盖在 `modelRules.capabilities`，两处共用该模块的判定）。
+        // **空表不落键**：老记录（没有这个键的）读回再写时一个字节都不多，
+        // 配置文件不被无谓扰动 —— 与 `reasoning` 拿空串占位刚好相反，
+        // 那个是必填字段的默认值，这个是可选的覆盖层。
+        let capabilities = capability::normalize_object(object.get("capabilities"));
+        if !capabilities.is_empty() {
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("capabilities".to_string(), Value::Object(capabilities));
+            }
+        }
+        entries.push(entry);
     }
     entries
 }
@@ -814,6 +834,10 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
             return Err(format!("模型 id 过长（最多 {MAX_MODEL_ID_CHARS} 个字符）"));
         }
         let reasoning = validate_reasoning(object.get("reasoning"))?;
+        // 能力位覆盖（可选；校验见 validate_capabilities）—— 它是整表替换里
+        // **必须原样带回**的字段：前端草稿漏了它，用户填过的能力就会被一次
+        // 「切开关」的提交顺手清掉。
+        let capabilities = validate_capabilities(object.get("capabilities"), position + 1)?;
         let enabled = object
             .get("enabled")
             .and_then(Value::as_bool)
@@ -827,11 +851,17 @@ fn validate_model_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
         if duplicated {
             continue;
         }
-        entries.push(json!({
+        let mut entry = json!({
             "id": id,
             "enabled": enabled,
             "reasoning": reasoning,
-        }));
+        });
+        if let Some(capabilities) = capabilities {
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("capabilities".to_string(), Value::Object(capabilities));
+            }
+        }
+        entries.push(entry);
     }
     Ok(entries)
 }
@@ -903,6 +933,34 @@ fn validate_mapping_entries(raw: &[Value]) -> Result<Vec<Value>, String> {
         }));
     }
     Ok(entries)
+}
+
+/// 能力位覆盖（`capabilities`）的可选校验：必须是对象，键名与值都要合法
+/// （判定在 `core::capability`，与内置家那层覆盖同一套）。非法时报错而不是
+/// 静默丢弃 —— 与 `reasoning` 同一取向：写入前拦下，不留一条读回来会被
+/// 归一丢掉的脏数据。
+///
+/// 返回**归一后的稀疏表**；缺省 / null / 归一后为空都返回 `None`
+/// （调用方不落键，见 `model_entries_of`）。
+fn validate_capabilities(value: Option<&Value>, position: usize) -> Result<Option<Map<String, Value>>, String> {
+    let Some(value) = value.filter(|item| !item.is_null()) else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(format!("models 第 {position} 项的 capabilities 必须是对象"));
+    };
+    for (key, item) in object {
+        if !capability::KEYS.contains(&key.as_str()) {
+            return Err(format!("models 第 {position} 项的能力字段不存在: {key}"));
+        }
+        if capability::normalize_value(key, item).is_none() {
+            return Err(format!(
+                "models 第 {position} 项的能力字段 {key} 取值非法（token 键要 1~1 亿的正整数，能力开关要布尔）"
+            ));
+        }
+    }
+    let normalized = capability::normalize_object(Some(value));
+    Ok((!normalized.is_empty()).then_some(normalized))
 }
 
 /// reasoning 绑定校验：缺省/空 → 空串（无绑定）；给了就必须是字符串且 ≤32 字符。

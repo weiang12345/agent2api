@@ -226,7 +226,7 @@ impl Db {
 /// 「语句返回了行却没人取」的返回值处理问题；`execute_batch` 只要求语句跑完，
 /// 不解析结果行，这几条一条串写最省事。
 ///
-/// 三条各自的作用：
+/// 四条各自的作用：
 ///   - `journal_mode=WAL`：写不再阻塞读（回滚日志模式下写期间读会被挡住）。
 ///     注意 WAL 是**写进库文件头的持久设置**，设一次以后一直有效；这里每次
 ///     打开都设一遍是为了幂等，且能从回滚日志模式库里自动切过来。
@@ -239,11 +239,18 @@ impl Db {
 ///   - `foreign_keys=ON`：SQLite 默认**关闭**外键约束（为兼容旧版而留的坑），
 ///     必须逐连接开启。现在表之间还没有外键，但先开着 —— 后续切片加关联表时
 ///     不会因为「忘了开这个 PRAGMA」而静默失去约束。
+///   - `busy_timeout=5000`：写锁被别人持着时最多等 5 秒，而不是立刻报
+///     `SQLITE_BUSY`。这一条只在**跨进程**时起作用：本机可能同时跑两个实例
+///     （桌面壳让开发版与正式版并存 —— 端口与 identifier 各自独立，数据目录
+///     仍共用同一个库），而进程内那把连接锁管不到另一个进程。桌面壳读设置
+///     的那条短命连接同样设了 5 秒，两处口径一致。连接级设置，不写进库文件，
+///     每次打开都要设。
 fn apply_pragmas(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
-         PRAGMA foreign_keys=ON;",
+         PRAGMA foreign_keys=ON;
+         PRAGMA busy_timeout=5000;",
     )
     .map_err(|error| format!("设置数据库 PRAGMA 失败: {error}"))
 }

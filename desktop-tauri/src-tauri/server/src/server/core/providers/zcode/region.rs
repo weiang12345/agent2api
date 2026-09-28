@@ -122,10 +122,18 @@ impl Region {
         }
     }
 
-    /// 开放平台业务域（API Key 解析用；参考实现的 `bizHost`）
+    /// 编码套餐业务域（凭证换取用，见 `coding_key.rs`）。
+    ///
+    /// ── 国内版为什么是 `bigmodel.cn` 而不是 `open.bigmodel.cn` ──
+    /// 参考实现里这两个域是分开的：它的 `ProviderDef.bizHost` 字段是
+    /// `open.bigmodel.cn`（那是给另一处「API Key 解析」用的），而真正跑登录
+    /// 换取的 `resolver.resolveCodingPlanCredential` **硬编码**了
+    /// `https://bigmodel.cn`。本函数服务的正是后者那条链，因此取后者。
+    /// 两个域实测都能响应 `/api/biz/*`（假令牌下返回同一种 401 文案），
+    /// 但既然有实测跑通的那一个，就没有理由去猜另一个。
     pub fn biz_host(self) -> &'static str {
         match self {
-            Self::Cn => "https://open.bigmodel.cn",
+            Self::Cn => "https://bigmodel.cn",
             Self::Intl => "https://api.z.ai",
         }
     }

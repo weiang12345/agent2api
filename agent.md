@@ -5,7 +5,8 @@
 
 ## 0. 版本号约定
 
-- 版本号形如 `X.Y.Z`（如 `2.7.2`），日常小版本「递增 0.01」= 末位 +1。
+- 版本号形如 `X.Y.Z`（如 `2.7.2`），日常小版本「递增 0.01」= 末位 +1（如 `2.7.8` → `2.7.9`）。
+- **递增幅度以用户要求为准**：默认用上面的「递增 0.01」；用户另有要求时（如「这次递增 0.1」）一律听用户的，按用户指定的幅度算出新版本号，不要自作主张套用默认幅度。
 - **版本号要同步改 5 处**（缺一处会导致安装包与显示版本对不上）：
   1. `package.json`（根）
   2. `desktop-tauri/package.json`
@@ -46,7 +47,7 @@ git push origin vX.Y.Z
 | `build.yml`（build） | Windows NSIS 安装包 + macOS universal dmg | `macos` / `windows` 两个 job 构建并上传 artifact（macOS 包**只能在 CI 构建**，无法从 Windows 交叉编译）；安装包只挂 artifact，GitHub Release 由本地脚本挂载（见第 4 节） |
 | `docker.yml`（docker） | Docker Hub `aimodcc/agent2api:<版本>` + `:latest`（amd64 / arm64 双架构） | 手动 `workflow_dispatch` 触发时只出 `:dev` 测试 tag，不碰正式 tag |
 
-跟踪进度：
+跟踪进度（手动跑 gh 前要先设代理，见第 6 节）：
 
 ```bash
 gh run list --limit 4          # 确认工作流都已触发
@@ -69,10 +70,17 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 
 ## 5. 验收清单（三处核对）
 
-- [ ] GitHub Release：`gh release view vX.Y.Z` —— 正文日志齐全，exe / dmg 两个附件都在；
+- [ ] GitHub Release：`gh release view vX.Y.Z`（手动跑 gh 前先设代理，见第 6 节）—— 正文日志齐全，exe / dmg 两个附件都在；
 - [ ] Docker Hub：`aimodcc/agent2api` 的 Tags 页出现 `<版本>` 与 `latest`，Pushed 时间一致；
 - [ ] 安装包「关于」页版本号与 tag 一致。
 
 ## 6. 已知坑与排查
 
 - **GHCR 新包默认私有**：若以后镜像改推 GHCR，首次推送后需到包设置手动改 Public（当前推的是 Docker Hub，无此问题）。
+- **gh 不读 git 的代理配置，跑 gh 前要先设代理环境变量**：`gh` 是 Go 程序，不读 `~/.gitconfig` 里的 `http(s).proxy`，也不读 Windows 系统代理（WinINET），只认 `HTTPS_PROXY` / `HTTP_PROXY` 环境变量。本机 GitHub 直连时通时不通，手动执行 gh 命令前先设：
+
+  ```bash
+  export HTTPS_PROXY=$(git config --get-urlmatch http.proxy https://github.com || git config --get https.proxy)
+  ```
+
+  只设 `HTTPS_PROXY` 就够（gh 的请求全是 HTTPS，实测不读 `HTTP_PROXY`）。第 4 节的 `scripts/release.sh` 已内置这一步（从 git 配置读取后透传给 gh），用脚本发版无需手动设。代理没开时 gh 会立刻报 `proxyconnect tcp: ... connection refused` 而不回退直连 —— 与 `git push` 的表现一致。

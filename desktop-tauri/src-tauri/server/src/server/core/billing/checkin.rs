@@ -51,10 +51,7 @@ pub struct CheckinError {
 
 impl CheckinError {
     fn new(message: impl Into<String>, status_code: i32) -> Self {
-        Self {
-            message: message.into(),
-            status_code,
-        }
+        Self { message: message.into(), status_code }
     }
 }
 
@@ -67,13 +64,18 @@ impl std::fmt::Display for CheckinError {
 /// 国际版没有签到活动，签到相关操作一律排除该版本账号
 /// （Node: `account.edition !== 'intl'`）。
 ///
+/// **Qoder 也吃这条判据**：它的公开账号形态带 `edition`（`account_store` 把
+/// `Region::edition()` 写进公开字段，global → `intl`），而签到活动只有中国版有
+/// （国际版的 legacy 签到路径 404、活动列表里只有促销），于是「非 intl」这一条
+/// 刚好把国际版 Qoder 排除、放行中国版 —— 不需要为它再加一条 provider 特判。
+///
 /// Accio 系（两个地区）**整家**也没有签到活动：上游客户端全包检索不到
 /// 「签到 / checkin / 每日任务」的任何痕迹（见 `providers::accio` 的模块头）。
 /// 它按 **provider id** 排除而不是 edition —— 两个地区都没有活动，而 provider
 /// 是落盘契约，不会因为凭证里多一个字段而改变判定。
 ///
-/// 这一步是**必需的**：`checkin_for` 的分派 match 里，不在范围的家会落到
-/// workbuddy 那个兜底分支，拿 Accio 的账号去打腾讯的签到接口只会稳定报错。
+/// 这一步是**必需的**：不在范围的家会落到 `checkin_for` 的分派里，拿另一家的
+/// 令牌去打错的签到接口只会稳定报错（见那里的最后两条分支）。
 pub fn supports_checkin(account: &Value) -> bool {
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
         return false;
@@ -175,21 +177,25 @@ pub fn resolve_checkin_targets(
 /// 单个账号签到。已签到（上游非 0 code）不算错误，原样返回结果 ——
 /// 前端把「今天已签到」显示成一条 warn 提示。
 ///
-/// ── 按提供商分派（三家的接口互不相通）────────────────────────
+/// ── 按提供商分派（四家的接口互不相通）────────────────────────
 ///   - **WorkBuddy**：计费服务的每日签到（`billing.claim_daily_checkin`）；
 ///   - **小浣熊**：桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）；
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
-///     （`providers::autoclaw::checkin::claim_daily_signin`）。
+///     （`providers::autoclaw::checkin::claim_daily_signin`）；
+///   - **Qoder**：活动（campaign）领取链路，只有中国版有
+///     （`providers::qoder::checkin::claim_daily_checkin`）。
+///   - **Trae**：`checkin_credits` 领取链路（`providers::trae::models::checkin`）。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
-/// 优化。三个分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
-/// 各家的 claim 都由各自的实现对齐成 `{success, msg}` 形状。
-pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account: &Value) -> Value {
-    let id = account
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+/// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
+/// 各家的 claim 都由各自的实现对齐成 `{success, msg}` 形状。最后的兜底**只认**
+/// 默认那家（WorkBuddy），未知家明确报「未接入」——见那里的说明。
+pub async fn checkin_for(
+    store: &AccountStore,
+    billing: &BillingService,
+    account: &Value,
+) -> Value {
+    let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
     let display = name.as_str().unwrap_or(&id).to_string();
     // 分派的键就是账号的 provider id（`provider_of` 已归一）；AutoClaw 两个
@@ -205,14 +211,25 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
             claim_result(id, name, &display, true, claim)
         }
         "autoclaw" | "autoclaw-intl" => {
-            let region =
-                crate::server::core::providers::autoclaw::Region::from_provider_id(provider_id)
-                    .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
+            let region = crate::server::core::providers::autoclaw::Region::from_provider_id(
+                provider_id,
+            )
+            .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
             let claim = crate::server::core::providers::autoclaw::checkin::claim_daily_signin(
                 region, store, &id,
             )
             .await
             .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "qoder" => {
+            // 中国版的每日权益以活动（campaign）形式下发；国际版没有签到计划，
+            // 它由 `supports_checkin` 挡在入口（Qoder 公开形态带 edition），
+            // 实现里的国际版文案只是兜底。
+            let claim =
+                crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
         "trae" => {
@@ -248,7 +265,11 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
             }
             claim_result(id, name, &display, true, claim)
         }
-        _ => {
+        // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
+        // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
+        // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
+        // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露。
+        _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID => {
             let Some(entry) = store.get_session_by_id(&id) else {
                 return json!({
                     "id": id,
@@ -263,6 +284,12 @@ pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account
                 .map_err(|error| error.message);
             claim_result(id, name, &display, false, claim)
         }
+        other => json!({
+            "id": id,
+            "name": name,
+            "claim": Value::Null,
+            "error": format!("{other} 的签到链路尚未接入"),
+        }),
     }
 }
 
@@ -282,10 +309,7 @@ fn claim_result(
 ) -> Value {
     match result {
         Ok(claim) => {
-            let success = claim
-                .get("success")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
             let msg = claim.get("msg").and_then(Value::as_str).unwrap_or("");
             if success {
                 if log_success_msg && !msg.is_empty() {
@@ -294,10 +318,7 @@ fn claim_result(
                     logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
                 }
             } else {
-                logging::log(
-                    "[Accounts]",
-                    &format!("账号 {display}: 签到未领取（{msg}）"),
-                );
+                logging::log("[Accounts]", &format!("账号 {display}: 签到未领取（{msg}）"));
             }
             json!({ "id": id, "name": name, "claim": claim, "error": Value::Null })
         }

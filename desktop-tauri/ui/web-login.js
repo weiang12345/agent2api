@@ -68,10 +68,12 @@
       if (loginActive && loginProvider === config.provider) {
         button_.disabled = true;
         button_.innerHTML = `<span class="spinner"></span>${config.busyText || '等待登录完成…'}`;
-        if (cancel_) cancel_.style.display = '';
+        // 取消按钮切 hidden 属性而不是行内 display：它是组件库的 Button（自带带
+        // !important 的 inline-flex 工具类），行内样式压不过它
+        if (cancel_) cancel_.hidden = false;
         return;
       }
-      if (cancel_) cancel_.style.display = 'none';
+      if (cancel_) cancel_.hidden = true;
       if (loginActive) {
         // 别家在等待：主进程同一时刻只允许一个登录流程，本家的发起按钮必须禁用
         button_.disabled = true;

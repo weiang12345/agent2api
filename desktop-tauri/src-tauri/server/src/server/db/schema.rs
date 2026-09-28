@@ -53,10 +53,10 @@
 //! 当前配置项（`apiKeys` / `modelRules` / `logRetentionDays` / `debugMode` /
 //! `sanitizeBlacklistFingerprints` / `promptMode` / `promptFile` /
 //! `scheduledTasks` / `autoCheckin` / `locale` / `lastRequestModel` /
-//! `providerRoute` / 三个 `*Dir` / 三个 `*RetentionDays` / 三个 `retry*` /
-//! 六条 `scheduledTasks.*` 子键 / 三个 `*Imported` 标记 / 旧字段 `apiKey`）
-//! 与固定键**无冲突**，逐项核对过（全仓 `update_raw_field` / `raw.insert` /
-//! `KEY_*` 常量的取值集合 vs 下面的 `RESERVED_KV_KEYS`）。
+//! `providerRoute` / `updateProxy` / 三个 `*Dir` / 三个 `*RetentionDays` /
+//! 三个 `retry*` / 六条 `scheduledTasks.*` 子键 / 三个 `*Imported` 标记 /
+//! 旧字段 `apiKey`）与固定键**无冲突**，逐项核对过（全仓 `update_raw_field` /
+//! `raw.insert` / `KEY_*` 常量的取值集合 vs 下面的 `RESERVED_KV_KEYS`）。
 //! 后加固定键名时**必须**回来核对一次：撞名的代价是用户的配置或状态被静默
 //! 覆盖，而两处代码离得很远（一个在本文件，一个在使用方）。
 
@@ -130,6 +130,17 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 「各家上次成功拉到的清单」一个键（十份清单挤一个键的理由见那个模块头）。
     // 属于「其它零散状态」——它不是配置项，配置写入绝不能动它。
     "modelCatalogCache",
+    // 后台任务的持久化排期与执行状态（core::task_state）：整份「每条任务的
+    // 上次尝试 / 上次成功 / 下次执行 / 失败冷却 / 缓存值」一个键。它替代了
+    // 改造前「排期只在内存里、重启即从头」的形态 —— 于是重启不再让
+    // GitHub 检查、余额查询、模型刷新、凭证维护各多打一轮上游请求。
+    // 属于「其它零散状态」：配置写入绝不能动它（否则排期归零、重启又立刻重跑）。
+    "backgroundTaskState",
+    // 最近一次「定时查询积分」的结果快照（core::usage_query）：整份
+    // `{at, results, skipped}` 一个键，让界面在重启后仍能看到上次结果与查询时刻。
+    // 与上面的排期分开存：一个是「下次什么时候跑」，一个是「上次跑出了什么」，
+    // 生命周期不同（快照会被手动查询覆盖，排期不会）。同样不归配置管。
+    "usageQuerySnapshot",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -480,7 +491,7 @@ ALTER TABLE requests ADD COLUMN upstream_reasoning TEXT NOT NULL DEFAULT '';
 /// ── 存什么 ──────────────────────────────────────────────────
 ///   - `phase`：该请求当前所处的转发阶段，取值是 `core::upstream::usage::
 ///     LogPhase` 的四个字面量（`connecting` 连接中 / `waiting` 等待响应 /
-///     `streaming` 响应中 / `retrying` 重试中）；空串 = 不在途（终态行、
+///     `streaming` 响应中 / `retrying` 重试中 / `queued` 排队中）；空串 = 不在途（终态行、
 ///     旧行、以及转发前就失败从未插入过在途行的行）。
 ///   - `phase_started_at`：**进入当前阶段**的时刻（毫秒时间戳，与 `ts`
 ///     同一口径）。阶段计时（请求日志状态列第二行）由它算出来。

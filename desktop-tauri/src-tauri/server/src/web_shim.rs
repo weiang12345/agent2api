@@ -505,6 +505,12 @@ pub fn shim_js() -> &'static str {
     },
     addCustomModel: function (provider, id) { return call('POST', '/api/models/custom', { provider: provider, id: id }); },
     removeCustomModel: function (provider, id) { return call('POST', '/api/models/custom/remove', { provider: provider, id: id }); },
+    // 能力位覆盖（只服务内置家）：`capabilities` 各键三态 —— 不给 = 不改、
+    // null = 恢复清单原值、给值 = 覆盖。自定义家走 /api/custom-providers/models
+    // 的整表保存（见后端 handler 的说明），不经过这里。
+    setModelCapabilities: function (provider, id, capabilities) {
+      return call('POST', '/api/models/capabilities', { provider: provider, id: id, capabilities: capabilities });
+    },
 
     // ── 网关 API Key（多把）──
     getKeys: function () { return call('GET', '/api/keys'); },
@@ -597,6 +603,12 @@ pub fn shim_js() -> &'static str {
     // ── 软件更新（检查可用，下载 / 安装明确拒绝）──
     checkUpdate: function () { return invokeShell('check_update'); },
     getUpdateStatus: function () { return call('GET', '/api/update/status'); },
+    // 「软件更新」的出网线路（null = 直连）：与桌面 bridge 对齐，面板下拉读写
+    getUpdateProxy: function () { return call('GET', '/api/update/proxy'); },
+    setUpdateProxy: function (payload) { return call('POST', '/api/update/proxy', payload); },
+    // GitHub 令牌：读只报 {filled, origin}，写传 {token: '…' | null}
+    getUpdateToken: function () { return call('GET', '/api/update/token'); },
+    setUpdateToken: function (payload) { return call('POST', '/api/update/token', payload); },
     downloadUpdate: function (payload) { return invokeShell('download_update', payload); },
     updateProgress: function () { return invokeShell('update_progress'); },
     cancelUpdate: function () { return invokeShell('cancel_update'); },
@@ -667,6 +679,12 @@ pub fn shim_js() -> &'static str {
     // ── 请求重试 ──
     getRetry: function () { return call('GET', '/api/retry'); },
     saveRetry: function (patch) { return call('PUT', '/api/retry', patch); },
+    // ── 上游请求超时（四项）──
+    getTimeouts: function () { return call('GET', '/api/timeouts'); },
+    saveTimeouts: function (patch) { return call('PUT', '/api/timeouts', patch); },
+    // ── 排队等待（次数 / 单次秒数）──
+    getQueue: function () { return call('GET', '/api/queue'); },
+    saveQueue: function (patch) { return call('PUT', '/api/queue', patch); },
 
     // ── 调试模式 ──
     getDebug: function () { return call('GET', '/api/debug'); },
@@ -700,6 +718,10 @@ pub fn shim_js() -> &'static str {
 
     // ── 窗口主题：没有窗口主题可钉，交给系统/浏览器偏好 ──
     setWindowTheme: function () { return Promise.resolve(); },
+    // ── 界面缩放：网页端的缩放归浏览器自己（Ctrl +/- 与浏览器菜单的缩放档位）──
+    // 空实现而不是拒绝：设置页里这一项在网页端是禁用状态、根本点不到，
+    // 只有 app.js 的启动应用会调到这里 —— 抛错只会在控制台留一条无意义的噪声。
+    setZoom: function () { return Promise.resolve(); },
 
     // ── 自定义标题栏的窗口三键：网页端没有应用窗口 ──
     // 按「能映射则映射，不能则明确拒绝」的惯例处理：三个动作明确拒绝，

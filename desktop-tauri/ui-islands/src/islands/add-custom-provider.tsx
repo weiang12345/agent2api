@@ -1,0 +1,436 @@
+/**
+ * Agent2API · 「添加账号」弹窗：自定义提供商（新建 / 加入已有）。
+ *
+ * 替换旧 ui/add-custom-provider.js。自定义提供商（custom- 前缀，运行期数据）的
+ * 添加方式有两种：新建提供商 + 首个账号（POST /api/custom-providers）、往已有
+ * 提供商再加账号（POST /api/accounts）—— 字段与端点都成对出现，与内置家那份
+ * 「一份字段配置 + 统一提交」的模型对不上，因此单独一块。
+ *
+ * ── 两种添加方式怎么选 ────────────────────────────────────
+ * **不由块内问**。第 1 步点的是「新建自定义提供商」那张卡还是一家已有提供商的
+ * 卡片，本身就已经回答了「给谁加账号」：前者上下文里没有 id → 新建，后者带着
+ * 那家的 id → 加入已有并预选它。要改主意关掉表单弹窗回列表重选（第 1 步还在
+ * 下面开着）。于是这里只剩「按上下文落到哪种模式」，没有模式切换控件。
+ *
+ * ── 主按钮为什么在底部操作条 ──────────────────────────────
+ * 留在字段流里它会和输入框同一个节奏、主次不分，底部条同时给失败提示一个固定
+ * 位置（toast 几秒后就没了）。因此拆成两个组件：表单段（这里）与底部操作条
+ * （CustomFootActions），两者只通过 DOM id 与 mode 沟通 —— 提交读的就是
+ * 输入框当前值，与旧实现一致。
+ */
+
+import * as React from 'react'
+import {
+  Button,
+  DialogSection,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@ui'
+
+import {
+  clearFields,
+  describeError,
+  draftProps,
+  readField,
+  setDraftValue,
+  shared,
+  toast,
+  type CustomProviderRecord,
+} from './add-account-bridge'
+
+/** 展示名长度上限（与后端 custom_providers::MAX_NAME_CHARS 一致，前端先挡一次） */
+const MAX_NAME_CHARS = 64
+/** 账号备注名长度上限（与 add-provider-forms 的 MAX_NAME_LENGTH 同一口径） */
+const MAX_ACCOUNT_NAME_CHARS = 100
+
+/** Base URL 的两种填法：Anthropic 走根地址，OpenAI 兼容要带 /v1（后端按协议拼路径） */
+const BASE_HINT_OPENAI = 'OpenAI 兼容填到 /v1；Anthropic 填根地址'
+const BASE_HINT_ANTHROPIC = 'Anthropic 协议填根地址，不要带 /v1'
+const BASE_PLACEHOLDER_OPENAI = 'https://open.bigmodel.cn/api/paas/v4'
+const BASE_PLACEHOLDER_ANTHROPIC = 'https://api.anthropic.com'
+
+/** 协议下拉的兜底选项：值必须与后端 PROTOCOLS 逐字一致（选项定义收在 providers.js） */
+const FALLBACK_PROTOCOLS = [
+  { value: 'chat_completions', label: 'OpenAI - Chat Completions' },
+  { value: 'responses', label: 'OpenAI - Responses' },
+  { value: 'anthropic', label: 'Anthropic - Messages' },
+]
+
+const PROTOCOL_ID = 'custom-protocol-select'
+const NAME_ID = 'custom-name-input'
+const BASEURL_ID = 'custom-baseurl-input'
+const APIKEY_ID = 'custom-apikey-input'
+const EXISTING_SELECT_ID = 'custom-existing-select'
+const EXISTING_APIKEY_ID = 'custom-existing-apikey-input'
+const EXISTING_NAME_ID = 'custom-existing-name-input'
+
+export const CREATE_BUTTON_ID = 'custom-create-button'
+export const EXISTING_BUTTON_ID = 'custom-existing-button'
+export const REMOVE_BUTTON_ID = 'custom-existing-remove'
+
+/** 提交互斥锁：弹窗内的提交不占用账号列表的 busy 锁（与内置家的 addBusy 同一取向） */
+let submitBusy = false
+
+const protocolOptions = (): Array<{ value: string; label: string }> =>
+  shared().wbProviders?.PROTOCOL_OPTIONS || FALLBACK_PROTOCOLS
+
+const customList = (): CustomProviderRecord[] => shared().wbProviders?.customList?.() || []
+
+/** 提交按钮的忙态包装（与内置家的 runAdd 同一形制；锁是模块级的，弹窗内互斥） */
+async function runSubmit(setBusy: (value: boolean) => void, task: () => Promise<void>): Promise<void> {
+  if (submitBusy) return
+  submitBusy = true
+  setBusy(true)
+  try {
+    await task()
+  } finally {
+    submitBusy = false
+    setBusy(false)
+  }
+}
+
+/** 添加成功后的统一收尾：关弹窗、刷新自定义目录与账号列表、提示 */
+async function afterCustomAdd(message: string): Promise<void> {
+  // 两层一起关（表单弹窗 + 下面的列表弹窗）：只摘外层会让表单留在屏幕上
+  shared().wbAddAccountModal?.close?.()
+  // 目录先刷：账号行 / 筛选器显示的提供商名都来自 wbProviders 的缓存
+  void shared().wbProviders?.refreshCustom?.()
+  await shared().wbApp?.refresh?.()
+  toast(message)
+}
+
+/* ─── 表单段 ─────────────────────────────── */
+
+export type CustomMode = 'create' | 'existing'
+
+export function CustomProviderBlock({
+  mode,
+  providerHint,
+  presetKey,
+  showToken,
+  version,
+}: {
+  mode: CustomMode
+  /** 第 1 步点的是某一家已有提供商时的 id（空串 = 没有指定） */
+  providerHint: string
+  /** 第 1 步点的是预置家卡片时的 key（空串 = 不是从预置卡进来的） */
+  presetKey: string
+  /** 第 1 步每点一次卡就 +1：让预填在「再次点同一张预置卡」时也重新执行（旧 onShow 每次都跑） */
+  showToken: number
+  /** 目录刷新后的重画信号 */
+  version: number
+}): React.ReactElement {
+  const options = protocolOptions()
+  const [protocol, setProtocol] = React.useState(() => readField(PROTOCOL_ID) || options[0].value)
+  /** 预置家给的 Base URL 备注（用户一改协议就失效，回到按协议算的那句） */
+  const [baseHintOverride, setBaseHintOverride] = React.useState('')
+  const [picked, setPicked] = React.useState(() => readField(EXISTING_SELECT_ID))
+
+  const list = React.useMemo(() => customList(), [version])
+  // 待选中的那家（带着上下文进来）优先；它不在列表里（目录还没到 / 已被删除）
+  // 时退回已选中的、再退回第一项
+  const wanted = providerHint && list.some(item => item.id === providerHint) ? providerHint : ''
+  const current = wanted || (list.some(item => item.id === picked) ? picked : (list[0]?.id || ''))
+  const pickedName = list.find(item => item.id === current)?.name || '该提供商'
+
+  // 提交动作在底部操作条那个组件里，它按 id 现读「当前选中的是哪一家」——
+  // 下拉是组件库的按钮触发器（不是原生 select），值只能落到草稿里给它读
+  React.useEffect(() => {
+    setDraftValue(EXISTING_SELECT_ID, current)
+  }, [current])
+
+  /**
+   * 切到这一家时按上下文落到哪种模式：预置家卡片把名称 / 协议 / Base URL 预填进
+   * 新建表单（都可改），而 quirks（上游特判）不进表单 —— 提交时原样随记录写入。
+   * 与旧实现的 onShow 同一时序：先按协议刷提示，再填预置值。
+   */
+  React.useEffect(() => {
+    if (mode !== 'create' || !presetKey) return
+    const preset = shared().wbPresetProviders?.presetOf?.(presetKey)
+    if (!preset) return
+    setDraftValue(NAME_ID, preset.name || '')
+    setDraftValue(BASEURL_ID, preset.baseUrl || '')
+    if (preset.protocol) {
+      setProtocol(preset.protocol)
+      setDraftValue(PROTOCOL_ID, preset.protocol)
+    }
+    setBaseHintOverride(preset.hint || '')
+    // showToken 参与依赖：同一张预置卡再点一次也要重新预填（旧 onShow 每次进这一屏都跑）
+  }, [mode, presetKey, providerHint, showToken])
+
+  const anthropic = protocol === 'anthropic'
+  const baseHint = baseHintOverride || (anthropic ? BASE_HINT_ANTHROPIC : BASE_HINT_OPENAI)
+
+  return (
+    <>
+      <DialogSection hidden={mode !== 'create'}>
+        <div className='add-panel-head'>
+          <h3>上游信息</h3>
+          <span>创建这个提供商，并同时建立它的第一个账号。</span>
+        </div>
+        <div className='add-form'>
+          <div className='add-field'>
+            <Label htmlFor={NAME_ID}>
+              名称
+              <i className='req' aria-hidden='true'>*</i>
+            </Label>
+            <Input
+              id={NAME_ID}
+              type='text'
+              maxLength={MAX_NAME_CHARS}
+              aria-required='true'
+              placeholder='如：智谱 GLM'
+              {...draftProps(NAME_ID)}
+            />
+            <span className='hint'>1~64 个字符，账号列表里按它分组显示</span>
+          </div>
+          <div className='add-field'>
+            <Label htmlFor={PROTOCOL_ID}>协议</Label>
+            {/* 协议换了下方的 Base URL 提示跟着换，因此这里受控 */}
+            <Select
+              value={protocol}
+              onValueChange={next => {
+                const value = String(next)
+                setProtocol(value)
+                setDraftValue(PROTOCOL_ID, value)
+                setBaseHintOverride('')
+              }}
+            >
+              {/* .add-field 的网格规则只认原生 select（`> select`），触发器要自己带位置 */}
+              <SelectTrigger id={PROTOCOL_ID} className='col-start-2 row-start-1 w-full'>
+                <SelectValue>{options.find(item => item.value === protocol)?.label || protocol}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {options.map(item => (
+                  <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className='add-field'>
+            <Label htmlFor={BASEURL_ID}>
+              Base URL
+              <i className='req' aria-hidden='true'>*</i>
+            </Label>
+            <Input
+              id={BASEURL_ID}
+              type='text'
+              aria-required='true'
+              placeholder={anthropic ? BASE_PLACEHOLDER_ANTHROPIC : BASE_PLACEHOLDER_OPENAI}
+              {...draftProps(BASEURL_ID)}
+            />
+            <span className='hint' id='custom-baseurl-hint'>{baseHint}</span>
+          </div>
+          <div className='add-field'>
+            <Label htmlFor={APIKEY_ID}>API Key</Label>
+            <Input
+              id={APIKEY_ID}
+              type='password'
+              autoComplete='new-password'
+              placeholder='sk-…'
+              {...draftProps(APIKEY_ID)}
+            />
+            <span className='hint'>留空表示无鉴权上游</span>
+          </div>
+        </div>
+      </DialogSection>
+
+      <DialogSection hidden={mode !== 'existing'}>
+        <div className='add-panel-head'>
+          <h3>账号信息</h3>
+          <span>
+            添加到 <b>{pickedName}</b>　同一家可以放多把 key，按优先级轮换。
+          </span>
+        </div>
+        <div className='add-form'>
+          <div className='add-field'>
+            <Label htmlFor={EXISTING_SELECT_ID}>提供商</Label>
+            <Select
+              value={current}
+              onValueChange={next => setPicked(String(next))}
+            >
+              <SelectTrigger id={EXISTING_SELECT_ID} className='col-start-2 row-start-1 w-full'>
+                <SelectValue>{pickedName}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {list.map(item => (
+                  <SelectItem key={item.id} value={item.id}>{item.name || item.id}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className='add-field'>
+            <Label htmlFor={EXISTING_APIKEY_ID}>API Key</Label>
+            <Input
+              id={EXISTING_APIKEY_ID}
+              type='password'
+              autoComplete='new-password'
+              placeholder='sk-…'
+              {...draftProps(EXISTING_APIKEY_ID)}
+            />
+            <span className='hint'>留空表示无鉴权上游</span>
+          </div>
+          <div className='add-field'>
+            <Label htmlFor={EXISTING_NAME_ID}>备注名</Label>
+            <Input
+              id={EXISTING_NAME_ID}
+              type='text'
+              maxLength={MAX_ACCOUNT_NAME_CHARS}
+              placeholder='可选'
+              {...draftProps(EXISTING_NAME_ID)}
+            />
+            <span className='hint'>留空则用提供商名称</span>
+          </div>
+        </div>
+      </DialogSection>
+    </>
+  )
+}
+
+/* ─── 底部操作条上的主按钮 ─────────────────── */
+
+/** 提交这一屏要用到的两件事：忙态与失败提示（都由底部操作条那个组件持有） */
+type FootContext = {
+  presetKey: string
+  setBusy: (value: boolean) => void
+  setHint: (message: string) => void
+}
+
+/** 失败提示同时写 toast 与底部条（toast 几秒后就没了） */
+function showSubmitError(context: FootContext, error: unknown): void {
+  const message = describeError(error)
+  toast(`添加失败：${message}`, 'err')
+  context.setHint(message)
+}
+
+/** 新建模式：POST /api/custom-providers（提供商 + 首个账号一次建成） */
+async function submitCreate(context: FootContext): Promise<void> {
+  const name = readField(NAME_ID)
+  const protocol = readField(PROTOCOL_ID) || protocolOptions()[0].value
+  const baseUrl = readField(BASEURL_ID)
+  const apiKey = readField(APIKEY_ID)
+  // 必填拦截在本地先做一次（弹窗不是 <form>，原生 required 不生效）
+  if (!name) { toast('请填写名称', 'err'); return }
+  if (!baseUrl) { toast('请填写 Base URL', 'err'); return }
+  await runSubmit(context.setBusy, async () => {
+    const payload: Record<string, unknown> = { name, protocol, baseUrl }
+    // 预置家的上游特判随记录写入（转发层按这些字段修正请求，见 preset-providers.js 的 quirks）
+    const preset = context.presetKey
+      ? shared().wbPresetProviders?.presetOf?.(context.presetKey)
+      : null
+    const quirks = preset?.quirks || {}
+    if (quirks.urlSuffix) payload.urlSuffix = quirks.urlSuffix
+    if (quirks.headers && Object.keys(quirks.headers).length) payload.headers = { ...quirks.headers }
+    if (quirks.anthropicToolType) payload.anthropicToolType = quirks.anthropicToolType
+    if (apiKey) payload.apiKey = apiKey // 留空 = 无鉴权上游，不进请求体
+    context.setHint('')
+    try {
+      const data = (await shared().wbProviders?.customRequest?.(
+        'POST', '/api/custom-providers', payload,
+      )) as { provider?: { name?: string } } | null
+      clearFields([NAME_ID, BASEURL_ID, APIKEY_ID])
+      const created = data?.provider?.name || name
+      await afterCustomAdd(`✅ 已创建自定义提供商「${created}」并添加账号`)
+    } catch (error) {
+      showSubmitError(context, error)
+    }
+  })
+}
+
+/** 已有模式：POST /api/accounts（custom 账号走 provider = custom-xxx 分支） */
+async function submitExisting(context: FootContext): Promise<void> {
+  const providerId = readField(EXISTING_SELECT_ID)
+  if (!providerId) { toast('请先选择一个自定义提供商', 'err'); return }
+  const apiKey = readField(EXISTING_APIKEY_ID)
+  const name = readField(EXISTING_NAME_ID)
+  await runSubmit(context.setBusy, async () => {
+    const payload: Record<string, unknown> = { provider: providerId }
+    if (apiKey) payload.apiKey = apiKey
+    if (name) payload.name = name
+    context.setHint('')
+    try {
+      const data = (await shared().wbProviders?.customRequest?.(
+        'POST', '/api/accounts', payload,
+      )) as { account?: { name?: string } } | null
+      clearFields([EXISTING_APIKEY_ID, EXISTING_NAME_ID])
+      const label = data?.account?.name
+        || customList().find(item => item.id === providerId)?.name
+        || ''
+      await afterCustomAdd(`✅ 账号已添加${label ? `：${label}` : ''}`)
+    } catch (error) {
+      showSubmitError(context, error)
+    }
+  })
+}
+
+/**
+ * 删除「加入已有」模式下选中的那一家（级联删账号）。
+ *
+ * 动作本身全在 `wbCustomProvidersUi.remove` 里 —— 二次确认（说明将级联删掉多少
+ * 账号）、POST /api/custom-providers/remove、刷新目录与账号列表都在那边，与账号
+ * 设置弹窗里的「删除提供商」共用同一条链；这里只回答两件事：删的是哪一家
+ * （下拉当前值）、删完收什么尾（关弹窗 —— 名下账号连同删光，弹窗里没有可停留
+ * 的上下文了）。
+ */
+async function removeExistingProvider(): Promise<void> {
+  const providerId = readField(EXISTING_SELECT_ID)
+  if (!providerId) { toast('请先选择一个自定义提供商', 'err'); return }
+  const remover = shared().wbCustomProvidersUi?.remove
+  if (typeof remover !== 'function') { toast('删除功能不可用（脚本未就绪）', 'err'); return }
+  await runSubmit(() => {}, async () => {
+    const removed = await remover(providerId)
+    if (removed) shared().wbAddAccountModal?.close?.()
+  })
+}
+
+export function CustomFootActions({
+  mode,
+  presetKey,
+}: {
+  mode: CustomMode
+  presetKey: string
+}): React.ReactElement {
+  const [busy, setBusy] = React.useState(false)
+  const [hint, setHint] = React.useState('')
+  const context: FootContext = { presetKey, setBusy, setHint }
+
+  return (
+    <>
+      <span className={`add-foot-hint${hint ? ' err' : ''}`} id='add-form-foot-hint'>{hint}</span>
+      <span className='add-foot-actions' id='add-form-foot-actions'>
+        {mode === 'existing' ? (
+          <Button
+            id={REMOVE_BUTTON_ID}
+            variant='destructive'
+            title='级联删除名下全部账号，不可恢复'
+            onClick={() => { void removeExistingProvider() }}
+          >
+            删除此提供商
+          </Button>
+        ) : null}
+        {/* 两颗主按钮都常驻、按模式切显隐（与旧实现一致：文案与提交函数成对写在一处） */}
+        <Button
+          id={CREATE_BUTTON_ID}
+          hidden={mode !== 'create'}
+          disabled={busy}
+          onClick={() => { void submitCreate(context) }}
+        >
+          {busy && mode === 'create' ? '提交中…' : '创建并添加账号'}
+        </Button>
+        <Button
+          id={EXISTING_BUTTON_ID}
+          hidden={mode !== 'existing'}
+          disabled={busy}
+          onClick={() => { void submitExisting(context) }}
+        >
+          {busy && mode === 'existing' ? '提交中…' : '添加账号'}
+        </Button>
+      </span>
+    </>
+  )
+}

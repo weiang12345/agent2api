@@ -294,9 +294,23 @@ impl UpstreamService {
         if let Some(object) = upstream_body.as_object_mut() {
             object.insert("stream".to_string(), Value::Bool(true));
         }
+        // ── 历史 sanitize（客户端带来的畸形工具历史）─────────────────
+        // 客户端会把上游偶发产出的畸形工具调用（空 name、丢配对、把别的消息
+        // 插在调用与结果之间）原样写进会话历史，之后每次请求都重放这段坏历史
+        // —— 严格上游对之后每一条用户消息都返回 400，整条会话报废。修在这里
+        // （转发入口、选路之前）而不是各家适配器里：所有家、所有协议、所有
+        // 重试轮次看到的历史因此完全一致。规则见 `protocol::history`。
+        let history = crate::server::core::protocol::history::sanitize_history(&mut upstream_body);
+        if history.notable() {
+            logging::verbose(
+                "[Upstream]",
+                &format!("历史 sanitize：{}", history.describe()),
+            );
+        }
         // 内容处理的两个开关**按请求取一次快照**：同一次请求里各 provider 的判定用同一
-        // 份值（请求进行中改设置不会让语义漂移），且这里的 body 始终是客户端原始
-        // 请求体 —— 处理只发生在「某一家即将发送之前」，见 payload.rs。
+        // 份值（请求进行中改设置不会让语义漂移）。上面那两处改动（stream 归一、
+        // 历史 sanitize）之后 body 才算「待发送的定稿」—— 提示词/脱敏等逐家处理
+        // 发生在「某一家即将发送之前」，见 payload.rs。
         //
         // 配置快照必须在本栈帧里活到转发结束：提示词文本是以**借用**形式随
         // `ProviderContext` 传下去的（见 `ProviderContext::prompt`），提前释放

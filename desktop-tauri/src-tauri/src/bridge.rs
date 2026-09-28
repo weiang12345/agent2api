@@ -30,13 +30,16 @@ fn target_platform() -> &'static str {
     }
 }
 
-/// 桥接脚本全文：模板里的 `__AGENT2API_PLATFORM__` 换成 [`target_platform`]。
+/// 桥接脚本全文：模板里的 `__AGENT2API_PLATFORM__` / `__AGENT2API_TITLE__`
+/// 换成 [`target_platform`] 与 [`crate::app_title`]。
 ///
 /// 为什么用占位替换而不是 `format!`：脚本里有大量 `{}`（对象字面量、模板串），
 /// 走 `format!` 得把它们全转义成 `{{}}`，改一次脚本就要小心翼翼地对一遍括号。
 /// 一个不会被误伤的长占位名更稳。
 pub fn bridge_js() -> String {
-    BRIDGE_JS.replace("__AGENT2API_PLATFORM__", target_platform())
+    BRIDGE_JS
+        .replace("__AGENT2API_PLATFORM__", target_platform())
+        .replace("__AGENT2API_TITLE__", crate::app_title())
 }
 
 const BRIDGE_JS: &str = r#"
@@ -146,6 +149,12 @@ const BRIDGE_JS: &str = r#"
     // 壳的编译目标平台（'macos' / 'windows' / 'linux'）。界面用它裁剪
     // 各平台不可用的功能（见文件头「平台标识」一节）。
     platform: '__AGENT2API_PLATFORM__',
+
+    // ── 标题 ──
+    // 应用标题（窗口标题、托盘提示同一份文案，见壳的 app_title）。开发版
+    // 带 "Dev" 标记 —— 自绘标题栏与 document.title 都按它显示，两个实例
+    // 同时跑时界面上一眼能分清。
+    title: '__AGENT2API_TITLE__',
 
     // ── 会话 ──
     getState: () => call('GET', '/api/session'),
@@ -270,6 +279,10 @@ const BRIDGE_JS: &str = r#"
     // 见后端 `api::model_manage::remove_custom` 的说明。
     addCustomModel: (provider, id) => call('POST', '/api/models/custom', { provider, id }),
     removeCustomModel: (provider, id) => call('POST', '/api/models/custom/remove', { provider, id }),
+    // 能力位覆盖（只服务内置家；自定义家走 /api/custom-providers/models 的
+    // 整表保存，见后端 handler 的说明）。`capabilities` 各键三态：不给 = 不改、
+    // null = 恢复清单原值、给值 = 覆盖。
+    setModelCapabilities: (provider, id, capabilities) => call('POST', '/api/models/capabilities', { provider, id, capabilities }),
 
     // ── 网关 API Key（多把）──
     getKeys: () => call('GET', '/api/keys'),
@@ -386,6 +399,14 @@ const BRIDGE_JS: &str = r#"
     checkUpdate: () => invoke('check_update'),
     // 最近一次「检查更新」的结果（定时任务写入；app.js 轮询它亮侧栏徽标）
     getUpdateStatus: () => call('GET', '/api/update/status'),
+    // 「软件更新」的出网线路：null = 直连。更新面板「检查更新」左侧的下拉读写
+    // （检查与下载安装包都走它，后端出口候选的第一优先级）
+    getUpdateProxy: () => call('GET', '/api/update/proxy'),
+    setUpdateProxy: payload => call('POST', '/api/update/proxy', payload),
+    // 「软件更新」的 GitHub 令牌：读只报 {filled, origin}（后端永不回显本体），
+    // 写传 {token: '…' | null}（null = 清除）。加密落库在后端做
+    getUpdateToken: () => call('GET', '/api/update/token'),
+    setUpdateToken: payload => call('POST', '/api/update/token', payload),
     downloadUpdate: payload => invoke('download_update', {
       url: String((payload && payload.url) || ''),
       name: (payload && payload.name) ? String(payload.name) : null,
@@ -479,6 +500,10 @@ const BRIDGE_JS: &str = r#"
     // 契约同 saveRetry：PUT 允许部分字段，返回生效后的全量值。
     getTimeouts: () => call('GET', '/api/timeouts'),
     saveTimeouts: patch => call('PUT', '/api/timeouts', patch),
+    // ── 排队等待（设置页「通用 → 排队等待」）──
+    // 次数 / 单次秒数，存配置（/api/queue）。契约同 saveTimeouts。
+    getQueue: () => call('GET', '/api/queue'),
+    saveQueue: patch => call('PUT', '/api/queue', patch),
 
     // ── 调试模式（设置页「通用 → 调试模式」）──
     // 开关存配置（debugMode）：开启后转发层把上游原始报文（凭据类头已脱敏）
@@ -520,6 +545,13 @@ const BRIDGE_JS: &str = r#"
     setWindowTheme: theme => invoke('set_window_theme', {
       theme: theme === 'dark' || theme === 'light' ? theme : null,
     }),
+
+    // ── 本壳特有：界面缩放（设置页「显示 → 界面缩放」）──
+    // 入参是**因子**（0.8 ~ 1.3），与壳命令 set_zoom 一致；界面上的百分数
+    // 除以 100 再传进来。返回实际生效的因子（壳侧会规整并校验范围），
+    // 调用方拿它回写显示。网页端 shim 里没有这个方法（浏览器自带缩放，
+    // 界面按 platform==='web' 把这一项禁用掉，不会走到这里）。
+    setZoom: scale => invoke('set_zoom', { scale }),
 
     // ── 本壳特有：自定义标题栏的窗口三键 ──
     // 主窗口去掉了系统装饰（lib.rs 建窗处 decorations(false)），最小化 /

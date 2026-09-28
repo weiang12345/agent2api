@@ -87,8 +87,10 @@ fn number_field(value: Option<&Value>) -> Option<i64> {
 ///     `Waiting`）。
 ///
 /// ── 与 OmniProxy 的对应关系 ─────────────────────────────────
-/// 四个取值与那边的 `LogPhase`（`connecting` / `waiting` / `streaming` /
-/// `retrying`）逐字对应：`as_str()` 的返回值就是落库的字符串，前端按它选文案
+/// 前四个取值与那边的 `LogPhase`（`connecting` / `waiting` / `streaming` /
+/// `retrying`）逐字对应，第五个（`queued`）是本项目的扩展（排队制上游的
+/// 等待阶段，OmniProxy 没有对应物）：`as_str()` 的返回值就是落库的字符串，
+/// 前端按它选文案
 /// （连接中 / 等待响应 / 响应中 / 重试中 —— 同一套文案）。阶段计时的语义也一致：
 /// **进入阶段的时刻**记一次（[`TelemetrySnapshot::phase_started_at`]），
 /// 前端那第二行显示的是「在当前阶段里待了多久」而不是总耗时。
@@ -109,6 +111,15 @@ pub enum LogPhase {
     Streaming,
     /// 本轮失败，退避 / 换号过渡中
     Retrying,
+    /// **上游排队中**：上游没报错，只是把请求排进了队列（模型繁忙），
+    /// 网关按上游建议的时长等着重发（见 `qoder::queue_backoff`）。
+    ///
+    /// 与 `Retrying` 分开的理由：两者的**成因与处置完全不同** —— 重试是「这一轮
+    /// 失败了再打一次」，排队是「这一轮还没开始，在等上游放行」。用户看到「排队中」
+    /// 就知道「不是网关卡住、也不是账号有问题，是模型忙」，而「重试中」会让人以为
+    /// 上游报错了。首次等待由 `note_queued` 进入，退避结束后的重发把它推回
+    /// `Waiting`（`note_attempt_started`）。
+    Queued,
 }
 
 impl LogPhase {
@@ -119,6 +130,7 @@ impl LogPhase {
             Self::Waiting => "waiting",
             Self::Streaming => "streaming",
             Self::Retrying => "retrying",
+            Self::Queued => "queued",
         }
     }
 }
@@ -784,6 +796,45 @@ impl RequestTelemetry {
         self.enter_phase(&mut guard, LogPhase::Retrying);
         // 在途回写：退避重试也是「进行中」期间就值得看到的进展
         // （前端那枚标签的判据含重试次数，见 `hasProcessFacts`）
+        self.flush_live(&guard);
+    }
+
+    /// 上游排队中：记一次「内部等待」并把阶段切到「排队中」。
+    ///
+    /// ── 为什么不是 `note_attempt_retry` ─────────────────────────
+    /// 那条走的是「重试中」阶段。排队不是失败重试，是**等上游放行**：阶段要
+    /// 单独显示成「排队中」，用户才知道这次慢跟账号、限额、登录态都无关
+    /// （文案里也写着这句）。重试事件本身照记 —— 详情弹窗的「内部重试」列表
+    /// 与阶段是两套读数，排队同样该在那份明细里留下一行。
+    pub fn note_queued(
+        &self,
+        reason: &str,
+        status: Option<i64>,
+        delay_ms: u64,
+        wait_number: usize,
+        max_waits: usize,
+    ) {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return;
+        }
+        let mut guard = self.lock();
+        let Some(last) = guard.attempts_detail.last_mut() else {
+            return;
+        };
+        // 序号与总数拼进原因里：详情弹窗那一列直接显示它，用户能看出
+        // 「这是第几次排队等待、上限几次」
+        let label = if max_waits > 0 {
+            format!("{reason}（第 {wait_number}/{max_waits} 次）")
+        } else {
+            reason.to_string()
+        };
+        last.retries.push(RetryEvent {
+            reason: truncate_chars(&label, MAX_ATTEMPT_RETRY_REASON_CHARS),
+            status,
+            delay_ms,
+        });
+        self.enter_phase(&mut guard, LogPhase::Queued);
         self.flush_live(&guard);
     }
 

@@ -105,6 +105,11 @@ pub struct RuntimeConfig {
     /// 与 retry 同一理由：转发层**每次发送 / 每次分片**都要取它（改完设置
     /// 下一个请求就用新值，不重启进程），解析一次存下来最省事。
     timeouts: TimeoutSettings,
+    /// 排队等待的次数与单次时长（设置页「通用 → 排队等待」区域）。
+    ///
+    /// 与 timeouts 同一理由：走排队制的适配器**每次遇到排队**都要取它
+    /// （改完设置下一个请求就用新值，不重启进程），解析一次存下来最省事。
+    queue: QueueSettings,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
     /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
     log_dir: Option<String>,
@@ -137,6 +142,18 @@ pub struct RuntimeConfig {
     /// 于是转发热路径上一次磁盘 IO 都没有；文件读不到时这里已经是「内置默认 +
     /// 一条原因」的形态，转发层不必再处理失败路径。
     prompt: PromptSettings,
+    /// 「软件更新」的出网线路（`updateProxy`：None = 直连，默认）。
+    ///
+    /// 存的是归一后的配置对象（与账号代理同一形状），解析交给
+    /// `core::proxies::resolve_account_proxy`（同一条路）。低频字段（每次
+    /// 检查 / 下载发起时读一次），不值得为它发明解析层，存原始值即可。
+    update_proxy: Option<Value>,
+    /// GitHub 令牌的**密文信封**（`githubToken`：None = 未在界面保存）。
+    ///
+    /// 注意这里从配置里读出来的就已经是 `enc1:` 信封，**明文永远不进
+    /// config 快照**（加解密都在 `core::update::token` 里），环境变量
+    /// 兜底也不在这里管。与 update_proxy 同为低频字段，存原始字符串即可。
+    github_token: Option<String>,
     /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
     raw: Map<String, Value>,
 }
@@ -360,6 +377,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let scheduled = scheduled_from(&raw);
     let retry = retry_from(&raw);
     let timeouts = timeouts_from(&raw);
+    let queue = queue_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）
         api_key: string_field(&raw, "apiKey").or_else(env_api_key),
@@ -373,6 +391,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         scheduled,
         retry,
         timeouts,
+        queue,
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
@@ -400,6 +419,14 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         // 系统提示词：模式非法/缺失 → passthrough（默认），文件读不到 → 内置默认
         // + 一条原因（见 `prompt_from`）
         prompt: prompt_from(&raw),
+        // 更新出网线路：null / 缺省都不进字段（None = 直连）
+        update_proxy: raw
+            .get(KEY_UPDATE_PROXY)
+            .filter(|value| !value.is_null())
+            .cloned(),
+        // GitHub 令牌信封：空串按未设置处理（手改库写出的空值不该被当成密文）
+        github_token: string_field(&raw, KEY_GITHUB_TOKEN)
+            .filter(|envelope| !envelope.is_empty()),
         raw,
     }
 }
@@ -922,6 +949,45 @@ pub fn set_timeouts(patch: TimeoutPatch) -> bool {
     })
 }
 
+// ─── 排队等待（queueMaxWaits / queueWaitSeconds）──────────────
+
+/// 只取排队等待的两项（**不克隆整份 raw**）。
+///
+/// 与 `timeout_settings()` 同一取舍：走排队制的适配器每次遇到排队都要取一次，
+/// 读锁取一份 `Copy` 快照即可。未初始化时给默认值。
+pub fn queue_settings() -> QueueSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.queue;
+        }
+    }
+    QueueSettings::default()
+}
+
+/// 更新排队等待（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`queue_api::put_queue`）**必须先校验范围**：本函数按「已合法」处理，
+/// 越界值会被 `bounded_int_field` 的回读逻辑丢弃。与 `set_timeouts` 同一模式：
+/// 内存快照与 raw 底稿一起改。
+pub fn set_queue(patch: QueuePatch) -> bool {
+    update(|config| {
+        let mut next = config.queue;
+        if let Some(count) = patch.max_waits {
+            config
+                .raw
+                .insert(KEY_QUEUE_MAX_WAITS.to_string(), Value::from(count));
+            next.max_waits = count;
+        }
+        if let Some(seconds) = patch.wait_seconds {
+            config
+                .raw
+                .insert(KEY_QUEUE_WAIT_SECONDS.to_string(), Value::from(seconds));
+            next.wait_seconds = seconds;
+        }
+        config.queue = next;
+    })
+}
+
 // ─── 调试模式（debugMode）────────────────────────────────────
 
 /// 写入调试模式开关。
@@ -964,6 +1030,80 @@ pub fn set_captcha_enabled(enabled: bool) -> bool {
             .raw
             .insert(KEY_CAPTCHA_ENABLED.to_string(), Value::Bool(enabled));
         config.captcha_enabled = enabled;
+    })
+}
+
+// ─── 更新出网线路（updateProxy）─────────────────────────────
+
+/// 只取「软件更新」出网线路的轻量读取（**不克隆整份 raw**）。
+///
+/// 检查与下载各只在**发起时**读一次（低频），但同样不必为它克隆整份
+/// `raw` Map —— 读锁取那一个字段即可。未初始化时给 None（直连）。
+pub fn update_proxy() -> Option<Value> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.update_proxy.clone();
+        }
+    }
+    None
+}
+
+/// 写入「软件更新」的出网线路（None = 直连）。
+///
+/// 值由调用方先归一（`api::update` 走 `normalize_account_proxy`），这里不做
+/// 二次校验 —— 解析失败（出口后来被删 / 被禁）由读取方兜底（回退默认出口，
+/// 见 `core::update::client`），与账号转发「代理不可用回退直连」同一取向。
+/// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（下一次检查 / 下载
+/// 就用新线路，含定时任务，不必重启进程），写盘时不吃掉其它字段。
+pub fn set_update_proxy(proxy: Option<Value>) -> bool {
+    update(move |config| {
+        match proxy.clone() {
+            Some(value) => {
+                config.raw.insert(KEY_UPDATE_PROXY.to_string(), value);
+                config.update_proxy = proxy.clone();
+            }
+            None => {
+                // 直连**删掉键**而不是写 null：与 set_api_key(None) 同一语义，
+                // 配置里不留没意义的空值（读侧也按缺省 = 直连处理）
+                config.raw.remove(KEY_UPDATE_PROXY);
+                config.update_proxy = None;
+            }
+        }
+    })
+}
+
+// ─── GitHub 令牌信封（githubToken）────────────────────────
+
+/// 只取 GitHub 令牌密文信封的轻量读取（**不克隆整份 raw**）。
+///
+/// 加解密都在 `core::update::token`（这里只存取信封，理由见字段说明）。
+/// 未初始化时给 None（未在界面保存）。
+pub fn github_token_envelope() -> Option<String> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.github_token.clone();
+        }
+    }
+    None
+}
+
+/// 写入 GitHub 令牌的密文信封（None = 清除，连键一起删）。
+///
+/// **只收信封不收明文**：调用方（`core::update::token::set_token`）负责加密
+/// 与校验。与 `set_update_proxy` 同一模式：内存立即生效（下一次检查更新就用
+/// 新令牌），写盘时不吃掉其它字段。
+pub fn set_github_token_envelope(envelope: Option<String>) -> bool {
+    update(move |config| {
+        match envelope.clone() {
+            Some(value) => {
+                config.raw.insert(KEY_GITHUB_TOKEN.to_string(), Value::String(value));
+                config.github_token = envelope.clone();
+            }
+            None => {
+                config.raw.remove(KEY_GITHUB_TOKEN);
+                config.github_token = None;
+            }
+        }
     })
 }
 

@@ -4,6 +4,10 @@
 //!   POST /api/update/download              开始下载 { url, name }
 //!   GET  /api/update/progress              下载进度
 //!   POST /api/update/cancel                取消下载
+//!   GET  /api/update/proxy                 更新出网线路（null = 直连）
+//!   POST /api/update/proxy                 换更新出网线路 { proxy: null | {…} }
+//!   GET  /api/update/token                 GitHub 令牌状态 { filled, origin }（不回显本体）
+//!   POST /api/update/token                 保存 / 清除 GitHub 令牌 { token: string | null }
 //!
 //! ── 路由挂法 ────────────────────────────────────────────────
 //! Node 是 `path.startsWith('/api/update/')` 的前缀判定：命中前缀后逐条判
@@ -24,9 +28,11 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::Method;
 use axum::response::{IntoResponse, Response};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::server::core::update::UpdateError;
+use crate::server::config;
+use crate::server::core::proxies::{describe_account_proxy, normalize_account_proxy};
+use crate::server::core::update::{set_token, status_json, UpdateError};
 use crate::server::errors::{management_error, GatewayError};
 use crate::server::http::{ok_json, parse_body};
 use crate::server::logging;
@@ -78,6 +84,91 @@ async fn dispatch(
         // 读这里亮侧栏徽标，自己不再打 GitHub —— 匿名限额 60 次/小时）。
         // 本进程还没查过时是 {checked:false}，前端按「未知」处理，不亮标。
         return ok_json(state.update().last_check());
+    }
+
+    if method == Method::GET && full_path == "/api/update/proxy" {
+        // 「软件更新」的出网线路（设置页更新面板里「检查更新」左侧的下拉读它）。
+        // 返回与账号代理**同一个描述形态**（label / config / error）：
+        // 前端据此取 listenerUid 当下拉值、取 label 显示、取 error 标红 ——
+        // 三件事账号页都已经有现成口径，形状对齐就不用第二套解析。
+        return ok_json(json!({
+            "proxy": describe_account_proxy(config::update_proxy().as_ref()),
+        }));
+    }
+
+    if method == Method::POST && full_path == "/api/update/proxy" {
+        // 换线路：`{proxy: null}` = 直连，`{proxy: {source:'clash', listenerUid}}`
+        // = 指定 Clash 出口。归一复用账号代理的 normalize_account_proxy
+        // （custom 形状也顺带支持），非法值 400 —— 静默忽略会让界面显示
+        // 「已切换」而值没存上，比报错难排查得多。
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::new(error.message).into_response(),
+        };
+        let raw = payload.get("proxy").cloned().unwrap_or(Value::Null);
+        return match normalize_account_proxy(&raw) {
+            Ok(normalized) => {
+                // 「换」才算数：重复选中当前线路不该被当成换线路（否则就成了
+                // 绕开失败冷却的口子，见下面 clear_check_cooldown 的说明）
+                let changed = config::update_proxy() != normalized;
+                let saved = config::set_update_proxy(normalized);
+                if changed {
+                    state.update().clear_check_cooldown();
+                }
+                // 落库失败仍返回新值（内存快照已生效，本次运行照走新线路），
+                // saved 字段如实带上，调用方要提醒就用它
+                ok_json(json!({
+                    "proxy": describe_account_proxy(config::update_proxy().as_ref()),
+                    "saved": saved,
+                }))
+            }
+            Err(error) => {
+                logging::log("[Update]", &format!("❌ 更新出网线路保存失败: {}", error.message));
+                GatewayError::bad_request(error.message).into_response()
+            }
+        };
+    }
+
+    if method == Method::GET && full_path == "/api/update/token" {
+        // 「更新设置」弹窗里 GitHub 令牌一栏的读数：**只报有没有、来自哪**，
+        // 不回显本体 —— 界面保存后只显示「已填写」，这条 API 就是那三个字
+        // 的唯一事实来源（回显 = 白加密）。加解密与状态口径见 token 模块。
+        return ok_json(status_json());
+    }
+
+    if method == Method::POST && full_path == "/api/update/token" {
+        // 保存 / 清除：`{token: "ghp_…"}` 保存、`{token: null}` 清除。
+        // 缺 token 字段按请求错误处理而不是「清除」—— 清除必须显式传 null，
+        // 免得某个调用方手滑发个 `{}` 就把令牌删了。校验在 token::set_token
+        // （字符集白名单挡请求头注入），非法值 400。
+        let payload = match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return GatewayError::new(error.message).into_response(),
+        };
+        let Some(raw) = payload.get("token").cloned() else {
+            return GatewayError::bad_request("请求体缺少 token 字段（清除请传 null）").into_response();
+        };
+        if !raw.is_null() && raw.as_str().is_none() {
+            return GatewayError::bad_request("token 必须是字符串或 null").into_response();
+        }
+        return match set_token(raw.as_str()) {
+            Ok(update) => {
+                // 令牌真的换了才清「检查更新」的失败冷却：配额桶按身份计（匿名按
+                // 出口 IP、带令牌按用户），换了凭证旧冷却不再适用；重复粘贴同一个
+                // 令牌不作数（token::stored_token 逐字比较，见 TokenUpdate 说明）
+                if update.changed {
+                    state.update().clear_check_cooldown();
+                }
+                // 落库失败仍返回新状态（内存已生效，本次运行照用），saved 如实带
+                let mut status = status_json();
+                status["saved"] = json!(update.saved);
+                ok_json(status)
+            }
+            Err(message) => {
+                logging::log("[Update]", &format!("❌ GitHub 令牌保存失败: {message}"));
+                GatewayError::bad_request(message).into_response()
+            }
+        };
     }
 
     if method == Method::POST && full_path == "/api/update/download" {

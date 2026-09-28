@@ -166,7 +166,10 @@
      */
     function paintCancel(visible) {
       const node = cancelButton();
-      if (node) node.style.display = visible ? '' : 'none';
+      // 切 hidden 属性而不是行内 display：按钮是组件库的 Button（自带带 !important
+      // 的 inline-flex 工具类），行内样式压不过它；属性由组件库 globals.css 的
+      // [hidden][hidden] 兜底
+      if (node) node.hidden = !visible;
     }
 
     /**

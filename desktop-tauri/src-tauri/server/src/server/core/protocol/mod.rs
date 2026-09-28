@@ -28,6 +28,7 @@
 //!   anthropic.rs         Anthropic Messages ↔ Chat（同上）
 //!   responses_outbound.rs chat → Responses 上游的出站翻译（自定义提供商转发）
 //!   anthropic_outbound.rs chat → Anthropic 上游的出站翻译（同上）
+//!   history.rs           内部 Chat 体的历史 sanitize（客户端带来的畸形工具历史）
 //!
 //! 出站两个文件与回程两个文件方向相反：回程服务「下游说 X」的入口
 //! （`api::protocol`），出站服务「上游说 X」的自定义家转发
@@ -42,6 +43,7 @@
 pub mod anthropic;
 pub mod anthropic_outbound;
 pub mod freeform;
+pub mod history;
 pub mod responses;
 pub mod responses_outbound;
 pub mod tool_plan;

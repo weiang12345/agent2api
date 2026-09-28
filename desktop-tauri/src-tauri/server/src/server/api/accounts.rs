@@ -842,6 +842,9 @@ async fn refresh_provider_account(state: &ServerState, id: &str, kind: ProviderK
 pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
     let report =
         crate::server::core::credential_maintenance::refresh_expiring_report(state.store()).await;
+    // 这一轮已经真刷过一遍了：把定时维护的排期顺延一个间隔（口径与其它手动
+    // 入口一致）—— 否则「刚点完维护、到点或重启后又立刻再刷一遍」。
+    crate::server::core::credential_maintenance::note_manual_run();
     ok_json(report)
 }
 

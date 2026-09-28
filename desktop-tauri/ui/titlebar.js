@@ -67,14 +67,19 @@
   // 拖动与双击最大化：Tauri 2 内建支持，声明属性即可（见文件头说明）
   bar.setAttribute('data-tauri-drag-region', '');
 
-  // 左侧品牌区（图标复用 icons.js 的 brand，与侧栏品牌区 / 应用图标同一造型；
-  // 文案与窗口 title 保持一致）
+  // 左侧品牌区（图标复用 icons.js 的 brand，与侧栏品牌区 / 应用图标同一造型）。
+  // 文案取自桥接层注入的 title —— 与窗口标题、托盘提示同一份（开发版带
+  // "Dev" 标记，两个实例同时跑时一眼能分清）；旧壳没注入时回落到发布版文案。
+  const appTitle = bridge.title || 'Agent2API · 多提供商本地网关';
   const brand = document.createElement('div');
   brand.className = 'titlebar-brand';
   brand.innerHTML =
     (window.wbIcons ? wbIcons.icon('brand', 16) : '')
-    + '<span class="txt">Agent2API · 多提供商本地网关</span>';
+    + `<span class="txt">${appTitle}</span>`;
   bar.appendChild(brand);
+  // document.title 也跟上（窗口标题由壳设置，这条只影响网页语义：
+  // 任务栏悬停预览、无障碍，以及将来可能有的网页版）
+  document.title = appTitle;
 
   // 右侧三键（普通 button，不带拖动属性：Tauri 只认带属性的元素）
   const actions = document.createElement('div');

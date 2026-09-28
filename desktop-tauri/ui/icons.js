@@ -33,6 +33,47 @@
     pulse: '<circle cx="12" cy="12" r="5"/>',
 
     /**
+     * 设置页左栏的分类图标（2026-09 新增，九个一组）。
+     *
+     * ── 为什么单独一组（不复用上面那些导航图标）──────────────
+     * 上面那组是主侧栏的**填充式**导航图标；设置页分类项的文字是 12.5px、
+     * 图标盒 17px，填充块在这个尺寸下比文字重。这九个统一用**描边**画
+     * （粗细 1.8 + 圆头圆角，与 arrowDown / eye 同一套约定，17px 下约 1.2px），
+     * 几何取自 Feather / Lucide 的成熟图形（与 eye / eyeOff 借 Feather 同理），
+     * 小尺寸下笔画不糊、形状可辨。九个图标同一风格，设置页内自成一套。
+     */
+    // 通用：调节滑杆（三条轨道 + 三个把手）
+    sliders: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/>'
+      + '<path d="M1 14h6M9 8h6M17 16h6"/></g>',
+    // 显示：显示器（屏 + 底座）
+    display: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<rect x="2" y="3" width="20" height="14" rx="2"/>'
+      + '<path d="M8 21h8M12 17v4"/></g>',
+    // 网关：双向箭头（进出的流量）
+    traffic: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M8 3 4 7l4 4M4 7h16"/><path d="m16 21 4-4-4-4M20 17H4"/></g>',
+    // 重试：环形箭头
+    refresh: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></g>',
+    // 超时：秒表（顶部按钮 + 表盘 + 指针）
+    timer: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M10 2h4M12 14l3-3"/><circle cx="12" cy="14" r="8"/></g>',
+    // 安全：盾牌
+    shield: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></g>',
+    // 数据：数据库（三层圆柱）
+    database: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<ellipse cx="12" cy="5" rx="9" ry="3"/>'
+      + '<path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></g>',
+    // 反馈与需求：对话气泡
+    feedback: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></g>',
+    // 更新：向下箭头 + 托盘（下载更新包）
+    download: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></g>',
+
+    /**
      * 优先级控件的两枚箭头（账号表「↓ 数字 ↑」合并控件用）。
      *
      * ── 为什么不用字符 ↓ / ↑（本次修复）────────────────────────

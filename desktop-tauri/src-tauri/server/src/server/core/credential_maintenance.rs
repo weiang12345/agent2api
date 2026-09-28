@@ -246,3 +246,21 @@ fn skipped(id: &str, provider: &str, reason: &str) -> Value {
         "message": reason,
     })
 }
+
+/// 手动维护跑完后的排期顺延（`POST /api/accounts/refresh-expiring` 调用）。
+///
+/// 与余额查询同一口径：手动动作已经真打了一轮上游，把定时那轮往后推一个间隔，
+/// 免得「刚点完、到点或重启后又立刻再刷一遍」。顺延失败只影响节奏，不影响结果
+/// —— 调用方因此不处理它的错误（`task_state` 内部已把它降级成日志）。
+pub fn note_manual_run() {
+    let interval = crate::server::config::scheduled_settings()
+        .credential_maintenance
+        .interval
+        * 60_000;
+    if let Err(error) = crate::server::core::task_state::note_external_run(
+        crate::server::config::KEY_CREDENTIAL_MAINTENANCE,
+        interval,
+    ) {
+        logging::verbose("[Accounts]", &format!("凭证维护排期顺延失败：{error}"));
+    }
+}

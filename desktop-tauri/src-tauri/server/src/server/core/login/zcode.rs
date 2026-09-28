@@ -27,9 +27,10 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::server::core::providers::kind_id;
+use crate::server::core::providers::zcode::coding_key;
 use crate::server::core::providers::zcode::oauth::CliLogin;
 use crate::server::core::providers::zcode::region::Region;
+use crate::server::core::providers::kind_id;
 use crate::server::logging;
 
 use super::{finish_task_error, LoginService, LoginTaskHandle, LOGIN_TIMEOUT_MS};
@@ -116,7 +117,26 @@ impl LoginService {
             match flow.poll().await {
                 // 还没授权完 —— 继续等
                 Ok(None) => continue,
-                Ok(Some(credentials)) => {
+                Ok(Some(mut credentials)) => {
+                    // ── 先把 OAuth 令牌换成推理凭证 ────────────────────
+                    // 轮询给的 `access_token` **不能直接用于推理**（拿它发出去
+                    // 必 401），要先换一把编码套餐的 API Key —— 这一步是网络
+                    // 动作，因此放在**拿任务锁之前**：持锁等网络会把取消与
+                    // 状态查询一起挡住，而它可能耗时数秒（见 `coding_key` 的
+                    // 模块头）。换取失败即登录失败：不落半条「能领套餐但发不出
+                    // 请求」的账号（理由同参考实现，见那边模块头）。
+                    match coding_key::resolve(credentials.region, &credentials.access_token).await
+                    {
+                        Ok(key) => credentials.access_token = key,
+                        Err(error) => {
+                            logging::log(
+                                "[Login]",
+                                &format!("❌ ZCode {}登录换取推理凭证失败: {}", credentials.region.label(), error.message),
+                            );
+                            finish_task_error(&handle, &error.message);
+                            return;
+                        }
+                    }
                     // 与取消共用任务锁：取消先发生就绝不落账号，落盘先发生则视为已完成
                     // （与 Qoder 那支逐字相同的处置）
                     let mut task = handle.lock();

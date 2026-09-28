@@ -248,7 +248,7 @@ pub struct RequestEntry {
     #[serde(rename = "sensitiveHits", default)]
     pub sensitive_hits: Vec<SensitiveHit>,
     /// **在途请求当前所处的转发阶段**（`connecting` / `waiting` / `streaming` /
-    /// `retrying`；空串 = 不在途 —— 终态行、旧行、转发前就失败的行）。
+    /// `retrying` / `queued`；空串 = 不在途 —— 终态行、旧行、转发前就失败的行）。
     ///
     /// 取值是 `core::upstream::usage::LogPhase::as_str()` 的字面量，与 OmniProxy
     /// 的 `LogPhase` 逐字相同；前端按它选文案（连接中 / 等待响应 / 响应中 /
@@ -614,7 +614,7 @@ pub struct RunningProgress {
     pub attempts: i64,
     /// 首响：上游首帧到达相对请求开始的毫秒数（None = 首帧还没到）
     pub first_response_ms: Option<i64>,
-    /// 当前阶段（`connecting` / `waiting` / `streaming` / `retrying`，
+    /// 当前阶段（`connecting` / `waiting` / `streaming` / `retrying` / `queued`，
     /// 见 `RequestEntry::phase`）—— 转发链路每换一个阶段回写一次。
     ///
     /// 为什么回收写**一定**带阶段：阶段是「现在在哪一步」的读数，它必须跟着

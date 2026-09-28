@@ -15,6 +15,20 @@ use serde_json::Value;
 
 /// 网关默认端口（与 server.mjs 的默认值一致）
 pub const DEFAULT_PORT: u16 = 3065;
+
+/// 开发版（debug 构建）的默认端口。
+///
+/// ── 为什么开发版要另起一个 ──────────────────────────────────
+/// 本机通常装着正式版并常驻 3065（开机自启 + 托盘），`tauri dev` 起的调试
+/// 副本若也用 3065，bind 必然失败 —— 以前只能靠环境变量、或先退掉正式版。
+/// 默认值按构建形态分岔后，`npm run tauri:dev` 直接就能与正式版并存。
+///
+/// 这是与 `tauri.dev.conf.json`（identifier 隔离）配套的第二道：只换端口
+/// 并不够，单实例锁不隔离的话调试副本会被插件判成重复实例、直接退出
+/// （见 lib.rs 的插件注册）。
+///
+/// release 构建（唯一的发布形态）行为不变，仍用 [`DEFAULT_PORT`]。
+pub const DEV_PORT: u16 = 3066;
 pub const REQUEST_TIMEOUT_MS: u64 = 60_000;
 
 /// 本次运行实际使用的端口。
@@ -33,6 +47,10 @@ static ACTIVE_PORT: AtomicU16 = AtomicU16::new(0);
 /// **配置文件里的端口**（`desktop-settings.json` 的 `proxyPort`）是 2.0.4 新增的：
 /// 端口被系统保留段挡住时，改环境变量对普通用户来说门槛太高（要改启动方式），
 /// 而这条故障又只能靠换端口解决 —— 界面上的「更换端口」写的就是这个字段。
+///
+/// **最后一级默认值**按构建形态分岔：debug 用 [`DEV_PORT`]、release 用
+/// [`DEFAULT_PORT`]（理由见 [`DEV_PORT`]）。前两级不受影响，所以开发时想
+/// 回到正式端口/正式数据，照旧用环境变量覆盖即可。
 pub fn proxy_port() -> u16 {
     let cached = ACTIVE_PORT.load(Ordering::Relaxed);
     if cached != 0 {
@@ -46,9 +64,22 @@ fn resolve_port() -> u16 {
     let port = env_port("AGENT2API_PROXY_PORT")
         .or_else(|| env_port("WORKBUDDY_PROXY_PORT")) // 旧名兼容读（1.x 起沿用）
         .or_else(|| configured_port())
-        .unwrap_or(DEFAULT_PORT);
+        .unwrap_or(default_port());
     ACTIVE_PORT.store(port, Ordering::Relaxed);
     port
+}
+
+/// 没有环境变量、设置里也没写时用的默认端口。
+///
+/// 判据取 `debug_assertions` 而不是 profile 名：与 lib.rs 里「开发态不做
+/// 安装迁移 / 自启刷新」是同一个口径，两处对「什么算开发态」的说法保持一致
+/// （`tauri build --debug` 也因此算开发态，符合直觉）。
+fn default_port() -> u16 {
+    if cfg!(debug_assertions) {
+        DEV_PORT
+    } else {
+        DEFAULT_PORT
+    }
 }
 
 /// 读设置文件里的端口；未设置 / 非法一律当未设置（回落到下一级）。

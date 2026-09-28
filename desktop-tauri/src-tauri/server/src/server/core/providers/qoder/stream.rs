@@ -28,7 +28,8 @@
 
 use serde_json::Value;
 
-use super::protocol::{classify_upstream_error, UpstreamKind, THINK_TAGS};
+use super::errors::{classify_upstream_error, QueueInfo, UpstreamKind};
+use super::protocol::THINK_TAGS;
 
 /// 上游 SSE 里解析出的一条事件（源实现 `parseSseLine` 的返回联合）
 pub enum SseEvent {
@@ -42,7 +43,7 @@ pub enum SseEvent {
     Error {
         /// 信封里的业务状态码（**不是** HTTP 状态码 —— 那一个始终是 200）
         status: u16,
-        /// 分类结果（决定「换账号 / 刷新重试 / 原样透传」）
+        /// 分类结果（决定「换账号 / 刷新重试 / 排队退避 / 原样透传」）
         kind: UpstreamKind,
         /// 上游原文（截断后）
         raw: String,
@@ -50,6 +51,8 @@ pub enum SseEvent {
         message: String,
         /// 额度类错误带出的定价页链接
         pricing_url: Option<String>,
+        /// 排队信号（`kind == Queued` 时有值）
+        queue: Option<QueueInfo>,
     },
 }
 
@@ -81,6 +84,7 @@ pub fn parse_sse_line(data: &str) -> SseEvent {
                 raw: raw.chars().take(500).collect(),
                 message: classified.message,
                 pricing_url: classified.pricing_url,
+                queue: classified.queue,
             };
         }
     }
@@ -106,10 +110,7 @@ pub fn parse_sse_line(data: &str) -> SseEvent {
 
 /// 一行 SSE 输出的形态：`data: <payload>\n\n`
 pub fn sse_frame(value: &Value) -> String {
-    format!(
-        "data: {}\n\n",
-        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
-    )
+    format!("data: {}\n\n", serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()))
 }
 
 /// `data: [DONE]\n\n`
@@ -373,7 +374,9 @@ impl ThinkingParser {
                 }
                 let close_len = THINK_TAGS
                     .iter()
-                    .filter(|(_, close)| self.buffer[close_at..].starts_with(*close))
+                    .filter(|(_, close)| {
+                        self.buffer[close_at..].starts_with(*close)
+                    })
                     .map(|(_, close)| close.len())
                     .max()
                     .unwrap_or(0);

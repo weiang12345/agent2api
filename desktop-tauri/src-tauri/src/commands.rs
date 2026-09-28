@@ -7,7 +7,7 @@
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_dialog::DialogExt;
 
@@ -25,7 +25,6 @@ pub struct ApiRequest {
     #[serde(default)]
     pub body: Option<Value>,
 }
-
 /// 统一的管理 API 入口：返回后端 data，出错时返回可读消息。
 #[tauri::command]
 pub async fn api_request(request: ApiRequest) -> Result<Value, String> {
@@ -295,12 +294,7 @@ pub fn login_state(app: AppHandle) -> LoginState {
             edition: Some(active.edition),
             provider: Some(active.provider),
         },
-        None => LoginState {
-            active: false,
-            mode: None,
-            edition: None,
-            provider: None,
-        },
+        None => LoginState { active: false, mode: None, edition: None, provider: None },
     }
 }
 
@@ -351,9 +345,7 @@ pub fn get_app_settings(app: AppHandle) -> AppSettings {
         current.autostart = enabled;
     }
     // 顺手把缓存与磁盘对齐：拦截关窗时要用到最新值
-    app.state::<AppState>()
-        .window
-        .set_close_to_tray(current.close_to_tray);
+    app.state::<AppState>().window.set_close_to_tray(current.close_to_tray);
     current
 }
 
@@ -391,9 +383,7 @@ pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettin
 
     settings::save(&saved)?;
     // 立即生效：配置改完不用重启，下一次关窗就走新行为
-    app.state::<AppState>()
-        .window
-        .set_close_to_tray(saved.close_to_tray);
+    app.state::<AppState>().window.set_close_to_tray(saved.close_to_tray);
     Ok(saved)
 }
 
@@ -468,10 +458,11 @@ pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
     let path = target
         .into_path()
         .map_err(|error| format!("文件路径无效: {error}"))?;
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("读取文件失败: {error}"))?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("读取文件失败: {error}"))?;
 
-    let parsed: Value =
-        serde_json::from_str(&text).map_err(|error| format!("文件不是有效 JSON: {error}"))?;
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("文件不是有效 JSON: {error}"))?;
     let document = unwrap_envelope_file(parsed);
     let accounts = match &document {
         // 整体导出文件
@@ -642,9 +633,37 @@ pub fn set_window_theme(app: AppHandle, theme: Option<String>) -> Result<(), Str
     let window = app
         .get_webview_window(crate::MAIN_WINDOW_LABEL)
         .ok_or_else(|| "主窗口不存在".to_string())?;
+    window.set_theme(theme).map_err(|error| format!("设置窗口主题失败: {error}"))
+}
+
+/// 设置主窗口的界面缩放（浏览器缩放同款：整体缩放整页，含布局与字号）。
+///
+/// 因子走 Tauri 的 `set_zoom` —— Windows 上是 WebView2 的 ZoomFactor，语义与
+/// 用户按 Ctrl +/- 一致（不是 CSS zoom：那个只改布局，还会和 WebView 缩放叠加）。
+/// 界面上是「百分比下拉」（设置页「显示 → 界面缩放」，80%–130%、一档 5%），
+/// 这里再把关口收一遍：渲染层传来的值不信任 —— 非有限值拒绝、范围外直接报错
+/// （不静默夹取，免得界面显示 130% 而实际是别的值）。
+///
+/// 返回值是**实际生效的因子**（规整到两位小数），界面拿它回写显示。缩放的
+/// 持久化在前端 localStorage，壳这侧不记账（与窗口主题同一口径：壳只执行动作，
+/// 偏好由界面自己记）。
+#[tauri::command]
+pub fn set_zoom(app: AppHandle, scale: f64) -> Result<f64, String> {
+    const MIN: f64 = 0.8;
+    const MAX: f64 = 1.3;
+    if !scale.is_finite() {
+        return Err(format!("界面缩放值非法: {scale}"));
+    }
+    // 先规整再比范围：0.95 这类因子在浮点里是 0.9499999…，直接比大小会把 95% 误判出界
+    let factor = (scale * 100.0).round() / 100.0;
+    if !(MIN..=MAX).contains(&factor) {
+        return Err(format!("界面缩放需在 80%–130% 之间（收到 {:.0}%）", factor * 100.0));
+    }
+    let window = main_window(&app)?;
     window
-        .set_theme(theme)
-        .map_err(|error| format!("设置窗口主题失败: {error}"))
+        .set_zoom(factor)
+        .map_err(|error| format!("设置界面缩放失败: {error}"))?;
+    Ok(factor)
 }
 
 // ── 自定义标题栏的窗口三键 ─────────────────────────────────────
@@ -665,9 +684,7 @@ pub fn set_window_theme(app: AppHandle, theme: Option<String>) -> Result<(), Str
 #[tauri::command]
 pub fn window_minimize(app: AppHandle) -> Result<(), String> {
     let window = main_window(&app)?;
-    window
-        .minimize()
-        .map_err(|error| format!("最小化窗口失败: {error}"))
+    window.minimize().map_err(|error| format!("最小化窗口失败: {error}"))
 }
 
 /// 切换主窗口最大化 / 还原（标题栏「最大化」按钮）。
@@ -698,9 +715,7 @@ pub fn window_toggle_maximize(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn window_close(app: AppHandle) -> Result<(), String> {
     let window = main_window(&app)?;
-    window
-        .close()
-        .map_err(|error| format!("关闭窗口失败: {error}"))
+    window.close().map_err(|error| format!("关闭窗口失败: {error}"))
 }
 
 /// 查询主窗口是否处于最大化（标题栏据此切换最大化 / 还原图标）。
@@ -711,9 +726,7 @@ pub fn window_close(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn window_is_maximized(app: AppHandle) -> Result<bool, String> {
     let window = main_window(&app)?;
-    window
-        .is_maximized()
-        .map_err(|error| format!("查询窗口状态失败: {error}"))
+    window.is_maximized().map_err(|error| format!("查询窗口状态失败: {error}"))
 }
 
 /// 取主窗口句柄：四个窗口命令共用的一步查找（不存在时报可读错误）。
@@ -757,61 +770,4 @@ fn timestamp_for_filename() -> String {
     let year = if month <= 2 { y + 1 } else { y };
 
     format!("{year:04}-{month:02}-{day:02}-{hour:02}-{minute:02}-{second:02}")
-}
-
-/// 启动维护：让网关刷新一遍临期凭证，结果推给渲染层。
-/// 任一环节失败只记日志，不影响窗口使用（与原 Electron 版行为一致）。
-///
-/// ── 余额查询为什么从这里移走了 ──────────────────────────────
-/// 原先这里还会调一次 `GET /api/accounts/usage`。现在余额查询归「定时查询积分」
-/// 这条定时任务（`scheduled_tasks` 的 backend 任务，默认每 10 分钟一次），
-/// 而它的**首轮在网关 bootstrap 后就立即跑一次**（`seed_schedule` 把首次排到
-/// 「现在」）—— 于是启动时该做的这一次查询依旧会发生，只是执行者换成了定时任务。
-///
-/// 两处各查一遍的代价是每个账号在启动瞬间被打两次上游积分接口：既无收益
-/// （同一份数据），又平白多担一次风控风险。更关键的是「关掉定时查询积分 =
-/// 启动也不查」这条一致性 —— 与其它定时任务（「关掉任务 = 启动也不刷」）同款，
-/// 留着这里这一份会让那条开关变得半失效。
-///
-/// 界面因此改为读定时任务的结果快照（`/api/accounts/usage/snapshot`），
-/// 由 `usage-actions.js` 的 `syncSnapshot` 应用 —— 手动点「查询积分」那条路径
-/// 不受影响，它仍走 `GET /api/accounts/usage` 当场取。
-pub async fn startup_maintenance(app: AppHandle) {
-    // 临期凭证的刷新**交给网关自己**（POST /api/accounts/refresh-expiring）：
-    // 「哪个账号该刷」是各家 provider 的知识（过期时间字段名、临期窗口四家
-    // 各不相同），壳侧按字段名判断会漏（曾漏掉小浣熊的 `tokenExpiresAt`）。
-    // 网关那边同时还有每 10 分钟的周期维护，这里这一次调用是为了让**刚启动的
-    // 这一轮**尽快把状态刷对，而不是等第一个周期。
-    //
-    // 保留 `refreshed` 的语义（本次实际刷新成功的账号 id 列表）：渲染层的
-    // `accounts:auto-maintained` 事件按它的长度决定要不要提示用户。
-    let refreshed = match gateway::call("POST", "/api/accounts/refresh-expiring", None).await {
-        Ok(report) => report
-            .get("results")
-            .and_then(Value::as_array)
-            .map(|results| {
-                results
-                    .iter()
-                    .filter(|item| item.get("status").and_then(Value::as_str) == Some("refreshed"))
-                    .filter_map(|item| item.get("id").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default(),
-        Err(error) => {
-            eprintln!("[startup] 自动刷新临期凭证失败: {error}");
-            Vec::new()
-        }
-    };
-
-    let _ = app.emit(
-        "accounts:auto-maintained",
-        json!({ "refreshed": refreshed }),
-    );
-    if !refreshed.is_empty() {
-        eprintln!(
-            "[startup] 已自动刷新 {} 个临期账号的 Token",
-            refreshed.len()
-        );
-    }
 }

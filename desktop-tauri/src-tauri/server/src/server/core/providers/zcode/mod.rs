@@ -31,14 +31,28 @@
 //!   adapter.rs      `ProviderAdapter` 实现（OpenAI 兼容转发）—— 已完成
 //!   credentials.rs  凭证（访问令牌 + 套餐 JWT + 设备标识）—— 已完成
 //!   oauth.rs        CLI 轮询登录（init / poll / 授权地址中转页）—— 已完成
+//!   coding_key.rs   编码套餐凭证换取（OAuth 令牌 → 能用于推理的 API Key）—— 已完成
 //!
-//! **尚未接线**：登录流程还没有进 `core::login` 的任务表（`login/zcode.rs`），
-//! 因此界面上「添加账号」目前仍走 `api::accounts` 的显式拒绝分支。
-//! 协议层已全部就绪，剩下的是把 `oauth::CliLogin` 接进既有登录框架 ——
-//! 模板是 `core/login/qoder.rs`（同样是「启动任务 → 轮询 → 落账号」）。
+//! 登录链已接进 `core/login/zcode.rs`（`start_zcode_login` / `run_zcode_login`，
+//! 与 Qoder 那支同构：启动任务 → 轮询 → 落账号），界面上「添加账号」的两个
+//! 入口（网页登录 / 填写凭证）都可用。
+//!
+//! ── 两件**已知未做**的事（别误以为已经覆盖）───────────────────
+//!   1. **凭证续期**：上游没有续期协议 —— OAuth 令牌用坏了只能重新登录
+//!      （参考实现实测：JWT 只带 `iat` 不带 `exp`，8 天前的仍能用，过期只以
+//!      401 暴露）。适配器的 `refresh_access_token` 因此如实报错，见 `adapter.rs`。
+//!   2. **客户端请求签名**（Client Request Signing V4）：上游的
+//!      `GET {zcode}/api/v1/agent/configs` 此刻回 `codingPlanSignature.enable: true`，
+//!      官方客户端会给编码套餐的推理请求加 Ed25519 签名 + 工作量证明头。
+//!      参考实现对它**全程 fail-open**（握手失败、连续两次 401 `VERIFY_*`
+//!      都退回未签名），且实测未签名请求的拒绝理由是鉴权（`Authentication
+//!      Failed`）而不是签名 —— 因此本家先不做，靠 `coding_key` 把凭证换对。
+//!      哪天真被 `VERIFY_SIGNATURE_INVALID` 拒了，再照参考实现的
+//!      `src/proxy/client-signing.ts` 补。
 
 pub mod adapter;
 pub mod claim;
+pub mod coding_key;
 pub mod credentials;
 pub mod models;
 pub mod oauth;

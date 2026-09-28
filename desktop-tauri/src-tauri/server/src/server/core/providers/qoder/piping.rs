@@ -43,17 +43,15 @@ use super::{chat, record_limited, LimitContext};
 ///
 /// 返回 `(预读到的内容帧, 剩余字节流)`。剩余流已装上空闲守卫、reqwest 错误
 /// 已折进 `io::Error`、半行缓冲已拼回流头 —— `drive_stream` 接手后按既有
-/// 语义续传。额度/鉴权类**首帧前**错误的去向见模块头。
+/// 语义续传。额度/鉴权类**首帧前**错误的去向见模块头；**排队态**在
+/// `AttemptError::Queued` 里单独交回，由调用方决定退避重发（见那里的说明）。
 pub(super) async fn prefetch_stream_head(
     response: reqwest::Response,
     limit: &LimitContext,
     telemetry: &std::sync::Arc<RequestTelemetry>,
 ) -> Result<
-    (
-        Vec<Value>,
-        BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
-    ),
-    GatewayError,
+    (Vec<Value>, BoxStream<'static, Result<bytes::Bytes, std::io::Error>>),
+    chat::AttemptError,
 > {
     // 传输层错误先折进 io::Error（文案与通用层 `ForwardStream::new` 同一出处）；
     // 空闲守卫从这里武装，随剩余流一路带给 `drive_stream`
@@ -83,7 +81,7 @@ pub(super) async fn prefetch_stream_head(
                 } else {
                     format!("Qoder 上游流式传输中断: {text}")
                 };
-                return Err(GatewayError::with_status(502, message));
+                return Err(chat::AttemptError::Fatal(GatewayError::with_status(502, message)));
             }
             None => break,
         };
@@ -99,17 +97,11 @@ pub(super) async fn prefetch_stream_head(
                 // 流直接收尾（无内容无错误）：剩余流原样交给 drive_stream，
                 // 由它走正常收尾（finish 帧 + [DONE]）
                 SseEvent::Done => return Ok((prefetched, with_pending_tail(source, lines))),
-                // 首帧之前的业务错误：冷却落库（与非流式同一落点）+ Err 交回
-                // 编排层换号。任何分类都返回（Unknown 的 502 也一样），与
-                // `drive_aggregate` 的口径一致
-                SseEvent::Error {
-                    status,
-                    kind,
-                    raw,
-                    message,
-                    pricing_url,
-                    ..
-                } => {
+                // 首帧之前的业务错误：冷却落库（与非流式同一落点，排队态不在
+                // `record_limited` 的名单里、天然不落）+ 交回编排层（额度/鉴权
+                // 走换号与刷新，排队由调用方退避重发）。任何分类都返回
+                // （Unknown 的 502 也一样），与 `drive_aggregate` 的口径一致
+                SseEvent::Error { status, kind, raw, message, pricing_url, queue } => {
                     record_limited(
                         &limit.store,
                         &limit.account_id,
@@ -124,6 +116,7 @@ pub(super) async fn prefetch_stream_head(
                         &raw,
                         &message,
                         pricing_url.as_deref(),
+                        queue,
                     ));
                 }
                 SseEvent::Chunk(chunk) => {
@@ -250,19 +243,12 @@ pub(super) async fn drive_stream(
             match stream::parse_sse_line(&data) {
                 SseEvent::Skip => {}
                 SseEvent::Done => break 'outer,
-                SseEvent::Error {
-                    status,
-                    kind,
-                    raw,
-                    message,
-                    pricing_url,
-                    ..
-                } => {
+                SseEvent::Error { status, kind, raw, message, pricing_url, queue } => {
                     // 上游的业务错误（HTTP 200 里的信封错误）：转成带状态码的
                     // 文案写进流，形态与通用层的收尾一致。额度类在这里落冷却
                     // （record_limited 自带「进入冷却」的运行日志）——但错误
-                    // 本身只能随流下发给客户端：流已开始，换号不再可能
-                    // （与首帧前错误的差别，见 prefetch_stream_head 的说明）
+                    // 本身只能随流下发给客户端：流已开始，换号与排队退避都
+                    // 不再可能（与首帧前错误的差别，见 prefetch_stream_head 的说明）
                     record_limited(
                         &limit.store,
                         &limit.account_id,
@@ -271,8 +257,15 @@ pub(super) async fn drive_stream(
                         kind,
                         &message,
                     );
-                    let error =
-                        chat::business_error(status, kind, &raw, &message, pricing_url.as_deref());
+                    let error = chat::business_error(
+                        status,
+                        kind,
+                        &raw,
+                        &message,
+                        pricing_url.as_deref(),
+                        queue,
+                    )
+                    .into_gateway();
                     failed = Some(error.message);
                     break 'outer;
                 }
@@ -293,14 +286,7 @@ pub(super) async fn drive_stream(
                         return;
                     }
                 }
-                SseEvent::Error {
-                    status,
-                    kind,
-                    raw,
-                    message,
-                    pricing_url,
-                    ..
-                } => {
+                SseEvent::Error { status, kind, raw, message, pricing_url, queue } => {
                     record_limited(
                         &limit.store,
                         &limit.account_id,
@@ -309,8 +295,15 @@ pub(super) async fn drive_stream(
                         kind,
                         &message,
                     );
-                    let error =
-                        chat::business_error(status, kind, &raw, &message, pricing_url.as_deref());
+                    let error = chat::business_error(
+                        status,
+                        kind,
+                        &raw,
+                        &message,
+                        pricing_url.as_deref(),
+                        queue,
+                    )
+                    .into_gateway();
                     failed = Some(error.message);
                 }
                 _ => {}
@@ -356,9 +349,7 @@ pub(super) async fn drive_stream(
         let usage = translator.usage_frame();
         let _ = send_frame(&sender, &usage).await;
     }
-    let _ = sender
-        .send(Ok(bytes::Bytes::from(stream::sse_done())))
-        .await;
+    let _ = sender.send(Ok(bytes::Bytes::from(stream::sse_done()))).await;
 }
 
 /// 一帧 SSE 写进通道；客户端断开时返回 Err（由调用方结束循环）
@@ -367,8 +358,5 @@ async fn send_frame(
     value: &Value,
 ) -> Result<(), ()> {
     let frame = stream::sse_frame(value);
-    sender
-        .send(Ok(bytes::Bytes::from(frame)))
-        .await
-        .map_err(|_| ())
+    sender.send(Ok(bytes::Bytes::from(frame))).await.map_err(|_| ())
 }

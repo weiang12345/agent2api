@@ -27,6 +27,11 @@ pub use view::{
 };
 
 /// 原始能力清单不应用绑定开关；关闭原始 ID 后，别名仍需解析到这条上游记录。
+///
+/// 用户的能力位覆盖（`modelRules.capabilities`）在**这里**统一应用：本函数是
+/// 内置家全部出口（`/v1/models`、Anthropic 列表、管理视图）的清单源头，收在
+/// 一处就不会出现「管理页改了、下游没变」的分叉。覆盖只改元数据键，不参与
+/// 路由 / 启停（见 `model_rules` 模块头的能力位覆盖一节）。
 fn manifest_for(kind: ProviderKind) -> Vec<Value> {
     let mut models = adapter_for(kind).list_models();
     for item in model_rules::custom_models_for(kind_id(kind)) {
@@ -39,6 +44,7 @@ fn manifest_for(kind: ProviderKind) -> Vec<Value> {
             models.push(item);
         }
     }
+    model_rules::apply_capability_overrides(kind_id(kind), &mut models);
     models
 }
 

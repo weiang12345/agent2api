@@ -19,9 +19,6 @@ pub const TRAY_ID: &str = "main-tray";
 const MENU_SHOW: &str = "tray-show";
 const MENU_QUIT: &str = "tray-quit";
 
-/// 托盘提示文字
-const TOOLTIP: &str = "Agent2API · 多提供商本地网关";
-
 /// 创建托盘图标。应用启动时调用一次即可。
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, MENU_SHOW, "显示主窗口", true, None::<&str>)?;
@@ -29,7 +26,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip(TOOLTIP)
+        // 提示文字与窗口标题同一份（开发版带 "Dev" 标记，见 lib.rs 的 app_title）：
+        // 两个实例同时跑时，托盘图标是唯一能一眼分清谁是谁的地方
+        .tooltip(crate::app_title())
         .menu(&menu)
         // 左键单击留给「唤起窗口」，因此不让它弹菜单；右键照常弹
         .show_menu_on_left_click(false)

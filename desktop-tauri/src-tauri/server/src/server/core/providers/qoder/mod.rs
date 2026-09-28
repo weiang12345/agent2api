@@ -38,9 +38,12 @@
 //!   cosy.rs        COSY 请求签名 + 请求体编码（**推理链路的鉴权核心**）
 //!   models.rs      模型目录（两地区缓存 + 静态兜底 + 远程刷新）
 //!   protocol.rs    OpenAI ↔ Qoder 协议转换（消息/tools/思考档位/上游信封）
+//!   context.rs     上下文档位（200K/400K/1M）：估算、选档、落到请求体
+//!   errors.rs      上游错误分类（状态码 + 业务码表 + 排队态判定）
 //!   stream.rs      上游 SSE 信封解包 + 思考标签拆解（跨分片）
 //!   piping.rs      流式首帧预读 + 流式透传（issue #8 的换号修复在这）
 //!   chat.rs        转发编排（构造 → 发送 → 翻译）与 delta 翻译器
+//!   checkin.rs     每日签到（中国版的活动领取；国际版没有签到计划）
 //!
 //! ── panic=abort ────────────────────────────────────────────
 //! 本模块在对话链路上，绝不 unwrap/expect/panic。
@@ -48,9 +51,12 @@
 pub mod auth;
 mod balance;
 pub mod chat;
-pub mod cosy;
+pub mod checkin;
+pub mod context;
 pub mod credentials;
+pub mod cosy;
 pub mod endpoints;
+pub mod errors;
 mod machine;
 pub mod models;
 pub mod oauth;
@@ -63,10 +69,10 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
-use crate::server::core::providers::content_block;
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
@@ -109,13 +115,10 @@ fn record_limited(
     account_id: &str,
     model: &str,
     status: u16,
-    kind: protocol::UpstreamKind,
+    kind: errors::UpstreamKind,
     message: &str,
 ) {
-    if !matches!(
-        kind,
-        protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate
-    ) {
+    if !matches!(kind, errors::UpstreamKind::Quota | errors::UpstreamKind::Rate) {
         return;
     }
     if account_id.is_empty() {
@@ -177,11 +180,11 @@ impl ProviderAdapter for QoderAdapter {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
             .unwrap_or("上游错误");
-        let classified = protocol::classify_upstream_error(status, raw);
+        let classified = errors::classify_upstream_error(status, raw);
         let message = format!("上游返回 {status}: {raw}");
         match classified.kind {
-            protocol::UpstreamKind::Auth => UpstreamErrorClass::TokenExpired { message },
-            protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate => {
+            errors::UpstreamKind::Auth => UpstreamErrorClass::TokenExpired { message },
+            errors::UpstreamKind::Quota | errors::UpstreamKind::Rate => {
                 UpstreamErrorClass::QuotaLimited {
                     reset_at: None,
                     message,
@@ -204,9 +207,7 @@ impl ProviderAdapter for QoderAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
         Box::pin(async move {
             refresh::ensure_fresh(store, account_id, false)
                 .await
@@ -223,9 +224,7 @@ impl ProviderAdapter for QoderAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
         Box::pin(async move {
             refresh::ensure_fresh(store, account_id, true)
                 .await
@@ -252,8 +251,7 @@ impl ProviderAdapter for QoderAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
         Box::pin(balance::query(store, account_id))
     }
 
@@ -430,106 +428,287 @@ impl ProviderAdapter for QoderAdapter {
                     "没有可用的 Qoder 账号：请在账号页添加并启用账号",
                 ));
             }
-            let context = chat::account_context(store, &account_id, false).await?;
-            let plan = chat::build_plan(&context.credentials, body, &model_name)?;
+            let mut context = chat::account_context(store, &account_id, false).await?;
             // 代理：编排层给的优先（它与账号记录同源，但已经解析好），
             // 没有就用快照里的（例如目录刷新那条路径）
             let effective_proxy = proxy.or(context.proxy);
+            // 排队退避的预算：用户给「等待响应超时」的那份预算（理由见 queue_backoff）
+            let queue_budget_ms = crate::server::config::timeout_settings().headers_ms();
+            let mut queue_waits: usize = 0;
+            let mut queue_waited_ms: u64 = 0;
+            // 鉴权失败后的强制续期只做一次（见 refresh_after_auth）
+            let mut auth_retries: usize = 0;
 
-            logging::verbose(
-                "[Qoder]",
-                &format!(
-                    "POST {} model={} upstream={} stream={} region={} account={}",
-                    plan.url,
-                    if model_name.is_empty() {
-                        "(默认)"
-                    } else {
-                        &model_name
-                    },
-                    plan.upstream_key,
-                    stream,
-                    context.credentials.region.id(),
-                    account_id,
-                ),
-            );
+            // ── 为什么这里是一个循环 ────────────────────────────────
+            // 上游对免费模型走排队制，繁忙时会用 403 + 业务码 10605 回一句
+            // 「暂不可服务，建议 N 秒后再来」。那是**可以原地等一会儿重发**的
+            // 状态（官方 CLI 与两个参考实现都这么做），所以「构造 → 发送 →
+            // 读首帧」这一整段每轮重跑一次：排队就睡一觉再来，其它错误按原样
+            // 返回。首帧之后（流已开始下发）不再重试 —— 那时客户端的 HTTP 头
+            // 早已发出，换不了任何东西，只能把错误写进流里收尾。
+            loop {
+                // 每轮都重新构造：COSY 签名覆盖 request_id 与请求体，**重放同一
+                // 份签名**会被上游判成重复请求（403 / code 103），所以退避之后
+                // 必须换一份新的 request_id 与签名。
+                let plan = chat::build_plan(&context.credentials, body, &model_name)?;
 
-            // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
-            // Qoder 是单次请求（一条对话 = 一次上游往返），与无状态路径同一
-            // 时机：请求体已定稿、即将发送。开关关着时 capture 为 None。
-            let capture = telemetry.capture();
-            if let Some(capture) = capture.as_deref() {
-                let headers: Vec<(String, String)> = plan.headers.clone();
-                capture.reset_request(&plan.url, "qoder", &headers, body);
-            }
+                logging::verbose(
+                    "[Qoder]",
+                    &format!(
+                        "POST {} model={} upstream={} stream={} region={} account={}",
+                        plan.url,
+                        if model_name.is_empty() { "(默认)" } else { &model_name },
+                        plan.upstream_key,
+                        stream,
+                        context.credentials.region.id(),
+                        account_id,
+                    ),
+                );
 
-            let response = chat::send(&plan, effective_proxy.as_ref()).await?;
-            if let Some(capture) = capture.as_deref() {
-                capture.attach_response(response.status().as_u16(), response.headers());
-            }
-            if !response.status().is_success() {
-                // 只有失败响应才读体（成功的是 SSE 流，读了就没流了）
-                let status = response.status().as_u16();
-                let error = chat::http_error(status, response).await;
-                // 限额信号落冷却（见 `record_limited`）：编排层在会话式路径上
-                // 看不到分类，只有适配器知道这一条是额度类错误
-                if error.status_code == 429 {
-                    record_limited(
-                        store,
-                        &account_id,
-                        &model_name,
-                        status,
-                        protocol::UpstreamKind::Quota,
-                        &error.message,
-                    );
+                // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
+                // Qoder 是单次请求（一条对话 = 一次上游往返），与无状态路径同一
+                // 时机：请求体已定稿、即将发送。开关关着时 capture 为 None。
+                // 排队退避时每轮都重置：报文要与最后一次真正发出的请求一致。
+                let capture = telemetry.capture();
+                if let Some(capture) = capture.as_deref() {
+                    let headers: Vec<(String, String)> = plan.headers.clone();
+                    capture.reset_request(&plan.url, "qoder", &headers, body);
                 }
-                return Err(error);
-            }
 
-            let translator = Translator::new(response_id(), plan.model_name.clone(), plan.thinking);
-            // 限额记账的素材：流式分支的收尾发生在 handler 返回之后，那时
-            // 这里的局部变量都还在（被 move 进后台任务），所以先把要用的
-            // 那份句柄与标识克隆好（store 是 Arc 句柄，clone 很便宜）
-            let limit_ctx = LimitContext {
-                store: store.clone(),
-                account_id: account_id.clone(),
-                model: model_name.clone(),
-            };
-            if stream {
-                // ── 首帧预读（issue #8 的修复，见 piping 模块头）────────
-                // 拿到 HTTP 200 不能直接返回：Qoder 的额度错误恰恰写在 200
-                // 的 SSE 信封里，改造前这里直接 Ok(Stream)，编排层退出后
-                // 流内错误只能透传给客户端、换号无从谈起。预读把首个事件拦
-                // 在返回之前 —— 业务错误转成带状态码的 Err 交回编排层换号
-                // （此刻还没有任何字节下发，客户端的 200 头也没发出，换号
-                // 无损）；拿到内容帧才返回 Ok(Stream)，预读帧随后补发。
-                let (prefetched, source) =
-                    piping::prefetch_stream_head(response, &limit_ctx, &telemetry).await?;
-                let (sender, receiver) =
-                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-                let telemetry = telemetry.clone();
-                // 上游流必须被**拉到底**（源实现同样读完整条流再 cancel）：
-                // 客户端断开时 tokio 的 channel 发送端会失败，循环随即退出，
-                // drop 掉 source 就等价于断开上游连接。
-                crate::spawn_task(async move {
-                    piping::drive_stream(
-                        source, translator, telemetry, limit_ctx, sender, prefetched,
-                    )
-                    .await;
-                });
-                return Ok(crate::server::core::upstream::ForwardOutcome::Stream {
-                    status: 200,
-                    stream: Box::new(tokio_stream::wrappers::ReceiverStream::new(receiver)),
-                });
-            }
+                let response = chat::send(&plan, effective_proxy.as_ref()).await?;
+                if let Some(capture) = capture.as_deref() {
+                    capture.attach_response(response.status().as_u16(), response.headers());
+                }
 
-            // 非流式：内部仍走流式拉取（上游只支持流式），再聚合成完整响应
-            // （流内的额度错误由 `drive_aggregate` 落冷却 —— 它就在错误现场，
-            // 这里不再重复记一次）
-            match drive_aggregate(response, translator, telemetry.clone(), &limit_ctx).await {
-                Ok(body) => Ok(crate::server::core::upstream::ForwardOutcome::Completion { body }),
-                Err(error) => Err(error),
+                if !response.status().is_success() {
+                    // 只有失败响应才读体（成功的是 SSE 流，读了就没流了）
+                    let status = response.status().as_u16();
+                    match chat::http_error(status, response).await {
+                        // 鉴权类：强制续期凭证后重发（一次）。续不出来/续了还被拒
+                        // 就把原错误交回 —— 那说明问题不在凭证的新旧上
+                        chat::AttemptError::Auth(error) => {
+                            context =
+                                refresh_after_auth(store, &account_id, &mut auth_retries, error, telemetry)
+                                    .await?;
+                            continue;
+                        }
+                        chat::AttemptError::Fatal(error) => {
+                            // 限额信号落冷却（见 `record_limited`）：编排层在会话式
+                            // 路径上看不到分类，只有适配器知道这一条是额度类错误
+                            if error.status_code == 429 {
+                                record_limited(
+                                    store,
+                                    &account_id,
+                                    &model_name,
+                                    status,
+                                    errors::UpstreamKind::Quota,
+                                    &error.message,
+                                );
+                            }
+                            return Err(error);
+                        }
+                        chat::AttemptError::Queued(queued) => {
+                            queue_backoff(
+                                &mut queue_waits,
+                                &mut queue_waited_ms,
+                                queue_budget_ms,
+                                &queued,
+                                telemetry,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                }
+
+                let translator = Translator::new(response_id(), plan.model_name.clone(), plan.thinking);
+                // 限额记账的素材：流式分支的收尾发生在 handler 返回之后，那时
+                // 这里的局部变量都还在（被 move 进后台任务），所以先把要用的
+                // 那份句柄与标识克隆好（store 是 Arc 句柄，clone 很便宜）
+                let limit_ctx = LimitContext {
+                    store: store.clone(),
+                    account_id: account_id.clone(),
+                    model: model_name.clone(),
+                };
+                if stream {
+                    // ── 首帧预读（issue #8 的修复，见 piping 模块头）────────
+                    // 拿到 HTTP 200 不能直接返回：Qoder 的额度错误恰恰写在 200
+                    // 的 SSE 信封里，改造前这里直接 Ok(Stream)，编排层退出后
+                    // 流内错误只能透传给客户端、换号无从谈起。预读把首个事件拦
+                    // 在返回之前 —— 业务错误转成带状态码的 Err 交回编排层换号
+                    // （此刻还没有任何字节下发，客户端的 200 头也没发出，换号
+                    // 无损）；拿到内容帧才返回 Ok(Stream)，预读帧随后补发。
+                    match piping::prefetch_stream_head(response, &limit_ctx, &telemetry).await {
+                        Ok((prefetched, source)) => {
+                            let (sender, receiver) =
+                                tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+                            let telemetry = telemetry.clone();
+                            // 上游流必须被**拉到底**（源实现同样读完整条流再 cancel）：
+                            // 客户端断开时 tokio 的 channel 发送端会失败，循环随即退出，
+                            // drop 掉 source 就等价于断开上游连接。
+                            crate::spawn_task(async move {
+                                piping::drive_stream(source, translator, telemetry, limit_ctx, sender, prefetched)
+                                    .await;
+                            });
+                            return Ok(crate::server::core::upstream::ForwardOutcome::Stream {
+                                status: 200,
+                                stream: Box::new(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+                            });
+                        }
+                        // 首帧就是排队信封（HTTP 200 + statusCodeValue 403）：还没
+                        // 下发任何字节，退避重发（和 HTTP 层的排队走同一条路）
+                        Err(chat::AttemptError::Queued(queued)) => {
+                            queue_backoff(
+                                &mut queue_waits,
+                                &mut queue_waited_ms,
+                                queue_budget_ms,
+                                &queued,
+                                telemetry,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(chat::AttemptError::Auth(error)) => {
+                            context =
+                                refresh_after_auth(store, &account_id, &mut auth_retries, error, telemetry)
+                                    .await?;
+                            continue;
+                        }
+                        Err(chat::AttemptError::Fatal(error)) => return Err(error),
+                    }
+                }
+
+                // 非流式：内部仍走流式拉取（上游只支持流式），再聚合成完整响应
+                // （流内的额度错误由 `drive_aggregate` 落冷却 —— 它就在错误现场，
+                // 这里不再重复记一次）
+                match drive_aggregate(response, translator, telemetry.clone(), &limit_ctx).await {
+                    Ok(body) => {
+                        return Ok(crate::server::core::upstream::ForwardOutcome::Completion { body })
+                    }
+                    // 非流式这一路也还没下发任何字节：排队同样可以退避重发
+                    Err(chat::AttemptError::Queued(queued)) => {
+                        queue_backoff(
+                            &mut queue_waits,
+                            &mut queue_waited_ms,
+                            queue_budget_ms,
+                            &queued,
+                            telemetry,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(chat::AttemptError::Auth(error)) => {
+                        context = refresh_after_auth(store, &account_id, &mut auth_retries, error, telemetry)
+                            .await?;
+                        continue;
+                    }
+                    Err(chat::AttemptError::Fatal(error)) => return Err(error),
+                }
             }
         })
+    }
+}
+
+/// 鉴权类失败后的补救：**强制**续期凭证一次，成功则交回新快照供调用方重发。
+///
+/// ── 为什么是「强制」而不是 `ensure` ──────────────────────────
+/// `ensure_fresh(force = false)` 只在临期窗口内才真续期。而 401 完全可能发生在
+/// 一个**时间上还很新**的 token 上（服务端侧作废、被别处顶下线、refreshToken
+/// 轮换过）—— 那时 `ensure` 会把同一个被拒的 token 原样交回来，白试一次。
+/// 这与无状态路径的 `TokenExpired` 动作同一理由（见 `providers::adapter` 模块头）。
+///
+/// ── 为什么只做一次 ──────────────────────────────────────────
+/// 续出来还被拒，说明问题不在凭证新旧（权限、地区、模型未开通）。再刷就是
+/// 对着同一个结果反复重试，还会把上游的刷新接口打成限流的形状。
+///
+/// 续期失败时返回的是**续期自己的错误**（「刷新令牌已失效，请重新登录」这类），
+/// 它比「上游返回 401」更能告诉用户下一步该做什么。
+async fn refresh_after_auth(
+    store: &AccountStore,
+    account_id: &str,
+    attempts: &mut usize,
+    error: GatewayError,
+    telemetry: &std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
+) -> Result<chat::AccountContext, GatewayError> {
+    if *attempts > 0 {
+        return Err(error);
+    }
+    *attempts += 1;
+    logging::log("[Qoder]", "🔑 上游报鉴权失败，强制续期凭证后同账号重试一次");
+    // 续期本身可能在途（刷新接口一次往返），先记一条内部重试 —— 用户看到
+    // 「凭证过期 → 续期 → 重发」这条链，才解释得通这次请求为什么慢了一拍
+    telemetry.note_attempt_retry("上游鉴权失败，强制续期凭证后重试", Some(401), 0);
+    chat::account_context(store, account_id, true).await
+}
+
+// ── 排队等待的次数与单次时长来自设置页「通用 → 排队等待」──────────
+// （`queueMaxWaits` / `queueWaitSeconds`，见 `config::queue_settings`）：
+// 缺省最多等 2 次、单次跟随上游建议（9～30 秒，上游没给建议时 15 秒）；
+// 把次数写成 0 = 不等待，排队态立刻以 503 返回（「快速失败、客户端自己重试」
+// 那一档，参考实现里叫 `queue_max_waits: 0`）。
+
+/// 排队退避：还能等就睡一觉并返回 `Ok`（调用方重新签名再发一次）；
+/// 预算用尽返回 `Err`（排队落定成 503，文案带已等待时长与上游原文）。
+///
+/// ── 等待预算为什么要看「等待响应超时」────────────────────────
+/// 排队等待发生在**首帧之前**（客户端的 200 头还没发出），吃掉的是用户在设置页
+/// 给「等待响应超时」的那份预算。用户把它调小（例如 20 秒）就说明他不接受一次
+/// 请求卡那么久 —— 那就不等，直接给一条能看懂的排队错误。
+async fn queue_backoff(
+    waits: &mut usize,
+    waited_ms: &mut u64,
+    budget_ms: u64,
+    queued: &chat::Queued,
+    telemetry: &std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
+) -> Result<(), GatewayError> {
+    let settings = crate::server::config::queue_settings();
+    let max_waits = settings.wait_budget();
+    // 单次时长：设置里写死了就用它，否则跟随上游建议（`queued.retry_after_ms`
+    // 已经在分类时按 5～30 秒钳过）
+    let wait_ms = settings.forced_wait_ms().unwrap_or(queued.retry_after_ms);
+    if *waits >= max_waits || waited_ms.saturating_add(wait_ms) > budget_ms {
+        return Err(chat::queued_error(queued, *waited_ms));
+    }
+    *waits += 1;
+    *waited_ms += wait_ms;
+    let seconds = wait_ms / 1000;
+    logging::log(
+        "[Qoder]",
+        &format!(
+            "⏳ 上游模型排队中{}，{seconds} 秒后重试（第 {}/{} 次）",
+            if queued.detail.is_empty() { String::new() } else { format!("（{}）", queued.detail) },
+            *waits,
+            max_waits,
+        ),
+    );
+    // 请求日志的尝试明细 + 阶段：排队退避既是一次「内部重试」，也是一段独立的
+    // 等待（阶段显示成「排队中」）—— 用户能在详情里看到「这次为什么慢」，
+    // 否则这段等待会被读成「网关卡住了」。
+    telemetry.note_queued("上游模型排队中", Some(10605), wait_ms, *waits, max_waits);
+    sleep_or_cancel(telemetry, wait_ms).await;
+    if telemetry.is_cancelled() {
+        // 等待期间客户端已经放弃（或用户手动终止）：不再白打一次上游
+        return Err(chat::queued_error(queued, *waited_ms));
+    }
+    Ok(())
+}
+
+/// 可取消的等待：客户端把请求掐掉（或用户点了终止）时立刻结束。
+///
+/// 与无状态路径的退避同一形态（见 `upstream::provider_loop` 的 `sleep_or_cancel`）：
+/// 令牌未接线时退化成普通 sleep，行为与「不可取消」一致。
+async fn sleep_or_cancel(
+    telemetry: &std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
+    delay_ms: u64,
+) {
+    let sleep = tokio::time::sleep(std::time::Duration::from_millis(delay_ms));
+    tokio::pin!(sleep);
+    match telemetry.cancel_token() {
+        Some(token) => tokio::select! {
+            _ = &mut sleep => {}
+            _ = token.cancelled() => {}
+        },
+        None => sleep.await,
     }
 }
 
@@ -545,31 +724,32 @@ struct LimitContext {
 /// 非流式：拉完整条上游流，聚合成一个完整 `chat.completion`。
 ///
 /// 与流式路径的关键差别：这里的错误**还没有下发任何内容**（HTTP 头都没发），
-/// 所以额度类错误可以带着状态码交回编排层，由编排层决定换账号还是刷新重试。
-/// 冷却标记在调用方落（它持有 store 与账号标识的完整上下文）。
+/// 所以额度类错误可以带着状态码交回编排层、排队态可以退避重发，都由调用方
+/// 决定（见 `forward_conversation` 的循环）。冷却标记在调用方落（它持有 store
+/// 与账号标识的完整上下文）。
 async fn drive_aggregate(
     response: reqwest::Response,
     mut translator: Translator,
     telemetry: std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
     limit: &LimitContext,
-) -> Result<Value, GatewayError> {
+) -> Result<Value, chat::AttemptError> {
     use futures::StreamExt;
 
     let mut lines = stream::LineBuffer::new();
     let mut source = response.bytes_stream();
-    let mut business_failure: Option<GatewayError> = None;
+    let mut business_failure: Option<chat::AttemptError> = None;
     // 调试模式的采集器（与 drive_stream 同一位置：解析之前采原始字节）
     let capture = telemetry.capture();
 
     'outer: while let Some(item) = source.next().await {
         let chunk = item.map_err(|error| {
-            GatewayError::with_status(
+            chat::AttemptError::Fatal(GatewayError::with_status(
                 502,
                 format!(
                     "Qoder 上游流式传输中断: {}",
                     crate::server::core::egress::describe_error_detail(&error)
                 ),
-            )
+            ))
         })?;
         if let Some(capture) = capture.as_deref() {
             capture.push(&chunk);
@@ -578,14 +758,7 @@ async fn drive_aggregate(
             match stream::parse_sse_line(&data) {
                 SseEvent::Skip => {}
                 SseEvent::Done => break 'outer,
-                SseEvent::Error {
-                    status,
-                    kind,
-                    raw,
-                    message,
-                    pricing_url,
-                    ..
-                } => {
+                SseEvent::Error { status, kind, raw, message, pricing_url, queue } => {
                     record_limited(
                         &limit.store,
                         &limit.account_id,
@@ -600,6 +773,7 @@ async fn drive_aggregate(
                         &raw,
                         &message,
                         pricing_url.as_deref(),
+                        queue,
                     ));
                     break 'outer;
                 }

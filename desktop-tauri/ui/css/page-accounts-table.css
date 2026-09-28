@@ -202,11 +202,6 @@
 /* 已禁用：整行压灰。不做成整行半透明 —— 那一行里的开关与菜单还要能点、要能看清 */
 .acct-row.disabled .acct-name .name { color: var(--text-3); }
 .acct-row.disabled .acct-sub { opacity: .75; }
-
-/* 组首行（换了一家）：上边框重一档，把「这一段的提供商变了」显出来。
-   不打组头行 —— 那会把一张表重新切回四块（见 accounts-view.js 的说明）。 */
-.acct-row.pgroup-start > td { border-top: 1px solid var(--border); }
-
 /* ─── 勾选列 ─── */
 
 .acct-table input[type="checkbox"] {
@@ -304,10 +299,6 @@
    inline-flex 会收缩到最长选项的自然宽，触发器比格子窄出箭头那一档，
    文本反而先被截断，见 page-gateway.css 的 select-shell 说明）。 */
 .cell-proxy select { width: 100%; }
-.cell-proxy .select-shell { width: 100%; }
-/* 代理解析失败（proxy.error）：整格标红，原因在触发器 title 与账号列第二行 */
-.cell-proxy.err .select-trigger { border-color: var(--danger-bd); }
-
 /* 健康说明（限流恢复时间 / 代理不可用）：只在异常时出现，正常行不留空行 */
 .acct-note {
   margin-top: 2px;
@@ -376,7 +367,9 @@
 
    ── 为什么必须显式写 height（本次修复）──────────────────────
    改造前这里只声明了 `width: 20px`、**没写 height**，于是全局
-   `button { height: 30px }`（components.css）直接生效 —— 它与特异性无关，
+   `button { height: 30px }
+
+`（components.css）直接生效 —— 它与特异性无关，
    纯粹是这里没人声明过高度。
    后果：按钮实际高 30px，而外框 `.prio-stepper` 只有 24px，
    `overflow: hidden` 把它裁到 24px。按钮自己的垂直中心落在 15px（30/2），
@@ -453,7 +446,9 @@
   appearance: textfield;
   -moz-appearance: textfield;
   /* flex 归零：箭头是固定 20px 的两枚按钮，输入框不许参与伸缩
-     （全局 `input[type=number]{flex:1 1 auto}` 会把它们挤没） */
+     （全局 `input[type=number]{flex:1 1 auto}
+
+` 会把它们挤没） */
   flex: 0 0 auto;
 }
 
@@ -518,24 +513,6 @@
    「最早恢复」。竖排的理由与余额列相同：徽章与恢复文案横排必然超出列宽。 */
 .cell-limits { white-space: nowrap; }
 
-.lim {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 24px;
-  padding: 0 8px;
-  border: 1px solid var(--warn-bd);
-  border-radius: var(--r-sm);
-  background: var(--warn-soft);
-  color: var(--warn);
-  font-size: 11.5px;
-  font-weight: 600;
-}
-
-.lim:hover:not(:disabled) { border-color: var(--warn); background: var(--warn-soft); color: var(--warn); }
-.lim.open { border-color: var(--warn); box-shadow: 0 0 0 2px var(--warn-soft); }
-.lim .caret { font-size: 9px; opacity: .7; }
-
 .lim-sub {
   display: block;
   margin-top: 3px;
@@ -545,10 +522,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-.lim-none { display: inline-flex; align-items: center; gap: 5px; color: var(--ok); font-size: 11.5px; }
-.lim-none i { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
-
 /* ─── 有效期列 ─── */
 .cell-expiry { color: var(--text-2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .cell-expiry .muted { color: var(--text-3); }
@@ -617,7 +590,9 @@
    明细行自带浅凹底：它是「附属于上一行」的补充信息，不该与账号行同权重。
 
    面板自身的外观在 page-accounts.css 里**是按 .acct-card 限定**的
-   （`.acct-card .row-panel { … }`），那份选择器在表格里不命中 ——
+   （`.acct-card .row-panel { … }
+
+`），那份选择器在表格里不命中 ——
    这里补一套同等形制的规则（含右上角的「收起」按钮），而不是去改那个文件里
    仍然服务于卡片视图的选择器：两处各写一份，改卡片那边不会悄悄改到表格。 */
 .acct-panels > td {
@@ -641,8 +616,6 @@
   color: var(--text-2);
   font-size: 11.5px;
 }
-
-.acct-panels .row-panel.error { border-color: var(--danger-bd); background: var(--danger-soft); color: var(--danger); }
 
 /* 「收起」按钮固定到右上角（面板是 flex 容器，跟着内容排会被挤到文字后面） */
 .acct-panels .row-panel .panel-close {

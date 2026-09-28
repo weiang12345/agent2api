@@ -293,7 +293,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 code, kbd { font-family: var(--font-mono); font-size: .93em; }
 
-/* hidden 属性必须压过组件自身 display，否则弹窗 / 进度块会默认露出来 */
+/* hidden 属性必须压过组件自身 display，否则弹窗 / 进度块会默认露出来。
+   注意：组件库产物（islands/ui.css）的工具类是分层 + !important 的，分层里的
+   重要声明反压未分层的重要声明 —— 那里需要同层压制的规则写在组件库自己的
+   globals.css（见 [data-slot='dialog-content'][hidden]）。 */
 [hidden] { display: none !important; }
 
 :focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--r-sm); }

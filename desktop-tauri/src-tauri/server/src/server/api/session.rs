@@ -79,7 +79,7 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
                     .unwrap_or_else(|| Value::String(UNCONFIGURED_REASON.to_string()))
             },
         },
-        "session": state.auth().get_status().await,
+        "session": state.auth().get_status(),
         // accounts.currentAccountId = **不限模型**的队首（判据 = 启用 + 有可用凭证 +
         // 优先级序，见 core::account_store）。它回答「队列第一位是谁」，别的地方
         // （凭证来源、刷新目标）读的也一直是它，语义不变。
@@ -1016,7 +1016,7 @@ pub async fn login_accio_callback(
 /// 刷新失败的响应形状与 /api/accounts/refresh 不同，别混用。
 pub async fn session_refresh(State(state): State<ServerState>) -> Response {
     match state.auth().refresh_stored_session().await {
-        Ok(_) => ok_json(json!({ "session": state.auth().get_status().await })),
+        Ok(_) => ok_json(json!({ "session": state.auth().get_status() })),
         Err(error) => {
             logging::log("[Auth]", &format!("❌ {}", error.message));
             use axum::response::IntoResponse;

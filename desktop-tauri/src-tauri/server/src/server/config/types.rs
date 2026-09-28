@@ -50,6 +50,24 @@ pub const KEY_REQUEST_STATS_DIR: &str = "requestStatsDir";
 /// 调试模式原始报文的保存目录（config.json 键），语义同 `KEY_LOG_DIR`
 pub const KEY_DEBUG_DIR: &str = "debugDir";
 
+/// 「软件更新」的出网线路（config.json 键，**缺省 = 直连**）。
+///
+/// 值是归一后的代理配置对象（与账号代理同一形状：`{source:'clash',
+/// listenerUid}` / `{source:'custom',…}`），null / 缺省都表示直连。
+/// 检查更新与下载安装包共用它（`core::update::client` 的出口候选），
+/// 定时检查任务同一条路 —— 所以改完不用重启，下一次检查就生效。
+/// 归一与解析都复用账号代理那两份实现（`normalize_account_proxy` /
+/// `resolve_account_proxy`），这里只存取。
+pub const KEY_UPDATE_PROXY: &str = "updateProxy";
+
+/// GitHub 令牌的密文信封（config.json 键，**存的不是明文**）。
+///
+/// 值是 `core::update::token` 用 AES-256-GCM 加密出来的 `enc1:<base64>` 信封，
+/// 明文只进内存、只在拼请求头时用；密钥在库外的密钥文件里（细节见那个
+/// 模块的头注释）。API 只报「有没有、来自哪」，不回显本体。
+/// 环境变量 `GITHUB_TOKEN` 仍是兜底来源（优先级：这个键 > 环境变量）。
+pub const KEY_GITHUB_TOKEN: &str = "githubToken";
+
 /// 调试模式开关（config.json 键）。
 ///
 /// 开启后转发层会把**发给上游的请求头（脱敏）与请求体、上游返回的响应头与
@@ -232,11 +250,14 @@ pub const DEFAULT_MODEL_REFRESH_MINUTES: i64 = 60;
 pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 1;
 pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 1;
 pub const DEFAULT_REPORT_AUTO_REFRESH_SECONDS: i64 = 1;
-/// 软件版本检查默认间隔（分钟）：每 5 分钟查一次 GitHub 最新发布。
+/// 软件版本检查默认间隔（分钟）：每 20 分钟查一次 GitHub 最新发布。
 ///
-/// GitHub 匿名限额是 60 次/小时/IP：5 分钟一次（12 次/小时）留足余量；
-/// 下限仍是全局的 INTERVAL_MIN_MINUTES，但设到 1 分钟贴着限额跑没有意义。
-pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 5;
+/// 20 分钟 = 3 次/小时，相对匿名限额（60 次/小时，且**按出口 IP 计** —— 同一
+/// 出口下的其它程序共用这份额度）留足余量，又能让新版本的提示在一刻钟量级内
+/// 出现。**这个默认值只影响「没配过间隔」的情形**：已经保存过
+/// `scheduledTasks.updateCheck.interval` 的配置按原值跑（`interval_field`
+/// 只在键缺失或越界时才回落到默认），所以调整它不会改写老用户的设置。
+pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 20;
 /// 定时查询积分的默认间隔（分钟）：每 10 分钟查一次全部账号的余额。
 ///
 /// 与凭证维护同档：一条余额查询就是逐账号打一次上游的积分接口，
@@ -571,4 +592,79 @@ pub struct TimeoutPatch {
     pub headers_seconds: Option<i64>,
     pub stream_idle_seconds: Option<i64>,
     pub body_seconds: Option<i64>,
+}
+
+// ─── 排队等待（走排队制的上游：目前只有 Qoder 的免费模型）─────────────
+
+/// 排队时最多等待几次（0 = 不等待，直接把排队态作为错误返回）
+pub const KEY_QUEUE_MAX_WAITS: &str = "queueMaxWaits";
+/// 单次排队等待的秒数（0 = 跟随上游建议值）
+pub const KEY_QUEUE_WAIT_SECONDS: &str = "queueWaitSeconds";
+
+/// 默认等待次数：2 次。
+///
+/// 与参考实现（CLIProxyAPI 的 qoder2api 插件 `queue_max_waits` 默认值）取同一
+/// 档：上游给的建议间隔实测 9～30 秒，两次最多等一分钟 —— 落在「用户还能接受
+/// 的首字等待」与「默认 300 秒的等待响应超时」之间。
+pub const DEFAULT_QUEUE_MAX_WAITS: i64 = 2;
+/// 默认单次等待秒数：0 = 跟随上游建议（上游没给建议时适配器退到 15 秒）
+pub const DEFAULT_QUEUE_WAIT_SECONDS: i64 = 0;
+
+/// 等待次数的合法范围 0~10：0 = 关闭等待（排队即报错）。上限 10 是因为
+/// 「等一会儿再发」等得太多次不如让客户端自己决定重试 —— 它会收到一条写清
+/// 「排队中、不是登录态或额度问题」的错误，而不是一个看不出所以然的超时。
+pub const QUEUE_MIN_MAX_WAITS: i64 = 0;
+pub const QUEUE_MAX_MAX_WAITS: i64 = 10;
+/// 单次等待秒数的合法范围 0~120（0 = 跟随上游建议）
+pub const QUEUE_MIN_WAIT_SECONDS: i64 = 0;
+pub const QUEUE_MAX_WAIT_SECONDS: i64 = 120;
+
+/// 排队等待设置（设置页「通用 → 排队等待」区域）。
+///
+/// 与 `TimeoutSettings` 同一取舍：两个值总是一起用（每次排队判定取一份快照），
+/// 打包成一个 `Copy` 值让调用方一次拿到。
+///
+/// ── 它影响谁 ────────────────────────────────────────────────
+/// 只有**走排队制的适配器**读它（目前是 Qoder：免费模型繁忙时上游用 403 +
+/// 业务码 10605 回一句「暂不可服务，建议 N 秒后再来」）。其它家没有排队语义，
+/// 这份设置对它们无影响。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueSettings {
+    /// 最多等待次数（0 = 不等待）
+    pub max_waits: i64,
+    /// 单次等待秒数（0 = 跟随上游建议值）
+    pub wait_seconds: i64,
+}
+
+impl QueueSettings {
+    /// 等待次数预算（负值按 0：读侧已保证范围，这里是防御性的）
+    pub fn wait_budget(&self) -> usize {
+        self.max_waits.clamp(QUEUE_MIN_MAX_WAITS, QUEUE_MAX_MAX_WAITS) as usize
+    }
+
+    /// 强制单次等待时长（毫秒）；`None` = 跟随上游建议
+    pub fn forced_wait_ms(&self) -> Option<u64> {
+        let seconds = self.wait_seconds.clamp(QUEUE_MIN_WAIT_SECONDS, QUEUE_MAX_WAIT_SECONDS);
+        if seconds > 0 {
+            Some(seconds as u64 * 1000)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for QueueSettings {
+    fn default() -> Self {
+        Self {
+            max_waits: DEFAULT_QUEUE_MAX_WAITS,
+            wait_seconds: DEFAULT_QUEUE_WAIT_SECONDS,
+        }
+    }
+}
+
+/// 排队等待的**部分**更新入参（`None` = 该项不动）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueuePatch {
+    pub max_waits: Option<i64>,
+    pub wait_seconds: Option<i64>,
 }
