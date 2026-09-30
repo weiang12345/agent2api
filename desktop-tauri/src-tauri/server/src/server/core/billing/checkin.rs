@@ -84,15 +84,13 @@ pub fn supports_checkin(account: &Value) -> bool {
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
-    // CodeArts 与 Trae 两家都没有「签到」链路，必须先排除：
+    // CodeArts 的每日福利是独立的 ops 链路，不属于这里的签到。
     // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而这两家
     // 的按钮在界面上由能力位 `checkin: false` 收起 —— 这一层是批量路径
     // （`resolve_checkin_targets` 的 filter）与 API 直调的兜底，双保险。
     // 注意 CodeArts 的每日福利**不是**签到（那是 ops 福利领取，独立的「领福利」
     // 按钮，见 `providers::codearts::welfare`），与这条链无交集。
-    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID
-        || provider == crate::server::core::account_store::TRAE_PROVIDER_ID
-    {
+    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID {
         return false;
     }
     !crate::server::core::account_store::is_accio_family(provider)
@@ -238,6 +236,13 @@ pub async fn checkin_for(
             // 实现里的国际版文案只是兜底。
             let claim =
                 crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "trae" => {
+            let claim =
+                crate::server::core::providers::trae::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
