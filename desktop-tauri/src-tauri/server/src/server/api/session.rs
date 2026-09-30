@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::server::api::health::UNCONFIGURED_REASON;
@@ -124,11 +124,7 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
 ///
 /// 模型未知 / 该模型下确实没有可用账号时给 null —— 界面回落到
 /// `currentAccountId`，宁可让它标一个「队列第一位」，也不要整列 ★ 凭空消失。
-fn routed_account_id(
-    accounts: &Value,
-    model: Option<&str>,
-    counts: &HashMap<String, usize>,
-) -> Value {
+fn routed_account_id(accounts: &Value, model: Option<&str>, counts: &HashMap<String, usize>) -> Value {
     let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
         return Value::Null;
     };
@@ -224,7 +220,9 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
     // 两张卡片共用一个表单时就会串味（点了国际版却落了国内版账号，
     // 而账号记录一旦落错家，转发会稳定打错域名）。因此这里由 kind 反查地区，
     // 再把地区交给登录任务（任务表里的 edition 串只用做日志与回显）。
-    if let Some(region) = crate::server::core::providers::zcode::region::Region::from_kind(kind) {
+    if let Some(region) =
+        crate::server::core::providers::zcode::region::Region::from_kind(kind)
+    {
         let handle = match state.login().start_zcode_login(region) {
             Ok(handle) => handle,
             Err(error) => return management_error(400, error),
@@ -247,6 +245,35 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         };
         return ok_json(json!({ "state": task_state, "authUrl": auth_url,
             "edition": task_edition, "provider": region.provider_id() }));
+    }
+    // Trae：**网页登录 + 本机回调监听**（授权地址由本进程现造，见
+    // `core::login::trae`）。响应形状与另外几条登录链一致
+    // （`{state, authUrl, edition, provider}`），前端不需要新分支。
+    //
+    // ★ 这里的等待上限比通用的 `AUTH_URL_WAIT_MS`（15s）**长**一档：地址要先
+    // 问一次 GetLoginGuidance，而那是「三个候选各 5 秒」的轮询 —— 上游不通时
+    // 恰好是 15 秒，用通用值会让"地址其实造出来了"的那一次被响应侧的超时
+    // 判成失败（后台任务还在跑，界面却已经报错了，是最难复现的一类分歧）。
+    // guidance 全挂时本家会兜到默认登录 host（参考实现同一条），所以这段
+    // 等待的最坏情况是"上游不通"而不是"永远等不到"。
+    if kind == crate::server::core::providers::ProviderKind::Trae {
+        let handle = match state.login().start_trae_login() {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let (task_state, auth_url, task_edition) = match state
+            .login()
+            .wait_for_auth_url(&handle, Duration::from_millis(20_000))
+            .await
+        {
+            Ok(values) => values,
+            Err(error) => {
+                logging::log("[Login]", &format!("❌ 发起 Trae 登录失败: {error}"));
+                return management_error(502, error);
+            }
+        };
+        return ok_json(json!({ "state": task_state, "authUrl": auth_url,
+            "edition": task_edition, "provider": "trae" }));
     }
     // Cline：**设备授权登录**（WorkOS RFC 8628）。形态上介于「网页登录」与
     // 「Qoder 设备授权」之间：同步问上游要 user_code 与授权页地址（一次 POST），
@@ -271,46 +298,13 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
             .map(str::to_string)
             .filter(|value| !value.trim().is_empty());
         let provider_id = crate::server::core::providers::kind_id(kind);
-        let handle = match state
-            .login()
-            .start_cline_device_login(provider_id, name)
-            .await
-        {
+        let handle = match state.login().start_cline_device_login(provider_id, name).await {
             Ok(handle) => handle,
             Err(error) => return management_error(400, error),
         };
         let task = handle.snapshot();
         return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
             "edition": task.edition, "provider": provider_id }));
-    }
-    if kind == crate::server::core::providers::ProviderKind::AtmCode {
-        let name = payload
-            .as_ref()
-            .and_then(|payload| payload.get("name").and_then(Value::as_str))
-            .map(str::to_string)
-            .filter(|value| !value.trim().is_empty());
-        let handle = match state.login().start_atomcode_login(name).await {
-            Ok(handle) => handle,
-            Err(error) => return management_error(400, error),
-        };
-        let task = handle.snapshot();
-        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
-            "edition": task.edition, "provider": "atomcode" }));
-    }
-    if kind == crate::server::core::providers::ProviderKind::Trae {
-        let name = payload
-            .as_ref()
-            .and_then(|payload| payload.get("name").and_then(Value::as_str))
-            .map(str::to_string)
-            .filter(|value| !value.trim().is_empty());
-        let callback_base = format!("http://127.0.0.1:{}", state.port);
-        let handle = match state.login().start_trae_login(&callback_base, name).await {
-            Ok(handle) => handle,
-            Err(error) => return management_error(400, error),
-        };
-        let task = handle.snapshot();
-        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
-            "edition": task.edition, "provider": "trae" }));
     }
     // CatPaw：上游把 token **推**到我们的 loopback 回调上（见 core::login::catpaw），
     // 所以这里除了发起还要把回调基址告诉它 —— 那必须是本网关自己的监听地址，
@@ -369,10 +363,7 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
 /// 响应形状与 workbuddy 分支**完全一致**（`{state, authUrl}` + 一个 `edition`
 /// 字段）：前端与壳侧轮询逻辑只认这三个键，多一个 provider 维度不该改动它们。
 /// `edition` 对非 workbuddy 没有语义（这里仍给默认值，省得前端读到 null）。
-async fn start_web_login(
-    state: ServerState,
-    kind: crate::server::core::providers::ProviderKind,
-) -> Response {
+async fn start_web_login(state: ServerState, kind: crate::server::core::providers::ProviderKind) -> Response {
     let label = crate::server::core::providers::meta(kind).label;
     let handle = match state.login().start_web_login(kind) {
         Ok(handle) => handle,
@@ -380,10 +371,7 @@ async fn start_web_login(
     };
     let task = handle.snapshot();
     let (Some(task_state), Some(auth_url)) = (task.state, task.auth_url) else {
-        return management_error(
-            500,
-            format!("{label}网页登录未能生成 state/授权地址，请重试"),
-        );
+        return management_error(500, format!("{label}网页登录未能生成 state/授权地址，请重试"));
     };
     ok_json(json!({
         "state": task_state,
@@ -514,42 +502,6 @@ pub async fn login_catpaw_callback(State(state): State<ServerState>, body: Bytes
     let response = match state.login().finish_catpaw_login(&token, &task_state).await {
         Ok(()) => catpaw_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
         Err(message) => catpaw_callback_page(400, &format!("登录失败：{message}")),
-    };
-    attach_private_network_headers(response)
-}
-
-// ─── GET /api/session/login/trae-callback ───────────────────
-/// Trae 网页登录回调。浏览器跳转到本机网关，携带 refreshToken 与用户信息。
-pub async fn login_trae_callback(
-    State(state): State<ServerState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Response {
-    let task_state = params
-        .get("loginTraceID")
-        .or_else(|| params.get("login_trace_id"))
-        .cloned()
-        .unwrap_or_default();
-    let callback_url = {
-        let mut url =
-            url::Url::parse("http://127.0.0.1/authorize").expect("static callback base URL");
-        {
-            let mut query = url.query_pairs_mut();
-            for (key, value) in &params {
-                query.append_pair(key, value);
-            }
-        }
-        url.to_string()
-    };
-    let response = match state
-        .login()
-        .finish_trae_login(&callback_url, &task_state)
-        .await
-    {
-        Ok(_) => catpaw_callback_page(200, "Trae 登录成功，已返回网关，可以关闭此页面。"),
-        Err(error) => catpaw_callback_page(
-            error.status_code as u16,
-            &format!("Trae 登录失败：{}", error.message),
-        ),
     };
     attach_private_network_headers(response)
 }
@@ -735,9 +687,9 @@ pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> 
     )
     .await
     {
-        Ok(credentials) => credentials,
-        Err(error) => return management_error(error.status_code, error.message),
-    };
+            Ok(credentials) => credentials,
+            Err(error) => return management_error(error.status_code, error.message),
+        };
     // 备注名：用户显式填的优先；没填则用脱敏手机号（`130****4229`）——
     // 比默认的「账号 830290」更像用户自己认得出来的标识
     let name = payload
@@ -775,20 +727,14 @@ pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> 
 ///
 /// 不认识的值一律 400：**不静默回落**到某一个变体 —— 那会让用户点 Google
 /// 却打开 Zai 的授权页（而两者用的是不同的账号体系，登进去是个陌生账号）。
-fn oauth_vendor_of(
-    payload: &Value,
-) -> Result<crate::server::core::providers::autoclaw::oauth::Vendor, Response> {
+fn oauth_vendor_of(payload: &Value) -> Result<crate::server::core::providers::autoclaw::oauth::Vendor, Response> {
     let raw = payload
         .get("vendor")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
-    crate::server::core::providers::autoclaw::oauth::Vendor::from_id(raw).ok_or_else(|| {
-        management_error(
-            400,
-            format!("未知的登录方式「{raw}」（只支持 zai / google）"),
-        )
-    })
+    crate::server::core::providers::autoclaw::oauth::Vendor::from_id(raw)
+        .ok_or_else(|| management_error(400, format!("未知的登录方式「{raw}」（只支持 zai / google）")))
 }
 
 /// `GET /api/session/login/oauth/captcha-config` —— 取风控验证配置。
@@ -860,13 +806,7 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
     let gateway_base = format!("http://localhost:{api_port}");
     let (handle, warning) = match state
         .login()
-        .start_autoclaw_oauth_login(
-            region,
-            vendor,
-            captcha,
-            &gateway_base,
-            state.host.is_loopback(),
-        )
+        .start_autoclaw_oauth_login(region, vendor, captcha, &gateway_base, state.host.is_loopback())
         .await
     {
         Ok(result) => result,
@@ -932,9 +872,7 @@ pub async fn login_autoclaw_oauth_callback(
         .await
     {
         Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
-        Err(error) => {
-            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
-        }
+        Err(error) => oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message)),
     }
 }
 
@@ -953,7 +891,7 @@ fn oauth_callback_page(status: i32, message: &str) -> Response {
         .replace('"', "&quot;");
     let html = format!(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
-         <title>AutoClaw 登录</title></head>\
+         <title>登录回调</title></head>\
          <body style=\"font-family:system-ui,sans-serif;padding:48px;text-align:center\">\
          <p style=\"font-size:16px\">{escaped}</p></body></html>"
     );
@@ -1004,6 +942,58 @@ pub async fn login_accio_callback(
             state.login().drop_accio_pending(&task_state);
             oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
         }
+    }
+}
+
+// ─── /oauth/callback（CodeArts portal 的登录回调）─────────────
+
+/// CodeArts 网页登录的回调。**路径不是我们能定的**：portal 只认授权地址里给的
+/// `port`，回调路径固定拼成 `http://127.0.0.1:<port>/oauth/callback`（见
+/// `providers::codearts::oauth::authorize_url`），所以这条路由必须用官方那个名字，
+/// 不能像 accio 一样自己挑一个别家撞不到的。
+///
+/// 免鉴权的理由与 accio / catpaw / autoclaw 四条 loopback 回调同一句：调用方是
+/// **用户的浏览器**，它当然没有我们的 API Key。
+///
+/// 两次回调（portal 先带 `secret`+`redirect`、再带 `code`）都落在这里，
+/// 归属判定与 ticket 兜底见 `core::login::codearts` 的模块头。
+///
+/// POST 也要：官方 portal 在某些链路上把 `code` 放在表单体里送回来（参考实现与
+/// `hitzy-codearts2api` 都为此留了兼容分支），只收 GET 会在那种链路上永远等不到码。
+pub async fn login_codearts_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    render_codearts_callback(state.login().finish_codearts_login(&params).await)
+}
+
+/// 同上，但参数在表单里（`application/x-www-form-urlencoded` 或裸查询串形态的 body）。
+pub async fn login_codearts_callback_post(
+    State(state): State<ServerState>,
+    body: Bytes,
+) -> Response {
+    let text = String::from_utf8_lossy(&body).to_string();
+    let mut params: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(text.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    // 上游也可能把整条回调 URL 塞进某个字段（代理过的链路），那一路径先按查询串拆一次
+    if params.is_empty() {
+        if let Some((_, query)) = text.split_once('?') {
+            params = url::form_urlencoded::parse(query.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+        }
+    }
+    render_codearts_callback(state.login().finish_codearts_login(&params).await)
+}
+
+/// 三种收尾各回什么给浏览器。
+fn render_codearts_callback(outcome: crate::server::core::login::codearts::Callback) -> Response {
+    use axum::response::Redirect;
+    match outcome {
+        // 第一趟必须原样转出去：这一跳是 portal 登录链路的一部分，不跳就没有第二趟
+        crate::server::core::login::codearts::Callback::ContinueTo(url) => Redirect::temporary(&url).into_response(),
+        crate::server::core::login::codearts::Callback::Accepted(_, message) => oauth_callback_page(200, &message),
+        crate::server::core::login::codearts::Callback::Failed(status, message) => oauth_callback_page(i32::from(status), &message),
     }
 }
 

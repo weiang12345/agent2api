@@ -1,5 +1,5 @@
 /**
- * 模型能力位的前端共享知识：五个键、文案、token 格式化与三态判定。
+ * 模型能力位的前端共享知识：六个键、文案、token 格式化与三态判定。
  *
  * 键名与顺序与后端 `core::capability::KEYS` 逐字一致（存储与出口的权威在
  * 那边）；本模块只回答「展示层怎么读」—— 表格两列、能力弹窗、自定义家适配
@@ -17,12 +17,13 @@
  * 表格用它给值加一枚小点、弹窗用它区分「继承 / 覆盖」两态。
  */
 
-/** 五个能力键（顺序 = 弹窗字段与能力徽章的展示顺序，与后端一致） */
+/** 六个能力键（顺序 = 弹窗字段与能力徽章的展示顺序，与后端一致） */
 export const CAPABILITY_KEYS = [
   'maxInputTokens',
   'maxOutputTokens',
   'supportsToolCall',
   'supportsImages',
+  'supportsVideo',
   'supportsReasoning',
 ] as const
 
@@ -34,7 +35,9 @@ export type Capabilities = Partial<Record<CapabilityKey, number | boolean | null
 /** token 数值键（弹窗按数字输入呈现） */
 export const TOKEN_KEYS: readonly CapabilityKey[] = ['maxInputTokens', 'maxOutputTokens']
 /** 布尔能力键（弹窗按三态选择呈现） */
-export const BOOLEAN_KEYS: readonly CapabilityKey[] = ['supportsToolCall', 'supportsImages', 'supportsReasoning']
+export const BOOLEAN_KEYS: readonly CapabilityKey[] = [
+  'supportsToolCall', 'supportsImages', 'supportsVideo', 'supportsReasoning',
+]
 
 /** 弹窗字段与表格 tooltip 用的完整文案 */
 export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
@@ -42,6 +45,7 @@ export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
   maxOutputTokens: '最大输出 Token',
   supportsToolCall: '工具调用',
   supportsImages: '图片识别',
+  supportsVideo: '视频识别',
   supportsReasoning: '支持思考',
 }
 
@@ -49,6 +53,7 @@ export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
 export const CAPABILITY_SHORT: Partial<Record<CapabilityKey, string>> = {
   supportsToolCall: '工具',
   supportsImages: '图片',
+  supportsVideo: '视频',
   supportsReasoning: '思考',
 }
 
@@ -133,7 +138,7 @@ export function capabilityState(value: unknown): CapabilityState {
   return 'unset'
 }
 
-/** 单键的 tooltip 文案（表格里三枚徽章与数值列共用） */
+/** 单键的 tooltip 文案（表格里四枚徽章与数值列共用） */
 export function capabilityTip(key: CapabilityKey, value: unknown, overridden: boolean): string {
   const label = CAPABILITY_LABELS[key]
   const suffix = overridden ? '（已被手动覆盖，弹窗里可恢复继承）' : ''

@@ -43,8 +43,8 @@ use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
-    js_string, number_or, object_or_empty, optional_text, pick_token, token_tail_of,
-    truncate_chars, value_or, value_or_nullish,
+    js_string, number_or, object_or_empty, optional_text, pick_token, token_tail_of, truncate_chars,
+    value_or, value_or_nullish,
 };
 use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
@@ -152,9 +152,10 @@ impl AccountStore {
         //   冲突判定走 `priority_holder`（一条 SQL 换掉「读全量 + 内存里 find」）。
         let existing_priority = existing.as_ref().map(StoredAccount::priority);
         let priority = match payload_object.get("priority") {
-            Some(value) => {
-                normalize_priority(Some(value), existing_priority.unwrap_or(DEFAULT_PRIORITY))
-            }
+            Some(value) => normalize_priority(
+                Some(value),
+                existing_priority.unwrap_or(DEFAULT_PRIORITY),
+            ),
             None => match existing_priority {
                 Some(value) => value,
                 None => {
@@ -163,9 +164,9 @@ impl AccountStore {
                 }
             },
         };
-        if let Some(holder_name) =
-            self.with_conn(&_guard, |conn| sql::priority_holder(conn, priority, &id))?
-        {
+        if let Some(holder_name) = self.with_conn(&_guard, |conn| {
+            sql::priority_holder(conn, priority, &id)
+        })? {
             return Err(AccountStoreError::new(
                 format!(
                     "优先级 {priority} 已被账号「{holder_name}」占用，请换一个\
@@ -189,14 +190,13 @@ impl AccountStore {
         let record_name = explicit_name
             .or_else(|| optional_text(account.get("nickname")))
             .or_else(|| optional_text(payload_object.get("nickname")))
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|item| optional_text(item.get("name")))
-            })
+            .or_else(|| existing.as_ref().and_then(|item| optional_text(item.get("name"))))
             .unwrap_or_else(|| format!("账号 {}", truncate_chars(&uid, 8)));
         record.insert("name".to_string(), Value::String(record_name.clone()));
-        record.insert("uid".to_string(), Value::String(uid.clone()));
+        record.insert(
+            "uid".to_string(),
+            Value::String(uid.clone()),
+        );
         record.insert(
             "nickname".to_string(),
             Value::String(
@@ -229,10 +229,7 @@ impl AccountStore {
                 .unwrap_or_default();
             record.insert(key.to_string(), Value::String(value));
         }
-        record.insert(
-            "accessToken".to_string(),
-            Value::String(access_token.clone()),
-        );
+        record.insert("accessToken".to_string(), Value::String(access_token.clone()));
         record.insert(
             "refreshToken".to_string(),
             Value::String(if refresh_token.is_empty() {
@@ -251,8 +248,7 @@ impl AccountStore {
         record.insert(
             "expiresAt".to_string(),
             number_or(
-                auth.get("expiresAt")
-                    .or_else(|| payload_object.get("expiresAt")),
+                auth.get("expiresAt").or_else(|| payload_object.get("expiresAt")),
                 existing
                     .as_ref()
                     .and_then(StoredAccount::expires_at)
@@ -263,7 +259,8 @@ impl AccountStore {
         record.insert(
             "refreshExpiresAt".to_string(),
             number_or(
-                auth.get("refreshExpiresAt")
+                auth
+                    .get("refreshExpiresAt")
                     .or_else(|| payload_object.get("refreshExpiresAt")),
                 existing
                     .as_ref()
@@ -283,52 +280,34 @@ impl AccountStore {
         record.insert("edition".to_string(), Value::String(edition.id.to_string()));
         // 先取出既有记录的这三个字段：payload 里没给就沿用原来的（Node 用 `??`，
         // 所以空串是有效值、只有 null/缺失才回落版本的默认值）
-        let existing_prefix = existing
-            .as_ref()
-            .and_then(|item| item.get("prefixPath"))
-            .cloned();
-        let existing_endpoint = existing
-            .as_ref()
-            .and_then(|item| item.get("endpoint"))
-            .cloned();
-        let existing_platform = existing
-            .as_ref()
-            .and_then(|item| item.get("platform"))
-            .cloned();
+        let existing_prefix = existing.as_ref().and_then(|item| item.get("prefixPath")).cloned();
+        let existing_endpoint = existing.as_ref().and_then(|item| item.get("endpoint")).cloned();
+        let existing_platform = existing.as_ref().and_then(|item| item.get("platform")).cloned();
         record.insert(
             "prefixPath".to_string(),
             value_or_nullish(
-                payload_object
-                    .get("prefixPath")
-                    .or(existing_prefix.as_ref()),
+                payload_object.get("prefixPath").or(existing_prefix.as_ref()),
                 Value::String(edition.prefix_path.to_string()),
             ),
         );
         record.insert(
             "endpoint".to_string(),
             value_or_nullish(
-                payload_object
-                    .get("endpoint")
-                    .or(existing_endpoint.as_ref()),
+                payload_object.get("endpoint").or(existing_endpoint.as_ref()),
                 Value::String(edition.endpoint.to_string()),
             ),
         );
         record.insert(
             "platform".to_string(),
             value_or_nullish(
-                payload_object
-                    .get("platform")
-                    .or(existing_platform.as_ref()),
+                payload_object.get("platform").or(existing_platform.as_ref()),
                 Value::String(edition.platform.to_string()),
             ),
         );
         record.insert("priority".to_string(), Value::from(priority));
         let enabled = match payload_object.get("enabled") {
             Some(value) => !matches!(value, Value::Bool(false)),
-            None => existing
-                .as_ref()
-                .map(StoredAccount::enabled)
-                .unwrap_or(true),
+            None => existing.as_ref().map(StoredAccount::enabled).unwrap_or(true),
         };
         record.insert("enabled".to_string(), Value::Bool(enabled));
         record.insert("proxy".to_string(), resolved_proxy);
@@ -372,23 +351,43 @@ impl AccountStore {
     /// `conversationId` 属于**上游账号上下文**：账号没了，它建立的会话再也不能
     /// 续接（续接会打到别人的会话或直接报错）。原项目在账号切换时整表清
     /// （`notifySwitch` → `clearClientToolSessions`），这里按账号精细作废。
-    /// provider 要在**删除之前**取好：记录删掉之后回读只能得到 None。
+    /// ── 删除必须留痕 ─────────────────────────────────────────
+    /// 单账号删除曾是**唯一**不写日志的删除路径：批量删除有「🗑️ 批量删除」、
+    /// 退出登录有「[Auth] 已清除当前登录态」，只有它删完什么都不说 —— 出事后
+    /// 时间与来源都无从追溯（2026-09-28 的一次误删就是这样查不出痕迹的）。
+    /// 文案与批量删除对齐，并带上 **id**：名字会改、也可能重名，id 才是能对上
+    /// 请求与记录的那个键。
+    ///
+    /// provider 与备注名都要在**删除之前**取好：记录删掉之后回读只能得到 None。
     pub fn remove_account(&self, id: &str) -> Result<(), AccountStoreError> {
         if let Some(reason) = self.protected_from_removal(id) {
             return Err(AccountStoreError::new(reason, 400));
         }
         let _guard = self.guard();
-        // provider 要在**删除之前**取好（记录删掉之后回读只能得到 None）
-        let provider = self
-            .record_by_id(&_guard, id)
+        // provider 与备注名都要在**删除之前**取好（记录删掉之后回读只能得到 None）：
+        // 前者给 `invalidate_catpaw_sessions`，后者给下面那条删除日志
+        let record = self.record_by_id(&_guard, id);
+        let provider = record
+            .as_ref()
             .map(|record| record.provider())
             .unwrap_or_default();
+        // 备注名为空时用 id 顶替：宁可日志难看，也不要写成「账号已删除: （user-…）」
+        let name = record
+            .as_ref()
+            .map(|record| record.name())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| id.to_string());
         // 单行删除，`false` 表示本来就没有这一行 → 404（与旧实现数数组长度的
         // 判据等价：删之前找不到这个 id）
         let removed = self.with_conn(&_guard, |conn| sql::delete(conn, id))?;
         if !removed {
             return Err(AccountStoreError::not_found("账号不存在"));
         }
+        // 落库之后立刻记一笔（与批量删除同一格式）
+        logging::log(
+            "[Accounts]",
+            &format!("🗑️  账号已删除: {name}（{id}，{provider}）"),
+        );
         // 落库已完成，账号锁在这里放开：注册表作废是另一把锁的操作，
         // 两者不必（也不该）嵌套（见 `invalidate_catpaw_sessions` 的说明）
         drop(_guard);
@@ -439,10 +438,7 @@ impl AccountStore {
             }
             changes.push(format!(
                 "优先级 → {}（置顶）",
-                ordered
-                    .first()
-                    .map(StoredAccount::priority)
-                    .unwrap_or(DEFAULT_PRIORITY)
+                ordered.first().map(StoredAccount::priority).unwrap_or(DEFAULT_PRIORITY)
             ));
         }
         if changes.is_empty() {
@@ -611,11 +607,7 @@ impl AccountStore {
             let current = record.enabled();
             if next != current {
                 record.set_enabled(next);
-                changes.push(if next {
-                    "已启用".to_string()
-                } else {
-                    "已禁用".to_string()
-                });
+                changes.push(if next { "已启用".to_string() } else { "已禁用".to_string() });
             }
         }
 
@@ -655,13 +647,12 @@ impl AccountStore {
                         "并发上限必须是不大于 999 的非负整数",
                     ))
                 }
-                None => return Err(AccountStoreError::bad_request("并发上限必须是非负整数")),
+                None => {
+                    return Err(AccountStoreError::bad_request("并发上限必须是非负整数"))
+                }
             };
             // 缺省记录无此键 = 不限（读侧按 0 处理），所以这里恒存显式数字
-            let current = record
-                .get("maxConcurrent")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            let current = record.get("maxConcurrent").and_then(Value::as_u64).unwrap_or(0);
             if next != current {
                 record.set("maxConcurrent", Value::from(next));
                 changes.push(if next == 0 {

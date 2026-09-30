@@ -26,6 +26,8 @@
 //!   update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
 //!   endpoints.rs  GET /api/endpoints（接口清单）
 //!   storage_api.rs GET /api/storage（统一库的位置、大小与各表条数，只读）
+//!   zcode_captcha.rs GET/POST /api/zcode/captcha（活动套餐通道的人机验证令牌池：
+//!                 界面静默铸造后推入，转发层按请求取用）
 //!   upgrade_api.rs GET /api/upgrade、POST /api/upgrade/run（旧数据 → SQLite 库）
 //!
 //! 管理 API 已全部就位（切片 1-6）。stats_api 是统计报表任务新增的唯一模块
@@ -40,6 +42,7 @@ pub mod auto_checkin;
 pub mod billing;
 pub mod captcha;
 pub mod chat;
+pub mod codearts_welfare;
 pub mod config_api;
 // 自定义提供商的管理接口（新建时顺带创建首个账号；存储与账号接入见
 // `core::custom_providers` 与 `core::account_store::custom_accounts`）
@@ -72,4 +75,6 @@ pub mod storage_api;
 pub mod timeouts_api;
 pub mod update;
 pub mod upgrade_api;
+// 活动套餐通道的人机验证令牌池（界面铸造 → 网关消费），见该文件模块头
+pub mod zcode_captcha;
 pub mod zcode_claim;

@@ -77,37 +77,43 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
             _ => Value::String(String::new()),
         },
     );
-    if let Some(value) = model
-        .get("maxOutputTokens")
-        .filter(|value| !value.is_null())
-    {
+    if let Some(value) = model.get("maxOutputTokens").filter(|value| !value.is_null()) {
         item.insert("max_output_tokens".to_string(), value.clone());
     }
     if let Some(value) = model.get("maxInputTokens").filter(|value| !value.is_null()) {
         item.insert("max_input_tokens".to_string(), value.clone());
     }
+    // 两个模态位先取成局部量：下面的 `input_modalities` 必须与它们**同源**
+    // —— 同一批生效值（含用户覆盖）、同一套真值判定，两处声明才不会漂移
+    let images = model.get("supportsImages").map(js_truthy).unwrap_or(false);
+    let video = model.get("supportsVideo").map(js_truthy).unwrap_or(false);
     item.insert(
         "supports_tool_call".to_string(),
-        Value::Bool(
-            model
-                .get("supportsToolCall")
-                .map(js_truthy)
-                .unwrap_or(false),
-        ),
+        Value::Bool(model.get("supportsToolCall").map(js_truthy).unwrap_or(false)),
     );
-    item.insert(
-        "supports_images".to_string(),
-        Value::Bool(model.get("supportsImages").map(js_truthy).unwrap_or(false)),
-    );
+    item.insert("supports_images".to_string(), Value::Bool(images));
+    item.insert("supports_video".to_string(), Value::Bool(video));
     item.insert(
         "supports_reasoning".to_string(),
-        Value::Bool(
-            model
-                .get("supportsReasoning")
-                .map(js_truthy)
-                .unwrap_or(false),
-        ),
+        Value::Bool(model.get("supportsReasoning").map(js_truthy).unwrap_or(false)),
     );
+    // `input_modalities`：OpenAI 兼容生态里模型条目上的**通用**输入模态声明
+    // （ZenMux / OpenRouter / AIHubMix 这类网关都在 `/v1/models` 的条目里给
+    // 它；CLIProxyAPI 为 Codex 客户端单独补同一个键）。它和上面的
+    // `supports_images` / `supports_video` 是**同一件事的两套说法** —— 一批
+    // 客户端只认前者，另一批只认后者，所以两套都得给，且必须同源。
+    //
+    // `text` 恒在（本网关只代理对话模型，`kind` 恒为 chat）；模态位为真时
+    // 追加对应的那一项。取值用生态通用的小写字符串，不是自有键名的复刻：
+    // 上游清单里没有的模态（audio / file）不猜，宁可不说。
+    let mut modalities = vec![Value::String("text".to_string())];
+    if images {
+        modalities.push(Value::String("image".to_string()));
+    }
+    if video {
+        modalities.push(Value::String("video".to_string()));
+    }
+    item.insert("input_modalities".to_string(), Value::Array(modalities));
     item.insert(
         "is_default".to_string(),
         Value::Bool(model.get("isDefault").map(js_truthy).unwrap_or(false)),

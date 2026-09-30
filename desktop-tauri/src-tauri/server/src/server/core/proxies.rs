@@ -10,6 +10,15 @@
 //! 账号记录里的 proxy 字段形态（null 表示无代理）：
 //!   { source: 'clash',  listenerUid: '__mixed__' | '<Clash 节点名>' }
 //!   { source: 'custom', protocol: 'http' | 'socks5', host, port, username?, password? }
+//!   { source: 'pool',   proxyId: '<代理池条目 id>' }
+//!
+//! `pool` 是「网络代理」页那批命名代理的**引用**（见 `core::proxy_pool`）：
+//! 解析时去池里取条目、再按条目自己的 clash/custom 形态解析（端口实时读取、
+//! 条目被删/被禁用的失败文案在 `proxy_pool::resolve_reference`）。入口放在
+//! 这里而不是让每个调用方各查一次池：账号的展示描述、会话解析、出口测试
+//! 三条链走的都是本模块，加一个分支就全部生效。
+//! 注意 `proxy_pool::resolve_item` 反过来调本模块 —— 两条路径**不递归**：
+//! 池条目的 source 只可能是 clash / custom（归一里挡掉了嵌套引用）。
 
 use serde_json::{json, Map, Value};
 
@@ -35,10 +44,7 @@ pub struct ProxyConfigError {
 
 impl ProxyConfigError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            status_code: 400,
-        }
+        Self { message: message.into(), status_code: 400 }
     }
 }
 
@@ -107,9 +113,7 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
         String::new()
     };
     if source.is_empty() {
-        return Err(ProxyConfigError::new(
-            "代理配置缺少 source（clash / custom）",
-        ));
+        return Err(ProxyConfigError::new("代理配置缺少 source（clash / custom）"));
     }
 
     if source == "clash" {
@@ -117,9 +121,16 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
         if listener_uid.is_empty() {
             return Err(ProxyConfigError::new("缺少 Clash 监听器 uid"));
         }
-        return Ok(Some(
-            json!({ "source": "clash", "listenerUid": listener_uid }),
-        ));
+        return Ok(Some(json!({ "source": "clash", "listenerUid": listener_uid })));
+    }
+    // 代理池引用：只存条目 id（形状校验；条目是否存在 / 是否禁用留给**解析**时
+    // 报错 —— 与本模块的纯逻辑定位一致，也不让「保存账号」依赖代理池的读库）
+    if source == "pool" {
+        let proxy_id = clean_string(object.get("proxyId"), MAX_LABEL_LENGTH);
+        if proxy_id.is_empty() {
+            return Err(ProxyConfigError::new("缺少代理池条目 id"));
+        }
+        return Ok(Some(json!({ "source": "pool", "proxyId": proxy_id })));
     }
     if source != "custom" {
         return Err(ProxyConfigError::new(format!("不支持的代理来源: {source}")));
@@ -127,11 +138,7 @@ pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConf
 
     let protocol = {
         let cleaned = clean_string(object.get("protocol"), 10).to_lowercase();
-        if cleaned.is_empty() {
-            "http".to_string()
-        } else {
-            cleaned
-        }
+        if cleaned.is_empty() { "http".to_string() } else { cleaned }
     };
     if protocol != "http" && protocol != "socks5" {
         return Err(ProxyConfigError::new("代理协议只支持 http 或 socks5"));
@@ -222,11 +229,7 @@ impl ResolvedProxy {
         };
         let protocol = {
             let protocol = text("protocol");
-            if protocol.is_empty() {
-                "http".to_string()
-            } else {
-                protocol
-            }
+            if protocol.is_empty() { "http".to_string() } else { protocol }
         };
         Ok(Some(ResolvedProxy {
             source: text("source"),
@@ -359,9 +362,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
     // 于是落到「不支持的代理来源: undefined」—— 手工编辑账号记录
     // 写错形状时就是这条文案，照抄不改成更「友好」的提示
     let Some(object) = config.as_object() else {
-        return Some(ProxyResolution::Failed(
-            "不支持的代理来源: undefined".to_string(),
-        ));
+        return Some(ProxyResolution::Failed("不支持的代理来源: undefined".to_string()));
     };
     // source 缺失时同样是 undefined（Node 是 `config.source` 直接进模板串）。
     // 这条文案会显示在账号列表的「代理异常」气泡里，所以必须逐字一致 ——
@@ -370,6 +371,22 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
         .get("source")
         .map(|value| js_interpolation(Some(value)))
         .unwrap_or_else(|| "undefined".to_string());
+
+    // 代理池引用：去池里取条目、按条目自己的 clash / custom 形态解析。
+    // 失败文案（不存在 / 已禁用 / Clash 监听器没了）由 proxy_pool 给出，
+    // 这里只做转手 —— 账号列表的「代理异常」气泡、转发时的回退日志都读它。
+    if source == "pool" {
+        let proxy_id = object.get("proxyId").and_then(Value::as_str).unwrap_or("");
+        if proxy_id.is_empty() {
+            return Some(ProxyResolution::Failed("代理引用缺少条目 id".to_string()));
+        }
+        return Some(
+            match crate::server::core::proxy_pool::resolve_reference(proxy_id) {
+                Ok(proxy) => ProxyResolution::Resolved(proxy),
+                Err(reason) => ProxyResolution::Failed(reason),
+            },
+        );
+    }
 
     if source == "custom" {
         let protocol = if object.get("protocol").and_then(Value::as_str) == Some("socks5") {
@@ -380,11 +397,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
         // host 原样透出：非字符串时 Node 会把数字/布尔照透给 JSON，但那种值
         // 无法用作主机名，这里统一给空串 —— 调用方（session_proxy）见到空 host
         // 就回退直连并记日志，比带着 `host: 123` 去连一个好
-        let host = object
-            .get("host")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let host = object.get("host").and_then(Value::as_str).unwrap_or("").to_string();
         let port = valid_port(object.get("port"));
         // label 缺省时按 JS 模板串拼接（未设置的值渲染成 undefined）；
         // 显式给了真值就用它（Node 是 `config.label || \`...\``，数字/布尔这类
@@ -417,9 +430,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
         }));
     }
     if source != "clash" {
-        return Some(ProxyResolution::Failed(format!(
-            "不支持的代理来源: {source}"
-        )));
+        return Some(ProxyResolution::Failed(format!("不支持的代理来源: {source}")));
     }
 
     let snapshot = crate::server::core::clash::clash_snapshot();
@@ -429,19 +440,12 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
             .as_ref()
             .map(|error| format!("（{error}）"))
             .unwrap_or_default();
-        return Some(ProxyResolution::Failed(format!(
-            "Clash Verge 配置不可用{detail}"
-        )));
+        return Some(ProxyResolution::Failed(format!("Clash Verge 配置不可用{detail}")));
     }
-    let listener_uid = object
-        .get("listenerUid")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let listener_uid = object.get("listenerUid").and_then(Value::as_str).unwrap_or("");
     if listener_uid == CLASH_MIXED_UID {
         let Some(port) = snapshot.mixed_port else {
-            return Some(ProxyResolution::Failed(
-                "Clash Verge 未启用混合端口".to_string(),
-            ));
+            return Some(ProxyResolution::Failed("Clash Verge 未启用混合端口".to_string()));
         };
         return Some(ProxyResolution::Resolved(ResolvedProxy {
             source: "clash".to_string(),
@@ -453,11 +457,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
             label: format!("Clash 混合端口 {port}"),
         }));
     }
-    let Some(listener) = snapshot
-        .listeners
-        .iter()
-        .find(|item| item.uid == listener_uid)
-    else {
+    let Some(listener) = snapshot.listeners.iter().find(|item| item.uid == listener_uid) else {
         return Some(ProxyResolution::Failed(format!(
             "Clash Verge 中找不到监听器「{listener_uid}」（可能已在 Clash 中删除）"
         )));
@@ -504,7 +504,11 @@ pub fn describe_account_proxy(config: Option<&Value>) -> Value {
             "config": config,
         }),
         ProxyResolution::Resolved(proxy) => json!({
-            "source": proxy.source,
+            // source 用**账号里配的那个**（pool / clash / custom）：pool 引用
+            // 解析成功后底层是 clash / custom，但界面上要如实显示「引用了
+            // 代理池的某条」—— 前端据此在代理列上标出来。手工改坏的记录
+            // （source 缺失）才回落到解析结果的 source
+            "source": if source.is_empty() { proxy.source.clone() } else { source.clone() },
             "protocol": proxy.protocol,
             "host": proxy.host,
             "port": proxy.port,

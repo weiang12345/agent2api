@@ -147,11 +147,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
             &crate::server::core::upstream::request::new_request_id(),
             Some("text/event-stream"),
         );
-        Ok(ChatRequestPlan {
-            url,
-            headers,
-            body: with_system,
-        })
+        Ok(ChatRequestPlan::chat(url, headers, with_system))
     }
 
     /// 上游错误分类（照抄改造前 `upstream` 的判定与文案）：
@@ -331,10 +327,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
                             )
                         })
                 }
-                Err(error) => Err(GatewayError::with_status(
-                    error.http_status(),
-                    error.message,
-                )),
+                Err(error) => Err(GatewayError::with_status(error.http_status(), error.message)),
             }
         })
     }
@@ -364,7 +357,9 @@ impl ProviderAdapter for WorkBuddyAdapter {
         store: &'a AccountStore,
         account_id: &'a str,
         _force: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
+    > {
         Box::pin(async move {
             let auth = AuthService::for_store(store.clone());
             // `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条账号
@@ -400,12 +395,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
     ///
     /// 返回的 `reason` 不含「第 n/N 次」：那是编排层才知道的读数
     /// （见 `RetryAdvice` 的说明）。
-    fn retry_advice(
-        &self,
-        error_body: &Value,
-        attempt: usize,
-        budget: usize,
-    ) -> Option<RetryAdvice> {
+    fn retry_advice(&self, error_body: &Value, attempt: usize, budget: usize) -> Option<RetryAdvice> {
         let code = error_body.get("code").and_then(Value::as_i64);
         if code != Some(RATE_LIMIT_CODE) {
             return None;
@@ -513,8 +503,9 @@ impl ProviderAdapter for WorkBuddyAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let Some(entry) = store.get_session_by_id(account_id) else {
                 return Err(GatewayError::with_status(
@@ -556,10 +547,7 @@ async fn default_session_token(store: &AccountStore) -> Result<String, GatewayEr
             401,
             "当前没有可用登录态：请先在桌面端完成登录",
         )),
-        Err(error) => Err(GatewayError::with_status(
-            error.http_status(),
-            error.message,
-        )),
+        Err(error) => Err(GatewayError::with_status(error.http_status(), error.message)),
     }
 }
 
@@ -593,18 +581,12 @@ fn chat_headers(session: &Value, request_id: &str, accept: Option<&str>) -> Vec<
         // 客户端身份头：服务端按此做客户端识别与白名单校验
         ("X-IDE-Type".to_string(), edition.ua_platform.to_string()),
         ("X-IDE-Name".to_string(), edition.product_name.to_string()),
-        (
-            "X-IDE-Version".to_string(),
-            edition.client_version.to_string(),
-        ),
+        ("X-IDE-Version".to_string(), edition.client_version.to_string()),
         ("X-Product".to_string(), edition.product_name.to_string()),
         ("X-Agent-Intent".to_string(), "craft".to_string()),
         // 会话追踪
         ("X-Request-ID".to_string(), request_id.to_string()),
-        (
-            "X-Conversation-Request-ID".to_string(),
-            request_id.to_string(),
-        ),
+        ("X-Conversation-Request-ID".to_string(), request_id.to_string()),
         ("X-Conversation-ID".to_string(), request_id.to_string()),
         ("X-Session-ID".to_string(), request_id.to_string()),
     ];

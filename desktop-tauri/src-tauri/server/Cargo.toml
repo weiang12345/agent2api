@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "2.7.10"
+version = "2.9.0"
 description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -63,6 +63,19 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 base64 = "0.22"
 # Qoder 网页登录的 PKCE verifier / nonce
 getrandom = "0.2"
+# P-256 密钥（两家共用一份依赖）：
+# * CodeArts 的 DPoP proof（providers/codearts/dpop.rs）—— ES256 的 JWS，每次令牌
+#   请求现签一份。ECDSA 要点乘 + RFC6979 确定性 k + DER，私钥运算手写出错的代价
+#   不对称（与 qoder 那个"一次模幂" num-bigint 手写不是一个量级），所以用现成
+#   crate；要的是 ecdsa 那一档。
+# * Trae 登录的设备密钥对（providers/trae/device.rs）—— 官方客户端每次登录生成一套
+#   EC P-256，把 SPKI 公钥 PEM 塞进 ExchangeToken 的 DeviceInfo.DevicePublicKey，
+#   空值会被上游判成 HTTP 401 / 业务码 20405（设备绑定，2026-09-04 实测）；
+#   要的是 pem + pkcs8（能生成、能导出 SPKI/PKCS#8，不做验签）。
+# 两家合并后统一在 0.13：它复用本仓已有的 sha2 0.10 / digest 0.10 那条链，
+# 换 0.14 会再拉一份 sha2 0.11 + digest 0.11 + hmac 0.13 —— 为签名与导出多背两份
+# 哈希库不值得（PR #24 原本用的是 0.14，见提交历史）。
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 # 出站请求体的指纹脱敏（core/sanitize.rs）
 regex = "1"
 # AutoClaw 适配器 encryption 侧（providers/autoclaw/crypto.rs）

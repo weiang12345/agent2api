@@ -83,8 +83,7 @@ impl KeyScope {
 
     /// 允许路由到 `provider`（provider id）？
     pub fn allows_provider(&self, provider: &str) -> bool {
-        self.allowed_providers.is_empty()
-            || self.allowed_providers.contains(&normalize_one(provider))
+        self.allowed_providers.is_empty() || self.allowed_providers.contains(&normalize_one(provider))
     }
 
     /// 白名单的可读摘要（日志与错误文案用；空 = `不限制`）

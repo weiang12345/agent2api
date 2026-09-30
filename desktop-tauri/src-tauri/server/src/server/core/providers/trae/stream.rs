@@ -1,425 +1,521 @@
-//! Trae SOLO SSE → OpenAI SSE / Completion。
-use std::collections::BTreeMap;
+//! 上游 SOLO SSE → OpenAI 形状的转换，以及非流式聚合。
+//!
+//! ── 这条流上有三件事必须先想清楚再写代码 ──────────────────
+//! 1. **上游不发 `[DONE]`**。结束帧是 `event: done`，`[DONE]` 是这里补的；
+//!    上游中途断掉（没有 done）也要补，否则客户端永远等在最后一片上。
+//! 2. **业务错误藏在 200 的流里**（`event: error`）。它不是 chunk，
+//!    而是一条 `event: error` + `[DONE]`；分类见 `errors.rs`。
+//! 3. **`token_usage` 是"欠着"的**：读到它并不立刻发帧，而是挂在下一帧
+//!    （正常就是那条 finish 帧）上一起走。所以"usage 之后流就断了"这种
+//!    上游行为会让 usage **静默消失** —— 向量里就有这一例，照抄行为、
+//!    在 M7 的对拍报告里记一笔，不偷偷改。
+//!
+//! 帧的**键顺序**不是契约（Go 的 map 序列化按 key 排序，serde 按插入顺序），
+//! 所以测试比的是解析后的 JSON；`id` 与 `created` 每次运行都不同，
+//! 向量里已归一成 `<ID>` / `<CREATED>`。
 
-use serde_json::{json, Map, Value};
+use serde_json::{Value, json};
 
-use crate::server::errors::GatewayError;
+use super::errors::{ErrorKind, error_event_fields, stream_error_kind};
 
-#[derive(Debug, Clone)]
-pub struct SoloEvent {
-    pub kind: String,
-    pub payload: Value,
+/// 一条已解析的上游事件。`metadata` / `timing_cost` / `extra_info` / 未知名
+/// 都归到 `Other`：当前实现**不处理**它们（`extra_info` 在两个 switch 里都落空，
+/// 这是参考实现的既有行为，向量 `extra_info 帧（当前实现不处理）` 钉着）。
+#[derive(Clone, Debug, PartialEq)]
+pub enum SoloEvent {
+    Output {
+        response: String,
+        reasoning: String,
+        tool_calls: Option<Value>,
+    },
+    TokenUsage(Value),
+    Done {
+        finish_reason: String,
+    },
+    Error {
+        code: i64,
+        message: String,
+    },
+    Other,
 }
 
-#[derive(Debug)]
-pub struct SoloError {
+/// 解析一条完整事件（`data` 是同一事件内多行 `data:` 累加后的结果）。
+/// JSON 不合法时返回 `None` —— 参考实现是"忽略这一帧"，不是"报错断流"。
+pub fn parse_solo_event(event: &str, data: &str) -> Option<SoloEvent> {
+    if data.trim().is_empty() {
+        // 只有 event 行没有 data：仍算一个事件边界（done 之类可能不带载荷）。
+        return Some(match event {
+            "done" => SoloEvent::Done { finish_reason: String::new() },
+            _ => SoloEvent::Other,
+        });
+    }
+    let parsed: Value = serde_json::from_str(data).ok()?;
+    Some(match event {
+        "output" => SoloEvent::Output {
+            response: parsed.get("response").and_then(Value::as_str).unwrap_or_default().to_string(),
+            reasoning: parsed
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tool_calls: parsed.get("tool_calls").cloned().filter(|value| !value.is_null()),
+        },
+        "token_usage" => SoloEvent::TokenUsage(parsed),
+        "done" => SoloEvent::Done {
+            finish_reason: parsed.get("finish_reason").and_then(Value::as_str).unwrap_or_default().to_string(),
+        },
+        "error" => {
+            let (code, message) = error_event_fields(&parsed);
+            SoloEvent::Error { code, message }
+        }
+        _ => SoloEvent::Other,
+    })
+}
+
+/// 一行一行的 SSE 状态机（跨行累积 `event:` 与多个 `data:`）。
+#[derive(Default, Debug)]
+pub struct SseScanner {
+    event: String,
+    data: String,
+}
+
+impl SseScanner {
+    /// 喂一行（不含行尾换行）。返回该行**触发**的事件；一行可以触发一个，
+    /// 也可以像大多数行那样返回 `None`（累积中）。
+    pub fn feed_line(&mut self, line: &str) -> Option<SoloEvent> {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            if self.event.is_empty() {
+                self.reset();
+                return None;
+            }
+            let event = parse_solo_event(&self.event, &self.data);
+            self.reset();
+            return event;
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            self.event = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            // 刻意不 trim：参考实现是**直接拼接**，多行 data 之间因此留下
+            // 一个空格（`{"response":` + ` "y"}`），拼出来才是合法 JSON。
+            self.data.push_str(rest);
+        }
+        // `:` 开头是注释行，忽略；其它前缀（含 `id:`）同样忽略。
+        None
+    }
+
+    fn reset(&mut self) {
+        self.event.clear();
+        self.data.clear();
+    }
+}
+
+/// 转换后的一帧出站内容。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Frame {
+    /// 一个 OpenAI chunk（`data: {…}`）。
+    Chunk(Value),
+    /// 流内业务错误：`event: error` + 一句转义后的文案。
+    Error {
+        code: i64,
+        message: String,
+        kind: ErrorKind,
+    },
+    /// `data: [DONE]`
+    Done,
+}
+
+impl Frame {
+    /// 落到线上的字节（不含结尾的两个换行，由调用方补分隔）。
+    pub fn wire(&self) -> String {
+        match self {
+            Self::Chunk(chunk) => format!("data: {chunk}"),
+            Self::Error { code, message, .. } => {
+                // 与参考实现同一条文案：`solo error code=<码> msg=<文案>`，
+                // 载荷是**一个 JSON 字符串**而不是对象。
+                format!("event: error\ndata: {}", json!(format!("solo error code={code} msg={message}")))
+            }
+            Self::Done => "data: [DONE]".to_string(),
+        }
+    }
+}
+
+/// 流式转换器。
+pub struct SoloStream {
+    id: String,
+    created: i64,
+    scanner: SseScanner,
+    /// `token_usage` 读到后欠着，随下一帧一起发。
+    pending_usage: Option<Value>,
+    saw_done: bool,
+}
+
+impl SoloStream {
+    pub fn new(id: String, created: i64) -> Self {
+        Self { id, created, scanner: SseScanner::default(), pending_usage: None, saw_done: false }
+    }
+
+    /// 喂一行，返回该行产生的帧。
+    pub fn feed_line(&mut self, line: &str) -> Vec<Frame> {
+        let Some(event) = self.scanner.feed_line(line) else {
+            return Vec::new();
+        };
+        self.apply(event)
+    }
+
+    fn apply(&mut self, event: SoloEvent) -> Vec<Frame> {
+        match event {
+            SoloEvent::Output { response, reasoning, tool_calls } => {
+                let mut delta = serde_json::Map::new();
+                if !response.is_empty() {
+                    delta.insert("content".to_string(), json!(response));
+                }
+                if !reasoning.is_empty() {
+                    delta.insert("reasoning_content".to_string(), json!(reasoning));
+                }
+                if let Some(calls) = tool_calls {
+                    delta.insert("tool_calls".to_string(), normalize_stream_tool_calls(calls));
+                }
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                vec![self.chunk(Value::Object(delta), None)]
+            }
+            SoloEvent::TokenUsage(usage) => {
+                self.pending_usage = Some(usage);
+                Vec::new()
+            }
+            SoloEvent::Done { finish_reason } => {
+                self.saw_done = true;
+                vec![self.chunk(json!({}), Some(finish_reason)), Frame::Done]
+            }
+            SoloEvent::Error { code, message } => {
+                let kind = stream_error_kind(code, &message);
+                self.saw_done = true;
+                // 注意：这里**不终止读取**，所以后面再来 `done` 会再发一整套
+                // 帧（向量 `流内错误 4008` 记的就是这个形状）。转发层在首包门
+                // 之前看到这条 error 就会改判成 HTTP 错误，正常不会走到第二步。
+                vec![Frame::Error { code, message, kind }, Frame::Done]
+            }
+            SoloEvent::Other => Vec::new(),
+        }
+    }
+
+    /// 流结束（EOF）。上游没给过 `done` 时补一个 `[DONE]`，保证客户端能收尾。
+    pub fn finish(&mut self) -> Vec<Frame> {
+        if self.saw_done {
+            return Vec::new();
+        }
+        self.saw_done = true;
+        vec![Frame::Done]
+    }
+
+    fn chunk(&mut self, delta: Value, finish_reason: Option<String>) -> Frame {
+        let mut choice = serde_json::Map::new();
+        choice.insert("index".to_string(), json!(0));
+        choice.insert("delta".to_string(), delta);
+        if let Some(reason) = finish_reason {
+            choice.insert("finish_reason".to_string(), json!(reason));
+        }
+        let mut chunk = serde_json::Map::new();
+        chunk.insert("id".to_string(), json!(self.id));
+        chunk.insert("object".to_string(), json!("chat.completion.chunk"));
+        chunk.insert("created".to_string(), json!(self.created));
+        chunk.insert("model".to_string(), json!(""));
+        chunk.insert("choices".to_string(), Value::Array([Value::Object(choice)].to_vec()));
+        if let Some(usage) = self.pending_usage.take() {
+            chunk.insert("usage".to_string(), usage);
+        }
+        Frame::Chunk(Value::Object(chunk))
+    }
+}
+
+/// 流式 tool_call 片段的字段整形：`function_call` → `function`，
+/// 并剥掉 SOLO 专属的 `namespace` / `partial_arguments`（上游带着它们）。
+fn normalize_stream_tool_calls(calls: Value) -> Value {
+    let Value::Array(list) = calls else {
+        // 上游偶尔给单个对象；按参考实现的处理方式包成数组。
+        return Value::Array(vec![normalize_one_call(calls)]);
+    };
+    Value::Array(list.into_iter().map(normalize_one_call).collect())
+}
+
+fn normalize_one_call(call: Value) -> Value {
+    let Value::Object(mut call) = call else {
+        return call;
+    };
+    if let Some(function) = call.remove("function_call") {
+        call.insert("function".to_string(), strip_solo_only_fields(function));
+    } else if let Some(function) = call.get("function").cloned() {
+        call.insert("function".to_string(), strip_solo_only_fields(function));
+    }
+    Value::Object(call)
+}
+
+fn strip_solo_only_fields(function: Value) -> Value {
+    let Value::Object(mut function) = function else {
+        return function;
+    };
+    function.remove("namespace");
+    function.remove("partial_arguments");
+    Value::Object(function)
+}
+
+/// 一条流内错误（非流式聚合时作为失败返回）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamError {
     pub code: i64,
     pub message: String,
 }
 
-impl SoloError {
-    pub fn gateway_error(&self) -> GatewayError {
-        let status = match self.code {
-            1005 | 4008 | 4010 => 429,
-            1001 => 401,
-            _ => 502,
+impl StreamError {
+    pub fn kind(&self) -> ErrorKind {
+        stream_error_kind(self.code, &self.message)
+    }
+
+    /// 与参考实现逐字同形的文案（对拍时要能直接对照日志）。
+    pub fn to_text(&self) -> String {
+        format!("solo error code={} msg={}", self.code, self.message)
+    }
+}
+
+/// 非流式：把整条 SSE 折成一个 `chat.completion`。
+///
+/// 上游没有非流式端点（`stream` 被强制成 true），所以这一条是**唯一**的
+/// 非流式实现路径，不是"流式的替代品"。
+pub fn aggregate(text: &str, id: &str, created: i64) -> Result<Value, StreamError> {
+    let mut scanner = SseScanner::default();
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut finish_reason = "stop".to_string();
+    let mut usage: Option<Value> = None;
+    let mut calls: Vec<Value> = Vec::new();
+    let mut upstream_error: Option<StreamError> = None;
+
+    // 与 Go 的 `ReadString('\n')` 对齐：按行喂，**EOF 那一次还会再喂一个空行**
+    // （那一下把最后一个没被空行闭合的事件推出去）。少喂这一行，
+    // 结尾没有空行的流就会丢掉最后一帧。
+    for line in text.split('\n').chain(std::iter::once("")) {
+        let Some(event) = scanner.feed_line(line) else {
+            continue;
         };
-        GatewayError::with_status(
-            status,
-            format!("Trae 上游错误 {}: {}", self.code, self.message),
-        )
-        .with_code(self.code.to_string())
-    }
-}
-
-#[derive(Default)]
-pub struct SoloSseParser {
-    pending_event: String,
-    pending_data: String,
-    pending_line: String,
-}
-
-impl SoloSseParser {
-    pub fn push(&mut self, chunk: &[u8]) -> Vec<SoloEvent> {
-        let mut buffer = self.pending_line.clone();
-        buffer.push_str(&String::from_utf8_lossy(chunk));
-        let mut events = Vec::new();
-        while let Some(index) = buffer.find('\n') {
-            let line: String = buffer.drain(..=index).collect();
-            let line = line.trim_end_matches(['\n', '\r']).to_string();
-            if let Some(value) = line.strip_prefix("event:") {
-                self.pending_event = value.trim().to_string();
-            } else if let Some(value) = line.strip_prefix("data:") {
-                if self.pending_data.is_empty() {
-                    self.pending_data = value.trim().to_string();
-                } else {
-                    self.pending_data.push_str(value.trim());
-                }
-            } else if line.is_empty() {
-                if let Some(event) = self.take_event() {
-                    events.push(event);
+        match event {
+            SoloEvent::Output { response, reasoning: thought, tool_calls } => {
+                content.push_str(&response);
+                reasoning.push_str(&thought);
+                if let Some(calls_value) = tool_calls {
+                    merge_tool_calls(&mut calls, calls_value);
                 }
             }
-        }
-        self.pending_line = buffer;
-        events
-    }
-
-    pub fn finish(&mut self) -> Vec<SoloEvent> {
-        let line = self.pending_line.clone();
-        self.pending_line.clear();
-        let line = line.trim_end_matches(['\n', '\r']).to_string();
-        if let Some(value) = line.strip_prefix("data:") {
-            if self.pending_data.is_empty() {
-                self.pending_data = value.trim().to_string();
-            } else {
-                self.pending_data.push_str(value.trim());
+            SoloEvent::TokenUsage(payload) => usage = Some(payload),
+            SoloEvent::Done { finish_reason: reason } => {
+                if !reason.is_empty() {
+                    finish_reason = reason;
+                }
             }
+            SoloEvent::Error { code, message } => upstream_error = Some(StreamError { code, message }),
+            SoloEvent::Other => {}
         }
-        if let Some(event) = self.take_event() {
-            return vec![event];
-        }
-        Vec::new()
     }
 
-    fn take_event(&mut self) -> Option<SoloEvent> {
-        let kind = std::mem::take(&mut self.pending_event);
-        let data = std::mem::take(&mut self.pending_data);
-        if kind.is_empty() {
-            return None;
-        }
-        let payload = if data.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&data).unwrap_or(Value::Null)
+    if let Some(error) = upstream_error {
+        return Err(error);
+    }
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), json!("assistant"));
+    message.insert("content".to_string(), json!(content));
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".to_string(), json!(reasoning));
+    }
+    if !calls.is_empty() {
+        message.insert("tool_calls".to_string(), Value::Array(calls));
+    }
+    let mut response = serde_json::Map::new();
+    response.insert("id".to_string(), json!(id));
+    response.insert("object".to_string(), json!("chat.completion"));
+    response.insert("created".to_string(), json!(created));
+    response.insert("model".to_string(), json!(""));
+    response.insert(
+        "choices".to_string(),
+        json!([{"index": 0, "message": Value::Object(message), "finish_reason": finish_reason}]),
+    );
+    if let Some(usage) = usage {
+        response.insert("usage".to_string(), usage);
+    }
+    Ok(Value::Object(response))
+}
+
+/// 按 `index` 合并流式 tool_call 片段：`id` / `type` / `function.name` 直覆盖，
+/// `function.arguments` **拼接**。
+fn merge_tool_calls(calls: &mut Vec<Value>, incoming: Value) {
+    let list: Vec<Value> = match incoming {
+        Value::Array(items) => items,
+        Value::Object(one) => vec![Value::Object(one)],
+        _ => return,
+    };
+    for call in list {
+        let Value::Object(call) = call else { continue };
+        let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
+        let slot = match calls.iter_mut().find(|existing| {
+            existing.get("index").and_then(Value::as_i64).unwrap_or(0) == index
+        }) {
+            Some(existing) => existing,
+            None => {
+                calls.push(json!({"index": index}));
+                calls.last_mut().expect("刚推进去")
+            }
         };
-        Some(SoloEvent { kind, payload })
-    }
-}
-
-pub struct Translator {
-    id: String,
-    created: i64,
-    model: String,
-    role_sent: bool,
-    usage: Option<Value>,
-    finish_reason: Option<String>,
-    content: String,
-    reasoning: String,
-    tool_calls: BTreeMap<i64, Map<String, Value>>,
-}
-
-impl Translator {
-    pub fn new(model: &str) -> Self {
-        Self {
-            id: format!("chatcmpl-{}", crate::server::logging::now_ms()),
-            created: crate::server::logging::now_ms() / 1000,
-            model: model.to_string(),
-            role_sent: false,
-            usage: None,
-            finish_reason: None,
-            content: String::new(),
-            reasoning: String::new(),
-            tool_calls: BTreeMap::new(),
-        }
-    }
-
-    pub fn consume(&mut self, event: SoloEvent) -> Result<Vec<Value>, GatewayError> {
-        let mut frames = Vec::new();
-        match event.kind.as_str() {
-            "output" => {
-                let response = event
-                    .payload
-                    .get("response")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let reasoning = event
-                    .payload
-                    .get("reasoning_content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                self.content.push_str(response);
-                self.reasoning.push_str(reasoning);
-                self.merge_tool_calls(event.payload.get("tool_calls"));
-                let mut delta = Map::new();
-                if !response.is_empty() {
-                    delta.insert("content".to_string(), Value::String(response.to_string()));
-                }
-                if !reasoning.is_empty() {
-                    delta.insert(
-                        "reasoning_content".to_string(),
-                        Value::String(reasoning.to_string()),
-                    );
-                }
-                if let Some(tools) = self.tool_call_delta(event.payload.get("tool_calls")) {
-                    delta.insert("tool_calls".to_string(), tools);
-                }
-                if !delta.is_empty() {
-                    self.ensure_role(&mut frames);
-                    frames.push(self.chunk(Value::Object(delta), None));
-                }
-            }
-            "token_usage" => {
-                self.usage = Some(event.payload.clone());
-            }
-            "done" => {
-                self.finish_reason = Some(
-                    event
-                        .payload
-                        .get("finish_reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("stop")
-                        .to_string(),
-                );
-            }
-            "error" => {
-                let code = event
-                    .payload
-                    .get("code")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                let message = event
-                    .payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("未知错误")
-                    .to_string();
-                return Err(SoloError { code, message }.gateway_error());
-            }
-            _ => {}
-        }
-        Ok(frames)
-    }
-
-    pub fn finish_frames(&mut self) -> Vec<Value> {
-        let mut frames = Vec::new();
-        self.ensure_role(&mut frames);
-        let finish = self
-            .finish_reason
-            .clone()
-            .unwrap_or_else(|| "stop".to_string());
-        frames.push(self.chunk(json!({}), Some(finish)));
-        if let Some(usage) = self.usage.clone() {
-            let mut value = self.chunk(json!({}), None);
-            if let Some(object) = value.as_object_mut() {
-                object.insert("usage".to_string(), usage);
-            }
-            frames.push(value);
-        }
-        frames
-    }
-
-    pub fn completion(&self) -> Value {
-        let mut message = Map::new();
-        message.insert("role".to_string(), Value::String("assistant".to_string()));
-        message.insert("content".to_string(), Value::String(self.content.clone()));
-        if !self.reasoning.is_empty() {
-            message.insert(
-                "reasoning_content".to_string(),
-                Value::String(self.reasoning.clone()),
-            );
-        }
-        if !self.tool_calls.is_empty() {
-            let calls: Vec<Value> = self
-                .tool_calls
-                .values()
-                .cloned()
-                .map(Value::Object)
-                .collect();
-            message.insert("tool_calls".to_string(), Value::Array(calls));
-        }
-        json!({
-            "id": self.id,
-            "object": "chat.completion",
-            "created": self.created,
-            "model": self.model,
-            "choices": [{
-                "index": 0,
-                "message": Value::Object(message),
-                "finish_reason": self.finish_reason.clone().unwrap_or_else(|| "stop".to_string()),
-            }],
-            "usage": self.usage.clone().unwrap_or(Value::Null),
-        })
-    }
-
-    fn ensure_role(&mut self, frames: &mut Vec<Value>) {
-        if self.role_sent {
-            return;
-        }
-        self.role_sent = true;
-        frames.push(self.chunk(json!({ "role": "assistant", "content": "" }), None));
-    }
-
-    fn chunk(&self, delta: Value, finish: Option<String>) -> Value {
-        let mut choice = Map::new();
-        choice.insert("index".to_string(), Value::from(0));
-        choice.insert("delta".to_string(), delta);
-        if let Some(finish) = finish {
-            choice.insert("finish_reason".to_string(), Value::String(finish));
-        }
-        json!({
-            "id": self.id,
-            "object": "chat.completion.chunk",
-            "created": self.created,
-            "model": self.model,
-            "choices": [Value::Object(choice)],
-        })
-    }
-
-    fn merge_tool_calls(&mut self, raw: Option<&Value>) {
-        let Some(list) = raw
-            .and_then(Value::as_array)
-            .filter(|list| !list.is_empty())
-        else {
-            return;
+        let Some(target) = slot.as_object_mut() else {
+            continue;
         };
-        for item in list {
-            let Some(object) = item.as_object() else {
-                continue;
-            };
-            let index = object.get("index").and_then(Value::as_i64).unwrap_or(0);
-            let merged = self.tool_calls.entry(index).or_insert_with(|| {
-                let mut initial = Map::new();
-                initial.insert("index".to_string(), Value::from(index));
-                initial
-            });
-            for (key, value) in object {
-                if key == "function_call" || key == "function" {
-                    if let Some(function) = value.as_object() {
-                        let target = merged
-                            .entry("function".to_string())
-                            .or_insert_with(|| Value::Object(Map::new()));
-                        if let Some(target) = target.as_object_mut() {
-                            for (function_key, function_value) in function {
-                                if function_key == "namespace"
-                                    || function_key == "partial_arguments"
-                                    || function_key == "partial_arguments"
-                                {
-                                    continue;
-                                }
-                                if function_key == "arguments" {
-                                    let previous = target
-                                        .get("arguments")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default();
-                                    let addition = function_value.as_str().unwrap_or_default();
-                                    target.insert(
-                                        "arguments".to_string(),
-                                        Value::String(format!("{previous}{addition}")),
-                                    );
-                                } else if !function_value.is_null()
-                                    && !matches!(function_value, Value::String(text) if text.is_empty())
-                                {
-                                    target.insert(function_key.clone(), function_value.clone());
-                                }
-                            }
-                        }
-                    }
-                } else if key != "partial_arguments"
-                    && key != "namespace"
-                    && !value.is_null()
-                    && !matches!(value, Value::String(text) if text.is_empty())
-                {
-                    merged.insert(key.clone(), value.clone());
-                }
-            }
+        if let Some(id) = call.get("id").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            target.insert("id".to_string(), json!(id));
+        }
+        if let Some(kind) = call.get("type").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            target.insert("type".to_string(), json!(kind));
+        }
+        let delta_function = call
+            .get("function")
+            .or_else(|| call.get("function_call"))
+            .cloned()
+            .map(strip_solo_only_fields)
+            .and_then(|value| value.as_object().cloned());
+        let Some(delta_function) = delta_function else {
+            continue;
+        };
+        let merged = target.entry("function".to_string()).or_insert_with(|| json!({}));
+        let Some(merged) = merged.as_object_mut() else {
+            continue;
+        };
+        if let Some(name) = delta_function.get("name").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            merged.insert("name".to_string(), json!(name));
+        }
+        if let Some(arguments) = delta_function.get("arguments").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            let previous = merged.get("arguments").and_then(Value::as_str).unwrap_or_default();
+            merged.insert("arguments".to_string(), json!(format!("{previous}{arguments}")));
         }
     }
-
-    fn tool_call_delta(&self, raw: Option<&Value>) -> Option<Value> {
-        let list = raw
-            .and_then(Value::as_array)
-            .filter(|list| !list.is_empty())?;
-        let mut out = Vec::new();
-        for item in list {
-            let Some(object) = item.as_object() else {
-                continue;
-            };
-            let mut delta = Map::new();
-            for (key, value) in object {
-                if key == "function_call" {
-                    delta.insert("function".to_string(), value.clone());
-                } else if key != "namespace" && key != "partial_arguments" {
-                    delta.insert(key.clone(), value.clone());
-                }
-            }
-            out.push(Value::Object(delta));
-        }
-        Some(Value::Array(out))
-    }
-}
-
-pub fn sse_frame(value: &Value) -> String {
-    format!(
-        "data: {}\n\n",
-        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
-    )
-}
-
-pub fn sse_done() -> String {
-    "data: [DONE]\n\n".to_string()
 }
 
 #[cfg(test)]
 mod tests {
+    //! 帧序列逐条对向量。这里最值钱的几条是"上游没给 done 也要收尾"、
+    //! "坏 JSON 的帧被忽略而不是断流"、"error 之后 usage 会丢"。
     use super::*;
 
-    #[test]
-    fn parses_solo_events_and_translates_completion() {
-        let raw = "event:output\n\
-                   data:{\"response\":\"你好\",\"reasoning_content\":\"思考\",\"tool_calls\":null}\n\n\
-                   event:output\n\
-                   data:{\"response\":\"世界\",\"reasoning_content\":null,\"tool_calls\":null}\n\n\
-                   event:token_usage\n\
-                   data:{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}\n\n\
-                   event:done\n\
-                   data:{\"finish_reason\":\"stop\"}\n\n";
-        let mut parser = SoloSseParser::default();
-        let mut translator = Translator::new("glm-5.2");
-        for event in parser.push(raw.as_bytes()) {
-            translator.consume(event).expect("translate event");
+    const VECTORS: &str = include_str!("vectors/trae-vectors.json");
+
+    fn document() -> Value {
+        serde_json::from_str(VECTORS).expect("向量文件必须是合法 JSON")
+    }
+
+    /// 跑一遍转换器，返回**归一后**的帧文本（`<ID>` / `<CREATED>`），与向量同口径。
+    fn run(input: &str) -> Vec<String> {
+        let mut stream = SoloStream::new("chatcmpl-123".to_string(), 1_700_000_000);
+        let mut frames = Vec::new();
+        for line in input.split_inclusive('\n') {
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            frames.extend(stream.feed_line(line));
         }
-        for event in parser.finish() {
-            translator.consume(event).expect("translate final event");
-        }
-        let completion = translator.completion();
-        assert_eq!(completion["choices"][0]["message"]["content"], "你好世界");
-        assert_eq!(
-            completion["choices"][0]["message"]["reasoning_content"],
-            "思考"
-        );
-        assert_eq!(completion["usage"]["total_tokens"], 12);
-        assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+        frames.extend(stream.finish());
+        frames
+            .iter()
+            .map(|frame| {
+                let text = frame.wire();
+                let text = text.replace("\"id\":\"chatcmpl-123\"", "\"id\":\"<ID>\"");
+                text.replace("\"created\":1700000000", "\"created\":<CREATED>")
+            })
+            .collect()
     }
 
     #[test]
-    fn merges_tool_call_fragments() {
-        let mut parser = SoloSseParser::default();
-        let mut translator = Translator::new("glm-5.2");
-        for event in parser.push(
-            "event:output\n\
-             data:{\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function_call\":{\"name\":\"demo\",\"arguments\":\"\"}}]}\n\n\
-             event:output\n\
-             data:{\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"\",\"function_call\":{\"name\":\"\",\"arguments\":\"{\\\"a\\\":\"}}]}\n\n\
-             event:output\n\
-             data:{\"response\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"\",\"function_call\":{\"name\":\"\",\"arguments\":\"1}\"}}]}\n\n\
-             event:done\n\
-             data:{\"finish_reason\":\"tool_calls\"}\n\n".as_bytes(),
-        ) {
-            translator.consume(event).expect("translate tool event");
+    fn stream_frames_match_the_reference_implementation() {
+        let document = document();
+        let cases = document["stream"].as_array().expect("stream 段是数组");
+        assert!(cases.len() >= 14, "用例数不对，实际 {}", cases.len());
+        for case in cases {
+            let name = case["name"].as_str().unwrap_or("?");
+            let want: Vec<String> = case["frames"].as_array().expect("frames 是数组").iter().map(|value| value.as_str().unwrap().to_string()).collect();
+            let got = run(case["input"].as_str().unwrap());
+            assert_eq!(want, got, "用例：{name}");
         }
-        let completion = translator.completion();
-        assert_eq!(
-            completion["choices"][0]["message"]["tool_calls"][0]["id"],
-            "call-1"
-        );
-        assert_eq!(
-            completion["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-            "demo"
-        );
-        assert_eq!(
-            completion["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
-            "{\"a\":1}"
-        );
+    }
+
+    /// 聚合结果里每次运行都不同的两个字段先归一，再比解析后的 JSON。
+    /// （先做字符串替换再解析是不行的 —— 替换出来的 `<CREATED>` 不是合法 JSON。）
+    fn canonical(mut document: Value) -> Value {
+        if let Some(map) = document.as_object_mut() {
+            map.insert("id".to_string(), json!("<ID>"));
+            map.insert("created".to_string(), json!(0));
+        }
+        document
+    }
+
+    #[test]
+    fn aggregate_documents_match_the_reference_implementation() {
+        let document = document();
+        let cases = document["aggregate"].as_array().expect("段存在");
+        // 下界：这一段被清空时循环不执行、测试照样绿（`stream` 段有同样的下界，
+        // 这里原先漏了，而 aggregate 是唯一会改"非流式回包形状"的对照）。
+        assert!(cases.len() >= 12, "aggregate 用例只剩 {} 条", cases.len());
+        for case in cases {
+            let name = case["name"].as_str().unwrap_or("?");
+            let input = case["input"].as_str().unwrap();
+            match aggregate(input, "chatcmpl-123", 1_700_000_000) {
+                Ok(got) => {
+                    // 向量里的 `created` 是占位符 `<CREATED>`（生成时把每次不同的
+                    // 时间戳归一掉了），它不是合法 JSON —— 先换成数字再解析。
+                    let raw = case["output"].as_str().unwrap().replace("<CREATED>", "0");
+                    let want: Value = serde_json::from_str(&raw).expect("向量 output 是合法 JSON");
+                    assert_eq!(canonical(want), canonical(got), "用例：{name}");
+                }
+                Err(error) => {
+                    assert_eq!(
+                        case["error"].as_str().unwrap_or("<不该失败>"),
+                        error.to_text(),
+                        "用例：{name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_error_frame_carries_the_classified_kind() {
+        let frames = run("event: error\ndata: {\"code\":4008,\"message\":\"Your requests have exceeded the quota\"}\n\n");
+        assert_eq!(2, frames.len());
+        assert!(frames[0].starts_with("event: error"));
+        assert!(frames[1].contains("[DONE]"));
+        // 分类结果同样要能拿到（转发层据此冷却账号）
+        let error = StreamError { code: 4008, message: "Your requests have exceeded the quota".to_string() };
+        assert_eq!(ErrorKind::PlanLimit, error.kind());
+    }
+
+    #[test]
+    fn a_usage_event_without_a_done_is_dropped_not_invented() {
+        // 参考实现把 usage 欠在下一帧上；没有下一帧就随它去。
+        let frames = run("event: token_usage\ndata: {\"prompt_tokens\":1}\n\n");
+        assert_eq!(vec!["data: [DONE]".to_string()], frames, "不能凭空造一个带 usage 的 finish 帧");
+    }
+
+    #[test]
+    fn malformed_frame_data_is_skipped_without_killing_the_stream() {
+        let frames = run("event: output\ndata: {not json}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n");
+        // 坏帧被忽略（不产 chunk），后面的 done 照常 → finish 帧 + [DONE] 两帧。
+        assert_eq!(2, frames.len(), "坏帧只被跳过，不断流：{frames:?}");
+        assert!(frames[0].contains("\"finish_reason\":\"stop\""), "{frames:?}");
+        assert!(frames[1].contains("[DONE]"), "{frames:?}");
+    }
+
+    #[test]
+    fn tool_call_deltas_are_merged_across_index_gaps() {
+        let mut calls = Vec::new();
+        merge_tool_calls(&mut calls, json!([{"index":1,"id":"b","function_call":{"name":"g","arguments":"{}","namespace":"n"}}]));
+        merge_tool_calls(&mut calls, json!([{"index":0,"id":"a","function":{"name":"f","arguments":"{\"x\""}}]));
+        merge_tool_calls(&mut calls, json!([{"index":0,"function":{"arguments":":1}"}}]));
+        assert_eq!(2, calls.len());
+        assert_eq!("f", calls[1]["function"]["name"]);
+        assert_eq!("{\"x\":1}", calls[1]["function"]["arguments"], "arguments 是拼接的");
+        assert!(calls[1]["function"].get("namespace").is_none(), "SOLO 专属字段要剥掉");
     }
 }

@@ -11,11 +11,13 @@
 //! 现在三者共用 `core::task_state` 的持久化排期（键 `modelRefresh:<scope>`）：
 //! 间隔、在途占位、失败冷却都跨重启保留，重启不再重置节奏。
 //!
-//! ── 手动路径：可以提前，但不能突破上游限流 ────────────────────
+//! ── 手动路径：提前排期、越过失败冷却，但不越过并发 ──────────────
 //! `manual = true` 跳过**普通排期**（用户按下按钮的预期就是「现在真的拉一次」，
-//! 小浣熊的 TTL 早退会让「点了没反应」与坏掉无法区分），但仍然受在途占位与
-//! 失败冷却约束 —— 那两条保护的是上游（连续失败往往就是限流或风控），
-//! 界面上的按钮不该把它解除。
+//! 小浣熊的 TTL 早退会让「点了没反应」与坏掉无法区分），并越过**失败冷却**
+//! （`ManualBackoff::Bypass`）：这一家的冷却记的是「上一轮为什么没成功」，而
+//! 用户按按钮往往正是因为刚把那个原因修好（重新导入登录态、换账号）—— 继续拿
+//! 旧结论挡着，界面上只会留着上一次的错误文案，看起来就是按钮坏了。
+//! 在途占位与最短请求间隔仍然生效：它们防的是并发与连点，与冷却不是一回事。
 //!
 //! ── Cline 的两个池只拉一次 ───────────────────────────────────
 //! `cline-free` / `cline-pass` 是两个 provider、两份清单，但底层是**同一个接口**
@@ -96,7 +98,14 @@ pub async fn refresh(
         let scope = if cline { "cline" } else { provider };
         let key = format!("modelRefresh:{scope}");
         let interval = config::scheduled_settings().model_refresh.interval * 60_000;
-        let guard = match task_state::claim(&key, interval, manual, 1_000) {
+        // 手动越过失败冷却（见 ManualBackoff）：用户点「获取模型」就是要现在真打一次。
+        // 自动路径照旧受它约束（`backoff` 在 `manual = false` 时不参与判定）。
+        let backoff = if manual {
+            task_state::ManualBackoff::Bypass
+        } else {
+            task_state::ManualBackoff::Respect
+        };
+        let guard = match task_state::claim(&key, interval, manual, backoff, 1_000) {
             Ok(Claim::Acquired(guard)) => guard,
             Ok(Claim::Deferred(state)) => {
                 item["status"] = json!("skipped");

@@ -45,6 +45,7 @@ import {
   manualTitleOf,
   maxLengthOf,
   methodsOf,
+  type FieldSpec,
   type MethodId,
   type ProviderConfig,
 } from './add-account-configs'
@@ -102,6 +103,29 @@ function Note({ html, text }: { html?: string; text?: string }): React.ReactElem
 
 /* ─── 手填字段 ─────────────────────────────── */
 
+/**
+ * `jsonExpand` 字段：解析并把键并进取到的请求体（`false` = 就地拦下，别把
+ * 「你粘的不是 JSON」变成后端签名/凭据模块吐出来的一条远端错误）。
+ *
+ * 只挡两层：解析失败与非对象（`"abc"` / `5` / `[]`）。粘错的常见形态是「多选了
+ * 外面的花括号」或「少粘一层」，这两类都在这一层被挡住。
+ */
+function expandJsonField(field: FieldSpec, value: string, payload: Record<string, unknown>): boolean {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch (error) {
+    toast(`${field.label} 不是合法 JSON：${describeError(error)}`, 'err')
+    return false
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    toast(`${field.label}要粘一个 JSON 对象（形如 {"codearts_provider_credential":{…}}）`, 'err')
+    return false
+  }
+  Object.assign(payload, parsed as Record<string, unknown>)
+  return true
+}
+
 function ManualSection({
   config,
   region,
@@ -127,7 +151,12 @@ function ManualSection({
         toast(`请填写 ${field.label}`, 'err')
         return
       }
-      if (value) payload[field.key] = value
+      if (!value) continue
+      if (field.jsonExpand) {
+        if (!expandJsonField(field, value, payload)) return
+        continue
+      }
+      payload[field.key] = value
     }
     await runAdd(setBusy, async () => {
       try {

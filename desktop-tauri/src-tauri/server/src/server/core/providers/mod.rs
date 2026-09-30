@@ -95,9 +95,8 @@
 //!                stream / chat / balance
 //! 本文件仍然只做「身份与元数据」这一件事，不认识磁盘也不认识账号。
 
-pub mod accio;
 pub mod adapter;
-pub mod atomcode;
+pub mod accio;
 pub mod autoclaw;
 pub mod catalog;
 /// 远程模型清单的**持久化缓存**（各家的清单在进程重启后由它读回，见模块头）。
@@ -106,6 +105,10 @@ pub mod catalog_cache;
 pub mod catalog_refresh;
 pub mod catpaw;
 pub mod cline;
+/// CodeArts（华为云 snap-access）。适配器实现在 `codearts/`，
+/// 语义来源与施工计划见 `cpa-deploy/notes/agent2api-codearts-port-plan.md`。
+/// 目前只落了签名层，尚未进 `ProviderKind`（不参与目录与转发）。
+pub mod codearts;
 pub mod content_block;
 /// 自定义提供商的**运行期接线**（目录聚合的追加段 + Chat Completions 协议
 /// 转发）。它不进本文件的身份体系（`ProviderKind` / `PROVIDERS`，见
@@ -117,6 +120,8 @@ pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
+/// Trae（字节 AI IDE）。目前只有"形状层"（签名无关的 body/头/SSE 判定），
+/// 适配器与账号存储在后续里程碑接入 —— 先挂模块是为了让向量测试能跑。
 pub mod trae;
 pub mod workbuddy;
 pub mod zcode;
@@ -205,10 +210,6 @@ pub enum ProviderKind {
     /// `ClineAdapter` 持有一个 `Pool`，`adapter_for` 按 kind 给出该池的实例。
     /// 远程目录缓存也共用一份（`models::REMOTE`），两家只是按池过滤它。
     ClinePass,
-    /// AtomCode（AtomGit CodingPlan，云直连）。
-    AtmCode,
-    /// Trae SOLO 国内版（云直连）。
-    Trae,
     /// Accio **国际版**（`accio`）。适配实现在 `accio/`：账号管理（PKCE 网页
     /// 登录 / 粘贴凭证 / 续期 / 额度查询）**加推理转发**。
     ///
@@ -237,7 +238,7 @@ pub enum ProviderKind {
     /// 账号管理 **加推理转发**（OpenAI 兼容、Bearer 鉴权、无状态）。
     ///
     /// ── 这一家的特别之处：zcode 平面两地相同、推理平面两地不同 ──
-    /// 登录与「周末套餐」领取都在 ZCode 自己的服务端（`zcode.z.ai`），两地
+    /// 登录与「限时套餐」领取都在 ZCode 自己的服务端（`zcode.z.ai`），两地
     /// 客户端用的是同一个域；真正跑推理的是各自开放平台的编码套餐端点
     /// （国内 `open.bigmodel.cn` / 国际 `api.z.ai`）。所以「地区」在这一家
     /// 只影响推理平面与账号归属 —— 与 AutoClaw（两地各一整套域名）不同。
@@ -257,10 +258,31 @@ pub enum ProviderKind {
     /// 把地区做成「一家的一个字段」的后果那三次已经各说过一遍：地区成了**账号
     /// 的属性**，界面上混在一起、无法按地区隔离账号记录。
     ///
-    /// ── 本家**没有签到**，接的是「周末套餐领取」────────────────
+    /// ── 本家**没有签到**，接的是「限时套餐领取」────────────────
     /// 其余各家都在 `core::auto_checkin` 的提供商清单里，本家不在 ——
-    /// 它没有签到活动，运营玩法是限时发放的体验套餐（见 `zcode::claim`）。
+    /// 它没有签到活动，运营玩法是限时发放的体验套餐（2026-09-28 那期是
+    /// 每天一份新套餐，见 `zcode::claim` 的模块头）。
     ZcodeIntl,
+    /// CodeArts（华为云 AI 代码助手 / snap-access）。适配实现在 `codearts/`：
+    /// 请求要华为云 SDK-HMAC-SHA256 签名、对话是有状态的（每账号只允许 3 路
+    /// 并发会话，靠 chat-session 心跳占槽），因此 `is_stateful()` 为 true。
+    CodeArts,
+    /// Trae（字节跳动 AI IDE 的 SOLO 通道）。适配实现在 `providers::trae/`。
+    ///
+    /// ── 为什么只有一家、没有"国际版"伴生 ─────────────────────
+    /// AutoClaw / Accio / ZCode 的两地是**同一套协议换域名**，所以做成两家
+    /// 按地区参数化。Trae 不是：国内 SOLO 走
+    /// `trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`（自定义信封 +
+    /// SSE 无 `[DONE]`），国际版走 `chat_sessions` → `events` 另一套协议、
+    /// 另一个 Origin —— 那是**两个协议**，不是一个地区的两种拼法。
+    /// 因此本 kind 只代表国内 SOLO，国际版将来接入时另立 kind
+    /// （`trae-intl`），不要往本家塞 `region` 字段：那会让"用哪套协议"
+    /// 变成账号的属性（这正是本文件反复拒绝的那个坑）。
+    ///
+    /// ── 本家没有签到活动可自动领 ────────────────────────────
+    /// `core::auto_checkin` 的提供商清单不含本家。每日签到存在，但要单独授权
+    /// 才会接（见 cpa-deploy/notes/agent2api-trae-port-plan.md 的 §8 决策 3）。
+    Trae,
 }
 
 /// 一个提供商的静态元数据。
@@ -285,71 +307,29 @@ pub struct ProviderMeta {
 /// 注册表顺序只用于**展示**（providers 摘要、模型目录合并时同名模型的去重顺序）
 /// 与旧数据迁移（把按家分队的优先级合并成全局队列时，作为旧默认路由顺序的依据）。
 pub const PROVIDERS: &[ProviderMeta] = &[
-    ProviderMeta {
-        id: "workbuddy",
-        label: "WorkBuddy",
-    },
-    ProviderMeta {
-        id: "raccoon",
-        label: "小浣熊",
-    },
-    ProviderMeta {
-        id: "catpaw",
-        label: "CatPaw",
-    },
+    ProviderMeta { id: "workbuddy", label: "WorkBuddy" },
+    ProviderMeta { id: "raccoon", label: "小浣熊" },
+    ProviderMeta { id: "catpaw", label: "CatPaw" },
     // AutoClaw 两个地区**相邻**排列（本次改动的要求）：界面上它们是同一条产品线的
     // 两个版本，中间隔着别的家会让「找国际版」变成一次扫描。顺序也决定模型目录
     // 合并时同名模型先归谁家 —— 国内版在前，与存量账号的归属一致。
-    ProviderMeta {
-        id: "autoclaw",
-        label: "AutoClaw 国内版",
-    },
-    ProviderMeta {
-        id: "autoclaw-intl",
-        label: "AutoClaw 国际版",
-    },
-    ProviderMeta {
-        id: "qoder",
-        label: "Qoder",
-    },
-    ProviderMeta {
-        id: "cline-free",
-        label: "Cline Free",
-    },
-    ProviderMeta {
-        id: "cline-pass",
-        label: "Cline Pass",
-    },
-    ProviderMeta {
-        id: "atomcode",
-        label: "AtomCode",
-    },
-    ProviderMeta {
-        id: "trae",
-        label: "Trae",
-    },
+    ProviderMeta { id: "autoclaw", label: "AutoClaw 国内版" },
+    ProviderMeta { id: "autoclaw-intl", label: "AutoClaw 国际版" },
+    ProviderMeta { id: "qoder", label: "Qoder" },
+    ProviderMeta { id: "cline-free", label: "Cline Free" },
+    ProviderMeta { id: "cline-pass", label: "Cline Pass" },
     // Accio 两个地区**相邻**排列（与 AutoClaw 同一理由：同一条产品线的两个
     // 版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
     // 合并时同名模型先归谁家 —— 国际版在前（用户装的、默认用的是它）。
-    ProviderMeta {
-        id: "accio",
-        label: "Accio",
-    },
-    ProviderMeta {
-        id: "accio-cn",
-        label: "Accio 国内版",
-    },
+    ProviderMeta { id: "accio", label: "Accio" },
+    ProviderMeta { id: "accio-cn", label: "Accio 国内版" },
     // ZCode 两个地区**相邻**排列（与 AutoClaw / Accio 同一理由：同一条产品线的
     // 两个版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
     // 合并时同名模型先归谁家 —— 国内版在前（国内网络环境下更常被添加的那个）。
-    ProviderMeta {
-        id: "zcode",
-        label: "ZCode 国内版",
-    },
-    ProviderMeta {
-        id: "zcode-intl",
-        label: "ZCode 国际版",
-    },
+    ProviderMeta { id: "zcode", label: "ZCode 国内版" },
+    ProviderMeta { id: "zcode-intl", label: "ZCode 国际版" },
+    ProviderMeta { id: "codearts", label: "CodeArts" },
+    ProviderMeta { id: "trae", label: "Trae" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -418,12 +398,12 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "qoder" => Some(ProviderKind::Qoder),
         "cline-free" => Some(ProviderKind::ClineFree),
         "cline-pass" => Some(ProviderKind::ClinePass),
-        "atomcode" => Some(ProviderKind::AtmCode),
-        "trae" => Some(ProviderKind::Trae),
         "accio" => Some(ProviderKind::Accio),
         "accio-cn" => Some(ProviderKind::AccioCn),
         "zcode" => Some(ProviderKind::Zcode),
         "zcode-intl" => Some(ProviderKind::ZcodeIntl),
+        "codearts" => Some(ProviderKind::CodeArts),
+        "trae" => Some(ProviderKind::Trae),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -450,12 +430,12 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Qoder => "qoder",
         ProviderKind::ClineFree => "cline-free",
         ProviderKind::ClinePass => "cline-pass",
-        ProviderKind::AtmCode => "atomcode",
-        ProviderKind::Trae => "trae",
         ProviderKind::Accio => "accio",
         ProviderKind::AccioCn => "accio-cn",
         ProviderKind::Zcode => "zcode",
         ProviderKind::ZcodeIntl => "zcode-intl",
+        ProviderKind::CodeArts => "codearts",
+        ProviderKind::Trae => "trae",
     }
 }
 
@@ -504,6 +484,54 @@ pub fn label_of(id: &str) -> String {
     match kind_from_id(id) {
         Some(kind) => meta(kind).label.to_string(),
         None => id.to_string(),
+    }
+}
+
+/// 「这家有一段**网关自带**的提示词」的说明（`None` = 这家没有这回事）。
+///
+/// 消费者只有一个：设置页「系统提示词 → 按提供商」那张表。它的存在同时决定
+/// **界面上这一家默认就出现在列表里**（有内置段的家不需要用户先去「添加」才
+/// 看得见那个开关 —— 否则这个开关等于藏起来了）。返回的文本是**说明**而不是
+/// 「不可改」的宣告：开关本身可以关，这段文字负责讲清「关掉意味着什么、
+/// 依据是哪次实测」（ZCode 的记录见 `zcode::OFFICIAL_PROMPT_NOTE`）。
+///
+/// 放在注册表这一层是因为它**就是**一条 provider 能力（与 `is_stateful` /
+/// `usage` 同类），而实现由那家自己给 —— 别处不要另写
+/// `match id { "zcode" => ... }`。
+pub fn gateway_prompt_note(id: &str) -> Option<&'static str> {
+    match kind_from_id(id)? {
+        // 国内版 / 国际版是同一条通道形态（活动套餐端点两地相同），要求一致
+        ProviderKind::Zcode | ProviderKind::ZcodeIntl => Some(zcode::OFFICIAL_PROMPT_NOTE),
+        _ => None,
+    }
+}
+
+/// 这家自带提示词的**装配规模**（字符数）—— 界面把它显示成只读子行的
+/// 「约 N 字符」，让用户对「关掉的是什么」有量化概念。
+///
+/// 与 [`gateway_prompt_note`] 一样按家分派；不认识的家、以及算不出规模的家
+/// （内置资源解析失败时是 0）都给 `None` —— 界面此时不显示那一行，
+/// 而不是显示一个 0 或一个假数字。
+pub fn gateway_prompt_chars(id: &str) -> Option<usize> {
+    match kind_from_id(id)? {
+        ProviderKind::Zcode | ProviderKind::ZcodeIntl => {
+            Some(zcode::official_prompt_approx_chars()).filter(|chars| *chars > 0)
+        }
+        _ => None,
+    }
+}
+
+/// 这家自带提示词的**正文模板**（三段；`None` = 这家没有自带段、或资源坏了）。
+///
+/// 与上面两个函数同一分派口径，消费者是 `/api/prompt` 的响应：设置页的编辑器拿
+/// 它当「官方原文」显示（`{cwd}` 这类占位符保持原样，编辑时看得见哪些值由运行时
+/// 填），用户改过的段存在配置里、发请求时逐段合并（见
+/// `core::prompt::GatewayBlocks::or`）。资源坏了给 `None` 而不是空文本 ——
+/// 一份空文本放上界面，用户一保存就等于把官方原文清空了。
+pub fn gateway_prompt_blocks(id: &str) -> Option<crate::server::core::prompt::GatewayBlocks> {
+    match kind_from_id(id)? {
+        ProviderKind::Zcode | ProviderKind::ZcodeIntl => zcode::official_prompt_blocks(),
+        _ => None,
     }
 }
 

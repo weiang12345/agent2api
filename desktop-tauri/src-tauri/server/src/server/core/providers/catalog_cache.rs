@@ -83,6 +83,10 @@ pub const SCOPE_CLINE: &str = "cline";
 pub const SCOPE_ACCIO_GLOBAL: &str = "accioGlobal";
 /// Accio 国内版
 pub const SCOPE_ACCIO_CN: &str = "accioCn";
+/// CodeArts（华为云 snap-access；三源合并成一份清单，所以一个 scope）
+pub const SCOPE_CODEARTS: &str = "codearts";
+/// Trae SOLO（`/api/ide/v1/get_detail_param`）
+pub const SCOPE_TRAE: &str = "trae";
 
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
@@ -96,6 +100,8 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_CLINE,
     SCOPE_ACCIO_GLOBAL,
     SCOPE_ACCIO_CN,
+    SCOPE_CODEARTS,
+    SCOPE_TRAE,
 ];
 
 /// 一份清单缓存
@@ -174,9 +180,7 @@ pub fn save(scope: &str, models: &[Value], fetched_at: i64) {
 /// 一次读库（不是逐 scope 调 [`load`]）：整份缓存本来就在一行里。
 pub fn cached_scopes() -> Vec<(&'static str, i64)> {
     let Some(db) = db() else { return Vec::new() };
-    let Some(all) = db.with(read_all).flatten() else {
-        return Vec::new();
-    };
+    let Some(all) = db.with(read_all).flatten() else { return Vec::new() };
     ALL_SCOPES
         .iter()
         .filter_map(|scope| {
@@ -214,16 +218,11 @@ pub fn age_text(fetched_at: i64) -> String {
 /// 读出整份缓存对象（键不存在 / 值坏 → `None`，由调用方按「没有缓存」处理）。
 fn read_all(conn: &Connection) -> Option<Map<String, Value>> {
     let text: Option<String> = conn
-        .query_row(
-            "SELECT value FROM kv WHERE key = ?1",
-            params![KV_KEY],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM kv WHERE key = ?1", params![KV_KEY], |row| {
+            row.get(0)
+        })
         .ok();
-    serde_json::from_str::<Value>(&text?)
-        .ok()?
-        .as_object()
-        .cloned()
+    serde_json::from_str::<Value>(&text?).ok()?.as_object().cloned()
 }
 
 /// 整份写回（单行 UPSERT）。

@@ -30,7 +30,9 @@
 mod accio;
 mod autoclaw;
 mod catpaw;
+pub mod codearts;
 mod qoder;
+mod trae;
 mod zcode;
 
 use std::collections::HashMap;
@@ -41,8 +43,8 @@ use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::{
-    anonymous_headers, context_for_edition, send_public_request, unwrap_public_response,
-    urlencoding, with_expires_at, AuthService, WorkBuddyAuthError, SERVER_CODE_RETRY_FETCH_TOKEN,
+    anonymous_headers, context_for_edition, send_public_request, unwrap_public_response, urlencoding,
+    with_expires_at, AuthService, WorkBuddyAuthError, SERVER_CODE_RETRY_FETCH_TOKEN,
 };
 use crate::server::core::endpoints::{resolve_edition, Context, DEFAULT_EDITION};
 use crate::server::core::providers::adapter::adapter_for;
@@ -79,8 +81,6 @@ pub struct LoginTaskState {
     /// 缺省（default）为空串，`new_handle_for_provider` 会写上一家；
     /// 空串在回调侧按「不认识」拒绝，不会静默落到某一家。
     pub provider: String,
-    pub machine_id: String,
-    pub device_id: String,
     pub canceled: bool,
     finished_at: Option<i64>,
 }
@@ -147,10 +147,7 @@ struct TaskTable {
 impl LoginTasks {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(TaskTable {
-                by_state: HashMap::new(),
-                next_ticket: 1,
-            })),
+            inner: Arc::new(Mutex::new(TaskTable { by_state: HashMap::new(), next_ticket: 1 })),
         }
     }
 
@@ -166,12 +163,10 @@ impl LoginTasks {
     /// 下次任何一次取任务都会把它扫掉。
     fn sweep(table: &mut TaskTable) {
         let now = logging::now_ms();
-        table
-            .by_state
-            .retain(|_, handle| match handle.lock().finished_at {
-                Some(finished) => now - finished < TASK_RETENTION_MS,
-                None => true,
-            });
+        table.by_state.retain(|_, handle| match handle.lock().finished_at {
+            Some(finished) => now - finished < TASK_RETENTION_MS,
+            None => true,
+        });
     }
 
     pub fn get(&self, state: &str) -> Option<LoginTaskHandle> {
@@ -221,7 +216,9 @@ impl LoginTasks {
             let mut table = self.lock();
             // 按 state 或按句柄（state 未入表时用 ticket 兜底，两者必居其一）
             let ticket = handle.ticket();
-            table.by_state.retain(|_, item| item.ticket() != ticket);
+            table
+                .by_state
+                .retain(|_, item| item.ticket() != ticket);
         }
         logging::log("[Login]", "登录任务已取消（用户放弃等待）");
         true
@@ -258,6 +255,13 @@ pub struct LoginService {
     /// 生命周期与任务表一致（收尾时清掉）；进程重启后自然为空，那时回调
     /// 会被 `finish_autoclaw_oauth_callback` 判成「登录上下文已丢失」。
     autoclaw_oauth: Arc<Mutex<HashMap<String, autoclaw::PendingOauth>>>,
+    /// Trae 网页登录的额外状态（`state → 进行中的一轮`）。
+    ///
+    /// 单独一张表而不是塞进 `LoginTaskState`（同 [`Self::autoclaw_oauth`] 的理由）：
+    /// 它的值是**活对象**（持有本机回调监听器），既不能序列化给 `/wait`，
+    /// 也不该让别的 provider 每次轮询都陪着带一份别人用不到的东西。
+    /// 表里同一时刻最多一条（见 `login/trae.rs` 模块头）。
+    trae_login: Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::trae::login::Session>>>>,
 }
 
 impl LoginService {
@@ -267,11 +271,17 @@ impl LoginService {
             store,
             tasks: LoginTasks::new(),
             autoclaw_oauth: Arc::new(Mutex::new(HashMap::new())),
+            trae_login: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn tasks(&self) -> &LoginTasks {
         &self.tasks
+    }
+
+    /// Trae 登录的待办表（`login/trae.rs` 用它挂这一轮的回调监听器）。
+    pub(crate) fn trae_login(&self) -> &Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::trae::login::Session>>>> {
+        &self.trae_login
     }
 
     /// 取消一次登录：任务表那一步见 [`LoginTasks::cancel`]，这里多做的事是
@@ -293,6 +303,16 @@ impl LoginService {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(state);
+            // CodeArts 那一轮的 PKCE verifier / DPoP 私钥在自己的待办表里，
+            // 不清就要占到 5 分钟超时才还 —— 而用户取消后往往立刻重试。
+            self.drop_codearts_pending(state);
+            // Trae 这一家的待办表按 state 存，但取消语义是"这一轮不要了"：
+            // 本家同时只有一轮，直接整体收摊（close 释放回调端口，正在等回调的
+            // 后台任务随之退出）。不这么做就要把端口占到 5 分钟超时才还 ——
+            // 与 AutoClaw 那次「取消后立刻重试抢不到端口」是同一个坑。
+            if state.starts_with("trae-") {
+                self.close_trae_login();
+            }
         }
         canceled
     }
@@ -310,10 +330,7 @@ impl LoginService {
 
     /// 建一个任务句柄但不启动后台任务（`/auth/login` 的同步登录用它 ——
     /// 那条路径自己 await 登录流程，不能再起一个后台任务重复登录）
-    fn new_handle(
-        &self,
-        info: &'static crate::server::core::endpoints::EditionInfo,
-    ) -> LoginTaskHandle {
+    fn new_handle(&self, info: &'static crate::server::core::endpoints::EditionInfo) -> LoginTaskHandle {
         self.new_handle_for_provider(info, DEFAULT_PROVIDER_ID)
     }
 
@@ -336,8 +353,6 @@ impl LoginService {
                 session: None,
                 edition: info.id.to_string(),
                 provider: provider.to_string(),
-                machine_id: String::new(),
-                device_id: String::new(),
                 canceled: false,
                 finished_at: None,
             })),
@@ -374,10 +389,7 @@ impl LoginService {
             task.auth_url = Some(auth_url);
         });
         self.tasks.register(&state, handle.clone());
-        logging::log(
-            "[Login]",
-            &format!("发起{label}网页登录（等待浏览器回调…）"),
-        );
+        logging::log("[Login]", &format!("发起{label}网页登录（等待浏览器回调…）"));
         Ok(handle)
     }
 
@@ -483,218 +495,6 @@ impl LoginService {
             }
         });
         Ok(handle)
-    }
-
-    /// 发起 AtomCode OAuth 登录。
-    ///
-    /// 与 Cline 设备授权同形：先拿授权 URL，再由后台任务轮询上游，直到拿到
-    /// OAuth 凭证并落账号。区别在于 AtomCode 的授权地址由 `acs.atomgit.com`
-    /// 直接返回，后续 `auth/check` / `auth/token` 也不需要本地客户端。
-    pub async fn start_atomcode_login(
-        &self,
-        name: Option<String>,
-    ) -> Result<LoginTaskHandle, String> {
-        let login = crate::server::core::providers::atomcode::oauth::start()
-            .await
-            .map_err(|error| error.message)?;
-        let state = login.state.clone();
-        let info = resolve_edition(Some(DEFAULT_EDITION));
-        let handle = self.new_handle_for_provider(info, "atomcode");
-        handle.update(|task| {
-            task.state = Some(state.clone());
-            task.auth_url = Some(login.login_url.clone());
-        });
-        self.tasks.register(&state, handle.clone());
-        logging::log("[Login]", "发起 AtomCode 网页登录（等待 AtomGit 授权…）");
-
-        let service = self.clone();
-        let task_state = state;
-        let name = name
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        crate::spawn_task(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(LOGIN_TIMEOUT_MS);
-            loop {
-                if service.tasks.get(&task_state).is_none() {
-                    return;
-                }
-                if let Some(handle) = service.tasks.get(&task_state) {
-                    if handle.snapshot().canceled {
-                        return;
-                    }
-                }
-                match crate::server::core::providers::atomcode::oauth::poll_once(&task_state).await
-                {
-                    Ok(Some(credentials)) => {
-                        // CodingPlan 领取与模型目录刷新都不阻塞登录：
-                        // 即使这里失败，账号仍先落地，用户可以在模型页手动重试。
-                        if let Err(error) = crate::server::core::providers::atomcode::models::claim(
-                            &credentials,
-                            None,
-                        )
-                        .await
-                        {
-                            logging::verbose(
-                                "[Login]",
-                                &format!("AtomCode CodingPlan 领取/同步失败：{}", error.message),
-                            );
-                        }
-                        let refresh_outcome =
-                            crate::server::core::providers::atomcode::models::refresh(
-                                &credentials,
-                                None,
-                                true,
-                            )
-                            .await;
-                        if let Some(error) = refresh_outcome.message {
-                            logging::verbose(
-                                "[Login]",
-                                &format!("AtomCode 模型目录刷新失败：{error}"),
-                            );
-                        }
-                        let store = service.store.clone();
-                        match store.add_atomcode_account(&credentials, name.as_deref(), "web") {
-                            Ok(account) => {
-                                let account_id = account
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let Some(handle) = service.tasks.get(&task_state) else {
-                                    return;
-                                };
-                                finish_task(
-                                    &handle,
-                                    &json!({
-                                        "account": {
-                                            "uid": account_id,
-                                            "nickname": credentials.name,
-                                        },
-                                        "edition": "",
-                                        "provider": "atomcode",
-                                    }),
-                                );
-                                logging::log("[Login]", "✅ AtomCode 登录完成");
-                                return;
-                            }
-                            Err(error) => {
-                                let Some(handle) = service.tasks.get(&task_state) else {
-                                    return;
-                                };
-                                finish_task_error(&handle, &error.message);
-                                logging::log(
-                                    "[Login]",
-                                    &format!("❌ AtomCode 登录失败: {}", error.message),
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let Some(handle) = service.tasks.get(&task_state) else {
-                            return;
-                        };
-                        finish_task_error(&handle, &error.message);
-                        logging::log(
-                            "[Login]",
-                            &format!("❌ AtomCode 登录失败: {}", error.message),
-                        );
-                        return;
-                    }
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    let Some(handle) = service.tasks.get(&task_state) else {
-                        return;
-                    };
-                    finish_task_error(&handle, "AtomCode 登录超时，请重试");
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(LOGIN_POLL_INTERVAL_MS)).await;
-            }
-        });
-        Ok(handle)
-    }
-
-    /// 发起 Trae 网页登录。回调由上游推到本网关的 loopback 端口。
-    pub async fn start_trae_login(
-        &self,
-        callback_base: &str,
-        name: Option<String>,
-    ) -> Result<LoginTaskHandle, String> {
-        let login = crate::server::core::providers::trae::oauth::build_login(&format!(
-            "{callback_base}/authorize"
-        ))
-        .map_err(|error| error.message)?;
-        let info = resolve_edition(Some(DEFAULT_EDITION));
-        let handle = self.new_handle_for_provider(info, "trae");
-        handle.update(|task| {
-            task.state = Some(login.state.clone());
-            task.auth_url = Some(login.auth_url.clone());
-            task.machine_id = login.machine_id.clone();
-            task.device_id = login.device_id.clone();
-        });
-        self.tasks.register(&login.state, handle.clone());
-        logging::log("[Login]", "发起 Trae 网页登录（等待授权回调…）");
-
-        let _ = name;
-        Ok(handle)
-    }
-
-    /// 完成 Trae 登录回调：解析、换凭证、落账号。
-    pub async fn finish_trae_login(
-        &self,
-        callback_url: &str,
-        task_state: &str,
-    ) -> Result<String, GatewayError> {
-        let task_state = task_state.trim();
-        let Some(handle) = self.tasks.get(task_state) else {
-            return Err(GatewayError::with_status(
-                404,
-                "Trae 登录任务不存在或已过期",
-            ));
-        };
-        if handle.snapshot().canceled {
-            return Err(GatewayError::with_status(
-                400,
-                "Trae 登录已取消，请重新发起",
-            ));
-        }
-        if handle.snapshot().done {
-            return Ok(String::new());
-        }
-        let callback =
-            crate::server::core::providers::trae::oauth::parse_callback(callback_url, task_state)?;
-        let snapshot = handle.snapshot();
-        let machine_id = snapshot.machine_id;
-        let device_id = snapshot.device_id;
-        let credentials = crate::server::core::providers::trae::oauth::exchange(
-            callback,
-            &machine_id,
-            &device_id,
-        )
-        .await?;
-        let account = self
-            .store
-            .add_trae_account(&credentials, None, "web")
-            .map_err(|error| GatewayError::with_status(error.status_code, error.message))?;
-        let account_id = account
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        finish_task(
-            &handle,
-            &json!({
-                "account": {
-                    "uid": account_id,
-                    "nickname": credentials.nickname,
-                },
-                "edition": "",
-                "provider": "trae",
-            }),
-        );
-        Ok(account_id)
     }
 
     /// 等 authUrl（对应 Node 版 `/api/session/login/start` 的 15 秒等待）。
@@ -804,10 +604,7 @@ impl LoginService {
     ) -> Result<String, GatewayError> {
         let state = state.trim();
         if state.is_empty() {
-            return Err(GatewayError::with_status(
-                400,
-                "缺少 state，无法确认这次回调归属",
-            ));
+            return Err(GatewayError::with_status(400, "缺少 state，无法确认这次回调归属"));
         }
         let Some(handle) = self.tasks.get(state) else {
             return Err(GatewayError::with_status(
@@ -830,6 +627,30 @@ impl LoginService {
                 format!("登录任务记录的提供商「{}」无法识别", task.provider),
             ));
         };
+        // CodeArts：粘贴回来的整条回调 URL 在这里收尾。
+        // 为什么不是「按 state 取 code」那套：portal 的回调**可能只带一个 code**、
+        // 不带我们的配对信息，收尾要「逐个候选试 verifier」，还要认第一次回调下发的
+        // secret（ticket 兜底通道）。整套判定都在 `core::login::codearts` 里，
+        // 这里只负责把 URL 的查询串拆给它。
+        if kind == ProviderKind::CodeArts {
+            let params: std::collections::HashMap<String, String> = url::Url::parse(callback_url)
+                .ok()
+                .map(|parsed| {
+                    parsed
+                        .query_pairs()
+                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return match self.finish_codearts_login(&params).await {
+                codearts::Callback::ContinueTo(_) => Err(GatewayError::with_status(
+                    400,
+                    "这条回调地址要浏览器自己去跳（网关没法替它跳转），请把地址栏里最终那条地址再粘一次",
+                )),
+                codearts::Callback::Accepted(account_id, _) => Ok(account_id.unwrap_or_default()),
+                codearts::Callback::Failed(status, message) => Err(GatewayError::with_status(i32::from(status), message)),
+            };
+        }
         if kind != ProviderKind::Raccoon {
             return Err(GatewayError::with_status(400, "该登录任务不接收授权码回调"));
         }
@@ -838,17 +659,11 @@ impl LoginService {
             Err(error) => {
                 // 校验失败也要落定任务：否则前端会一直等到 5 分钟超时
                 finish_task_error(&handle, &error.message);
-                logging::log(
-                    "[Login]",
-                    &format!("❌ 网页登录回调校验失败: {}", error.message),
-                );
+                logging::log("[Login]", &format!("❌ 网页登录回调校验失败: {}", error.message));
                 return Err(error);
             }
         };
-        match adapter_for(kind)
-            .exchange_login_code(&self.store, &code, state)
-            .await
-        {
+        match adapter_for(kind).exchange_login_code(&self.store, &code, state).await {
             Ok(account_id) => {
                 let session = json!({
                     "accountUid": account_id,
@@ -865,10 +680,7 @@ impl LoginService {
             }
             Err(error) => {
                 finish_task_error(&handle, &error.message);
-                logging::log(
-                    "[Login]",
-                    &format!("❌ 网页登录换取凭证失败: {}", error.message),
-                );
+                logging::log("[Login]", &format!("❌ 网页登录换取凭证失败: {}", error.message));
                 Err(error)
             }
         }
@@ -1005,9 +817,12 @@ impl LoginService {
                         "登录成功但获取账号信息失败（缺少 uid），请重试",
                     ));
                 }
-                let saved = self.store.add_account(&session, None).map_err(|error| {
-                    WorkBuddyAuthError::with_status(error.status_code, error.message)
-                })?;
+                let saved = self
+                    .store
+                    .add_account(&session, None)
+                    .map_err(|error| {
+                        WorkBuddyAuthError::with_status(error.status_code, error.message)
+                    })?;
                 let name = saved
                     .get("name")
                     .and_then(Value::as_str)

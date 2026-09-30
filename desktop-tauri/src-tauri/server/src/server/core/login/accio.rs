@@ -58,16 +58,10 @@ impl LoginService {
             return Err(GatewayError::with_status(400, "回调没有携带授权码"));
         }
         if state.is_empty() {
-            return Err(GatewayError::with_status(
-                400,
-                "回调没有携带 state，无法确认这次登录归属",
-            ));
+            return Err(GatewayError::with_status(400, "回调没有携带 state，无法确认这次登录归属"));
         }
         let Some(handle) = self.tasks.get(state) else {
-            return Err(GatewayError::with_status(
-                404,
-                "这次登录已取消或已过期，请重新发起",
-            ));
+            return Err(GatewayError::with_status(404, "这次登录已取消或已过期，请重新发起"));
         };
         let snapshot = handle.snapshot();
         let Some(region) = Region::from_provider_id(&snapshot.provider) else {
@@ -98,11 +92,7 @@ impl LoginService {
                 finish_task_error(&handle, &error.message);
                 logging::log(
                     "[Login]",
-                    &format!(
-                        "❌ Accio {}网页登录换取凭证失败: {}",
-                        region.label(),
-                        error.message
-                    ),
+                    &format!("❌ Accio {}网页登录换取凭证失败: {}", region.label(), error.message),
                 );
                 Err(error)
             }

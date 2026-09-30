@@ -82,11 +82,7 @@ pub async fn set_state(State(state): State<ServerState>, body: Bytes) -> Respons
     // 目标提供商：新版前端总是带着（启停粒度是「提供商 × 模型 id」）；
     // 缺省走旧版全局语义 —— 只有旧版前端（升级前）会这么传
     let provider = text_field(&object, "provider");
-    let provider_opt = if provider.is_empty() {
-        None
-    } else {
-        Some(provider.as_str())
-    };
+    let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
     // 启用某一家时可能要把旧版的全局条目展开成「其余各家」，这里给出当前
     // 清单里同样承载该模型的其他提供商（目录的匹配口径：先 id 后 name）。
     // 返回值是 id 空间（内置家 + 自定义家同列，见 `providers_for_model`）；
@@ -113,11 +109,7 @@ pub async fn set_state(State(state): State<ServerState>, body: Bytes) -> Respons
         Some(name) => format!("[{name}] {id}"),
         None => id.clone(),
     };
-    let what = if enabled == Some(true) {
-        "已启用"
-    } else {
-        "已禁用"
-    };
+    let what = if enabled == Some(true) { "已启用" } else { "已禁用" };
     logging::log("[Models]", &format!("模型 {subject} {what}"));
     ok_json(catalog::manage_view(state.store()))
 }
@@ -148,19 +140,12 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
     let target = text_field(&object, "target");
     let provider = text_field(&object, "provider");
     if !model_rules::alias_valid(&alias) {
-        return errors::management_error(
-            400,
-            "映射名只能包含字母、数字与 - _ . / :，且不超过 128 个字符",
-        );
+        return errors::management_error(400, "映射名只能包含字母、数字与 - _ . / :，且不超过 128 个字符");
     }
     if target.is_empty() {
         return errors::management_error(400, "缺少目标上游模型");
     }
-    let provider_opt = if provider.is_empty() {
-        None
-    } else {
-        Some(provider.as_str())
-    };
+    let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
     if let Some(kind) = provider_opt {
         // provider 必须是注册表里的家：它决定候选链里追加谁，写错名字会让
         // 映射悄悄变成一条永远路由不到的死路
@@ -193,14 +178,11 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
         Some(Value::Bool(value)) => Some(*value),
         Some(_) => return errors::management_error(400, "enabled 必须是布尔值"),
     };
-    let others = catalog::providers_for_model(&target)
-        .into_iter()
+    let others = catalog::providers_for_model(&target).into_iter()
         .filter(|id| crate::server::core::providers::kind_from_id(id).is_some())
         .filter(|id| Some(id.as_str()) != provider_opt)
         .collect::<Vec<_>>();
-    if let Err(error) =
-        model_rules::add_mapping(&alias, &target, provider_opt, reasoning, enabled, &others)
-    {
+    if let Err(error) = model_rules::add_mapping(&alias, &target, provider_opt, reasoning, enabled, &others) {
         return errors::management_error(500, error);
     }
     let subject = match provider_opt {
@@ -218,10 +200,7 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
         Some(false) => "，开关 关",
         None => "",
     };
-    logging::log(
-        "[Models]",
-        &format!("保存映射 {subject}{reasoning_text}{enabled_text}"),
-    );
+    logging::log("[Models]", &format!("保存映射 {subject}{reasoning_text}{enabled_text}"));
     ok_json(catalog::manage_view(state.store()))
 }
 
@@ -247,11 +226,7 @@ pub async fn remove_mapping(State(state): State<ServerState>, body: Bytes) -> Re
     if alias.eq_ignore_ascii_case(&target) {
         return errors::management_error(400, "原始 ID 的默认绑定不能删除，请关闭它的开关");
     }
-    let provider_opt = if provider.is_empty() {
-        None
-    } else {
-        Some(provider.as_str())
-    };
+    let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
     // 其余承载家（id 空间，见 `providers_for_model`；口径与 `set_state` 的
     // others 同一处）
     let others: Vec<String> = if provider_opt.is_some() {
@@ -344,7 +319,10 @@ pub async fn remove_custom(State(state): State<ServerState>, body: Bytes) -> Res
     }
     let (_, removed) = model_rules::remove_custom(&provider, &id);
     if !removed {
-        return errors::management_error(404, format!("自定义模型不存在: [{provider}] {id}"));
+        return errors::management_error(
+            404,
+            format!("自定义模型不存在: [{provider}] {id}"),
+        );
     }
     logging::log("[Models]", &format!("移除自定义模型 [{provider}] {id}"));
     ok_json(catalog::manage_view(state.store()))
@@ -358,14 +336,14 @@ pub async fn remove_custom(State(state): State<ServerState>, body: Bytes) -> Res
 /// （`/v1/models` 与 Anthropic 列表、管理页），不改路由 / 启停 / 转发行为。
 ///
 /// ── 为什么单独一条接口 ──────────────────────────────────────
-/// 覆盖面是 `(provider, id)` 二元组（启停也是，但值是五个键各自的三态；
+/// 覆盖面是 `(provider, id)` 二元组（启停也是，但值是六个键各自的三态；
 /// 映射是三元组）。塞进任何一条现有接口都会让那套三态协议变成两义。
 ///
 /// ── `capabilities` 的三态（与 `add_mapping` 的 reasoning 同一套）──
 ///   · 键**缺失**   → 不改这一项；
 ///   · 键给 `null`  → 清除这一项的覆盖（回到清单原值）；
 ///   · 键给值       → 覆盖（token 键要 1~1 亿正整数，能力开关要布尔）。
-/// 管理页弹窗保存时五个键一次全给（「全量提交」最不容易出歧义）；
+/// 管理页弹窗保存时六个键一次全给（「全量提交」最不容易出歧义）；
 /// 只给一个键的单字段路径也支持，留给以后的行内编辑。
 ///
 /// ── 只服务内置家 ────────────────────────────────────────────

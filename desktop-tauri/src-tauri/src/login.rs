@@ -250,8 +250,20 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 提供方，主机不可穷举。**必须显式列出** —— 落进默认分支会拿到 WorkBuddy
         // 的白名单，症状正是上面警告的那种：窗口一片空白，而日志上什么也看不出。
         // 两个地区都列：它们共用同一个授权域，任缺一个都会在将来复用时踩到。
+        //
+        // CodeArts 同样不设限：授权页在 `codearts.huaweicloud.com/portal/authorize`，
+        // 它会按用户选的登录方式继续跳华为云账号（`account.huaweicloud.com`）、
+        // IAM 委托、扫码等不可穷举的主机；最后还要回到**网关自己的** loopback 端口
+        // 拿授权码（portal 只认我们给的 port，回调路径由它拼死，见
+        // `providers::codearts::oauth::authorize_url`）。那条 loopback 导航一旦被
+        // 白名单拦下，症状就是上面警告过的那种：用户在官方页面明明登录成功，
+        // 网关却永远等不到码。
+        //
+        // Trae 必须显式列在这里：落进默认分支会拿到 WorkBuddy 的白名单，
+        // 那张表**既没有** `trae.cn`（授权页）**也没有** `127.0.0.1`（回调），
+        // 症状正是本文件上面警告的那种 —— 窗口一片空白，日志什么也看不出。
         "catpaw" | "qoder" | "cline-free" | "cline-pass" | "autoclaw" | "autoclaw-intl"
-        | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "atomcode" | "trae" => None,
+        | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae" => None,
         _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
@@ -393,8 +405,6 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         "catpaw" => Ok("catpaw"),
         "cline-free" => Ok("cline-free"),
         "cline-pass" => Ok("cline-pass"),
-        "atomcode" => Ok("atomcode"),
-        "trae" => Ok("trae"),
         "autoclaw" | "autoclaw-intl" => Ok("autoclaw-intl"),
         // Accio 两个地区：授权地址由后端适配器拼（PKCE），壳侧只负责开窗口与
         // 轮询 —— 与 workbuddy / Qoder 同一条路。地区由 **provider 本身**决定
@@ -412,6 +422,18 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 上打不开，也**不影响**登录判定。
         "zcode" => Ok("zcode"),
         "zcode-intl" => Ok("zcode-intl"),
+        // CodeArts（华为云码道）：授权地址由**后端适配器**现拼（PKCE + 回调 URL，
+        // 见 `providers::codearts::oauth::authorize_url`），壳侧只负责开窗口与
+        // 轮询 —— 与 ZCode 同一条路。它的回调由 portal 拼成
+        // `http://127.0.0.1:<网关端口>/oauth/callback` 落回网关自己，所以窗口
+        // **必须允许**导航到本机端口（见下面 allowed_hosts 的同一条）。
+        "codearts" => Ok("codearts"),
+        // Trae（SOLO CN）：授权地址由**后端**问上游 guidance 拼（PKCE + 回调 URL），
+        // 壳侧只负责开窗口与轮询 —— 与 ZCode 同一条路。特别地，它的回调落在
+        // `http://127.0.0.1:<随机端口>/authorize`（网关自己监听的那台 loopback，
+        // 上游把这个地址按正则逐字校验），所以窗口**必须允许**导航到本机端口，
+        // 否则用户点完授权、回调请求根本发不出去（见下面 allowed_hosts 的同一条）。
+        "trae" => Ok("trae"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -627,11 +649,7 @@ pub async fn start(
     // 这里再算一遍 edition 就是多余的一处状态（还会与 provider 冲突时说不清谁算数）。
     let edition_id = match provider {
         "qoder" => {
-            if edition == "intl" || edition == "global" {
-                "intl"
-            } else {
-                "cn"
-            }
+            if edition == "intl" || edition == "global" { "intl" } else { "cn" }
         }
         // ZCode 的两个地区由 **provider 本身**决定（界面上是两张卡片，
         // 没有地区下拉，因此面板不会传 `edition`）。不看 `edition` 形参的
@@ -640,18 +658,10 @@ pub async fn start(
         "zcode" => "cn",
         "zcode-intl" => "intl",
         _ => {
-            if edition == "intl" {
-                "intl"
-            } else {
-                "cn"
-            }
+            if edition == "intl" { "intl" } else { "cn" }
         }
     };
-    let edition_label = if edition_id == "intl" {
-        "国际版"
-    } else {
-        "国内版"
-    };
+    let edition_label = if edition_id == "intl" { "国际版" } else { "国内版" };
     // 系统浏览器模式对 workbuddy / qoder / cline 都开放：三家的判定都在后端
     // （轮询上游 auth/token、轮询设备令牌、轮询设备授权），浏览器在哪登录都行。
     // 小浣熊**只有内嵌窗口**能收回调（自定义协议深链要靠系统注册，见模块头），
@@ -681,11 +691,7 @@ pub async fn start(
         *guard = Some(ActiveLogin {
             state: login_state.clone(),
             edition: edition_id.to_string(),
-            mode: if use_external {
-                "external".into()
-            } else {
-                "embedded".into()
-            },
+            mode: if use_external { "external".into() } else { "embedded".into() },
             provider: provider.to_string(),
         });
     }
@@ -693,11 +699,7 @@ pub async fn start(
         app,
         LoginState {
             active: true,
-            mode: Some(if use_external {
-                "external".into()
-            } else {
-                "embedded".into()
-            }),
+            mode: Some(if use_external { "external".into() } else { "embedded".into() }),
             edition: Some(edition_id.to_string()),
             provider: Some(provider.to_string()),
         },
@@ -711,21 +713,26 @@ pub async fn start(
         "cline-free" => "Cline Free",
         "cline-pass" => "Cline Pass",
         "catpaw" => "CatPaw",
-        "atomcode" => "AtomCode",
-        "trae" => "Trae",
         "raccoon" => "小浣熊",
         // ZCode 两家各自点名，且品牌名里**已经带了地区** —— 因此下面拼标题时
         // 要跳过 edition 后缀，否则会得到「登录 ZCode 国内版 国内版账号」
         "zcode" => "ZCode 国内版",
         "zcode-intl" => "ZCode 国际版",
+        // CodeArts 只有一家（region 固定在 cn-north-4 且必须与 token 签发地
+        // 一致，不是用户可选项，见 `providers::codearts` 的模块头），
+        // 品牌名里不需要地区
+        "codearts" => "CodeArts",
+        // Trae 只有一家（国内 SOLO 通道；国际版是另一套协议、另立 provider id），
+        // 品牌名里不需要地区
+        "trae" => "Trae",
         _ => "WorkBuddy",
     };
-    // 窗口标题：Cline 两家的池、ZCode 两家的地区都已经在品牌名里，
-    // 不再拼 edition 后缀（否则会出现「登录 Cline Free 国内版账号」
-    // 「登录 ZCode 国内版 国内版账号」这种说不通的标题）
+    // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae 的单一家
+    // 都已经在品牌名里，不再拼 edition 后缀（否则会出现「登录 Cline Free 国内版
+    // 账号」「登录 ZCode 国内版 国内版账号」这种说不通的标题）
     let title = if matches!(
         provider,
-        "cline-free" | "cline-pass" | "zcode" | "zcode-intl"
+        "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae"
     ) {
         format!("登录 {provider_label} 账号")
     } else {
@@ -741,28 +748,11 @@ pub async fn start(
     let result = if use_external {
         open_external(app, &auth_url, edition_label, &login_state).await
     } else {
-        run_embedded(
-            app,
-            provider,
-            &auth_url,
-            &title,
-            &login_state,
-            social_restore,
-        )
-        .await
+        run_embedded(app, provider, &auth_url, &title, &login_state, social_restore).await
     };
 
-    if result
-        .as_ref()
-        .map(|value| value.get("ok").and_then(serde_json::Value::as_bool))
-        != Ok(Some(true))
-    {
-        let _ = gateway::call(
-            "POST",
-            "/api/session/login/cancel",
-            Some(&json!({ "state": login_state })),
-        )
-        .await;
+    if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
+        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
     }
     clear_active_login(app, &login_state);
     result
@@ -813,26 +803,9 @@ async fn start_raccoon(app: &AppHandle) -> Result<serde_json::Value, String> {
     // social_restore 传 false：第三方入口恢复只针对 WorkBuddy 的登录页
     // （`run_embedded` 里也只对 provider == "workbuddy" 注入脚本），小浣熊
     // 没有这个开关概念，直传 false 表明「不参与这项能力」。
-    let result = run_embedded(
-        app,
-        "raccoon",
-        &auth_url,
-        "登录小浣熊账号",
-        &login_state,
-        false,
-    )
-    .await;
-    if result
-        .as_ref()
-        .map(|value| value.get("ok").and_then(serde_json::Value::as_bool))
-        != Ok(Some(true))
-    {
-        let _ = gateway::call(
-            "POST",
-            "/api/session/login/cancel",
-            Some(&json!({ "state": login_state })),
-        )
-        .await;
+    let result = run_embedded(app, "raccoon", &auth_url, "登录小浣熊账号", &login_state, false).await;
+    if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
+        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
     }
     clear_active_login(app, &login_state);
     result
@@ -848,7 +821,10 @@ async fn start_raccoon(app: &AppHandle) -> Result<serde_json::Value, String> {
 ///
 /// `mode`：内嵌窗口与系统浏览器都支持（回调打回本机网关，与浏览器在哪无关），
 /// 与 Qoder 同理；小浣熊那种「只有内嵌能收回调」的约束在这家不成立。
-async fn start_catpaw(app: &AppHandle, mode: &str) -> Result<serde_json::Value, String> {
+async fn start_catpaw(
+    app: &AppHandle,
+    mode: &str,
+) -> Result<serde_json::Value, String> {
     let started = gateway::call(
         "POST",
         "/api/session/login/start",
@@ -894,27 +870,10 @@ async fn start_catpaw(app: &AppHandle, mode: &str) -> Result<serde_json::Value, 
         open_external(app, &auth_url, "CatPaw 官方登录页", &login_state).await
     } else {
         // social_restore 传 false：与小浣熊同理，这项能力只属于 WorkBuddy 的登录页。
-        run_embedded(
-            app,
-            "catpaw",
-            &auth_url,
-            "登录 CatPaw 账号",
-            &login_state,
-            false,
-        )
-        .await
+        run_embedded(app, "catpaw", &auth_url, "登录 CatPaw 账号", &login_state, false).await
     };
-    if result
-        .as_ref()
-        .map(|value| value.get("ok").and_then(serde_json::Value::as_bool))
-        != Ok(Some(true))
-    {
-        let _ = gateway::call(
-            "POST",
-            "/api/session/login/cancel",
-            Some(&json!({ "state": login_state })),
-        )
-        .await;
+    if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
+        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
     }
     clear_active_login(app, &login_state);
     result
@@ -924,20 +883,9 @@ async fn start_catpaw(app: &AppHandle, mode: &str) -> Result<serde_json::Value, 
 fn clear_active_login(app: &AppHandle, expected_state: &str) {
     let state = app.state::<crate::state::AppState>();
     if let Ok(mut guard) = state.login.lock() {
-        if guard
-            .as_ref()
-            .is_some_and(|active| active.state == expected_state)
-        {
+        if guard.as_ref().is_some_and(|active| active.state == expected_state) {
             *guard = None;
-            emit_login_state(
-                app,
-                LoginState {
-                    active: false,
-                    mode: None,
-                    edition: None,
-                    provider: None,
-                },
-            );
+            emit_login_state(app, LoginState { active: false, mode: None, edition: None, provider: None });
         }
     };
 }
@@ -989,9 +937,7 @@ async fn open_external(
             }
         }
     }
-    Err(format!(
-        "已打开系统浏览器完成{edition_label}登录，但等待超时（5 分钟），请重试"
-    ))
+    Err(format!("已打开系统浏览器完成{edition_label}登录，但等待超时（5 分钟），请重试"))
 }
 
 /// 内嵌 WebView 模式：建独立窗口加载登录页，同时轮询后端。
@@ -1147,8 +1093,7 @@ async fn run_embedded(
                 clear_active_login(&handle, &state_for_close);
                 let payload = json!({ "state": state_for_close });
                 tauri::async_runtime::spawn(async move {
-                    let _ =
-                        gateway::call("POST", "/api/session/login/cancel", Some(&payload)).await;
+                    let _ = gateway::call("POST", "/api/session/login/cancel", Some(&payload)).await;
                 });
             }
         }
@@ -1240,10 +1185,7 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
     }
 
     let to_wide = |text: &str| -> Vec<u16> {
-        std::ffi::OsStr::new(text)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+        std::ffi::OsStr::new(text).encode_wide().chain(std::iter::once(0)).collect()
     };
     let operation = to_wide("open");
     let file = to_wide(url);
@@ -1260,9 +1202,7 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
         )
     };
     if result as isize <= 32 {
-        return Err(format!(
-            "打开系统浏览器失败（ShellExecute 返回 {result:?}）"
-        ));
+        return Err(format!("打开系统浏览器失败（ShellExecute 返回 {result:?}）"));
     }
     Ok(())
 }
@@ -1271,11 +1211,7 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
 /// 保留分支是为了 `cargo check` 在其它平台也能过）
 #[cfg(not(windows))]
 pub fn open_in_browser(url: &str) -> Result<(), String> {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     // URL 作为独立 argv 传入，不经过 shell，`&` 不会被解释
     std::process::Command::new(opener)
         .arg(url)

@@ -5,8 +5,9 @@
 //! **凭证已就绪、即将发送之前**发生，按**两层**依次落到副本上：
 //!
 //!   ① **系统提示词层**（`core::prompt`）：按配置的模式（透传 / 替换 / 追加）
-//!      把网关自有提示词写进出站 body；降级期（`core::degrade`）改用最小中性
-//!      提示词。`passthrough` + 未降级时**一个字节都不动**（默认路径）。
+//!      把网关自有提示词写进出站 body；模式与提示词**可按提供商分别配置**
+//!      （`config::KEY_PROMPT_PROVIDERS`），未单独配置的家走全局那一份。
+//!      降级期（`core::degrade`）改用最小中性提示词。`passthrough` + 未降级时**一个字节都不动**（默认路径）。
 //!   ② **指纹脱敏层**（`core::sanitize`）：由全局开关
 //!      `sanitizeBlacklistFingerprints` 决定（快照见
 //!      [`ProviderContext::sanitize_fingerprints`]）：开关关着 → 原样；
@@ -160,21 +161,27 @@ pub(super) fn send_body<'a>(
     // 自己万一命中指纹也会被后一层清掉；反过来的话，「刚换上去的那段提示词」
     // 就没人过一遍了。
     //
+    // 取**哪一份**是按家的（逐家覆盖见 `config::KEY_PROMPT_PROVIDERS`）：本函数
+    // 正是「某一家即将发送之前」那一刻，`provider_id` 就在手上，所以分派不需要
+    // 新的时机，只是把「哪一份」从全局换成这家自己的那一份。
+    //
     // `degraded` = 本请求是否已进入降级（请求开始时状态机已生效，或本次撞了
     // 内容拦截后由转发层置位）：降级期用最小中性提示词（`custom` 模式除外，
-    // 见 `PromptPlan::text_for`）。
-    let after_prompt = match ctx.prompt.apply(ctx.body, degraded) {
+    // 见 `PromptChoice::text_for`）。
+    let prompt = ctx.prompt.for_provider(provider_id);
+    let after_prompt = match prompt.apply(ctx.body, degraded) {
         Some(next) => {
             logging::verbose(
                 "[Upstream]",
                 &format!(
-                    "系统提示词层：{}（{}）messages {} → {}",
-                    ctx.prompt.mode.label(),
-                    if degraded && ctx.prompt.mode.degradable() {
+                    "系统提示词层：{}（{}）provider={} messages {} → {}",
+                    prompt.mode.label(),
+                    if degraded && prompt.mode.degradable() {
                         "降级期：中性提示词"
                     } else {
-                        ctx.prompt.source.label()
+                        prompt.source.label()
                     },
+                    provider_id,
                     message_count(ctx.body),
                     message_count(&next),
                 ),
@@ -208,10 +215,7 @@ pub(super) fn send_body<'a>(
         .to_string();
     if requested.is_empty() {
         // 没有 model 字段：不改写，也没有可用的冷却键（空串，与改造前一致）
-        return SendBody {
-            body,
-            wire_model: requested,
-        };
+        return SendBody { body, wire_model: requested };
     }
     // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
     // （同源，见模块头「思考等级绑定为什么也在这一步」）
@@ -237,10 +241,7 @@ pub(super) fn send_body<'a>(
     // 注入路径已经问过一次适配器，这里再查一次注册表是两次哈希查找，可忽略。
     let upstream_reasoning = injected.or_else(|| outbound_reasoning_of(provider_id, &body));
     ctx.telemetry.note_upstream_reasoning(upstream_reasoning);
-    SendBody {
-        body,
-        wire_model: wire.model,
-    }
+    SendBody { body, wire_model: wire.model }
 }
 
 /// 承载家的 [`ProviderAdapter::outbound_reasoning`]（读发送体里随行的等级）。

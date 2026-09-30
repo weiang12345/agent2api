@@ -38,11 +38,7 @@ impl BillingService {
         let result = match self
             .call_billing(
                 ACTIVITY_BANNER,
-                CallOptions {
-                    session: active.as_ref(),
-                    expect_code_ok: false,
-                    ..Default::default()
-                },
+                CallOptions { session: active.as_ref(), expect_code_ok: false, ..Default::default() },
             )
             .await
         {
@@ -93,9 +89,7 @@ impl BillingService {
         banner.insert(
             "active".to_string(),
             Value::Bool(
-                raw.get("activity_online_status")
-                    .map(js_truthy)
-                    .unwrap_or(false)
+                raw.get("activity_online_status").map(js_truthy).unwrap_or(false)
                     && raw.get("status").and_then(Value::as_str) == Some("None"),
             ),
         );
@@ -146,11 +140,7 @@ impl BillingService {
         let result = match self
             .call_billing(
                 ACTIVITY_AMBASSADOR,
-                CallOptions {
-                    session: active.as_ref(),
-                    expect_code_ok: false,
-                    ..Default::default()
-                },
+                CallOptions { session: active.as_ref(), expect_code_ok: false, ..Default::default() },
             )
             .await
         {
@@ -209,11 +199,7 @@ impl BillingService {
             Err(error) => json!({ "success": false, "code": -1, "msg": error.message }),
         };
         // 额度可能因签到变化，稍等一下再查（对照 Node 的 sleep(500)）
-        if claim
-            .get("success")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        if claim.get("success").and_then(Value::as_bool).unwrap_or(false) {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         let usage = match self.query_credits_summary(Some(&active), locale).await {

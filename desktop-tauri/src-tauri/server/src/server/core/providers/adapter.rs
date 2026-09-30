@@ -135,6 +135,45 @@ pub struct ChatRequestPlan {
     pub headers: Vec<(String, String)>,
     /// 已按 provider 规则改写过的请求体
     pub body: Value,
+    /// 上游**响应**说的是哪套协议（默认 [`UpstreamResponse::Chat`]）
+    pub response: UpstreamResponse,
+}
+
+impl ChatRequestPlan {
+    /// 标准形态：上游说 OpenAI Chat（请求体与响应帧都是 chat 形态）。
+    ///
+    /// 七家内置上游里的六家（以及自定义家）都是这一种；只有 ZCode 的活动套餐
+    /// 通道说 Anthropic（见 [`UpstreamResponse::Anthropic`]）。写成构造器而不是
+    /// 让各家手写字段，是为了「响应协议」这一个新字段不给七处调用点各留一次
+    /// 写错的机会。
+    pub fn chat(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::Chat,
+        }
+    }
+}
+
+/// 上游响应的协议（**请求体与响应必须同源**：这套标记由适配器在构造请求时
+/// 一并给出，编排层只按它选翻译层，不做二次推断）。
+///
+/// ── 为什么需要它 ────────────────────────────────────────────
+/// 本项目的历史前提是「所有上游都说 Chat」（见 `protocol` 的模块头），于是
+/// 无状态转发路径的下行帧一律按 chat SSE 处理。ZCode 的活动套餐通道打破了这个
+/// 前提：它的推理端点是 Anthropic Messages（`stream:true` 时吐 Anthropic 事件
+/// 流）。与其为一家新写一条「适配器自己转发」的路（那会丢掉账号轮换、限额冷却、
+/// 退避重试、usage 与取消处理，见 `upstream::provider_loop` 的有状态路径说明），
+/// 不如把「响应要说另一种协议」做成计划里的一个字段 —— 编排层只多一次分支，
+/// 其余全都共用。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UpstreamResponse {
+    /// OpenAI Chat SSE（默认）
+    #[default]
+    Chat,
+    /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
+    Anthropic,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -876,12 +915,11 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 参数化，见 `autoclaw::adapter` 与 `autoclaw::region` 的模块头）
         ProviderKind::AutoClawIntl => &super::autoclaw::AUTOCLAW_INTL_ADAPTER,
         ProviderKind::Qoder => &super::qoder::QODER_ADAPTER,
+        ProviderKind::CodeArts => &super::codearts::CODEARTS_ADAPTER,
         // Cline 的两个额度池是两个 provider、两个实例（同一份实现的按池
         // 参数化，见 `cline::adapter` 的模块头）
         ProviderKind::ClineFree => &super::cline::CLINE_FREE_ADAPTER,
         ProviderKind::ClinePass => &super::cline::CLINE_PASS_ADAPTER,
-        ProviderKind::AtmCode => &super::atomcode::ATMCODE_ADAPTER,
-        ProviderKind::Trae => &super::trae::TRAE_ADAPTER,
         // Accio 的两个地区是两个 provider、两个实例（同一份实现的按地区
         // 参数化，见 `accio::endpoints::Region` 与 `accio::mod` 的模块头）
         ProviderKind::Accio => &super::accio::ACCIO_ADAPTER,
@@ -890,6 +928,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 见 `zcode::adapter` 与 `zcode::region` 的模块头）
         ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
         ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
+        ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
     }
 }
 
@@ -933,8 +972,6 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::Qoder,
         ProviderKind::ClineFree,
         ProviderKind::ClinePass,
-        ProviderKind::AtmCode,
-        ProviderKind::Trae,
         // Accio 的两个地区各算一家（同一份实现、两套账号与目录缓存）
         ProviderKind::Accio,
         ProviderKind::AccioCn,
@@ -945,6 +982,14 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 本列表回答的是「这家接线了没有」，不是「这家的目录能不能远程刷」。
         ProviderKind::Zcode,
         ProviderKind::ZcodeIntl,
+        // CodeArts 在本列表里 = 适配器已接线（登录 / 凭据 / 目录 / 转发 / 余额
+        // / 每日福利）、可参与目录刷新调度。
+        ProviderKind::CodeArts,
+        // Trae 已接真身（登录 / 凭据 / 目录 / 转发），并且**真有**远程目录
+        // （`supports_model_refresh()` 为 true），所以它必须在本列表里 ——
+        // 不在的话刷新循环根本不会问它，症状是"界面上点了刷新、日志里
+        // 一句 trae 都没有"（与"刷了但没取到"是两种完全不同的故障）。
+        ProviderKind::Trae,
     ]
 }
 

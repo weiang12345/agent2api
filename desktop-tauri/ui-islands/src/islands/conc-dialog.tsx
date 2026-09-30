@@ -12,6 +12,8 @@ import {
   Input,
   Label,
 } from '@ui'
+import { providerFeatures, providerOf } from './accounts-domain'
+import type { AccountRecord } from './accounts-shared'
 
 /**
  * 账号「并发上限」编辑弹窗。
@@ -28,13 +30,14 @@ import {
  * React root，关闭时 unmount 并摘掉宿主，不留常驻节点。
  */
 
-/** 账号公开形态里本弹窗用到的字段（其余字段不关心） */
-type Account = {
-  id: string
-  name?: string
-  nickname?: string
-  maxConcurrent?: number
-}
+/**
+ * 账号公开形态里本弹窗用到的字段（其余字段不关心）。
+ *
+ * 直接复用 `AccountRecord` 而不是这里另写一份窄类型：能力表的读法（下面按
+ * `concurrencyDefault` 分岔那句）要走 `providerOf(account)`，而那个函数的入参
+ * 就是这个类型 —— 窄类型要么过不了类型检查，要么逼出一处 cast。
+ */
+type Account = AccountRecord
 
 /** 与后端 apply_patch 的封顶值一致（store_crud 的 MAX_CONCURRENT_LIMIT） */
 const MAX_LIMIT = 999
@@ -50,6 +53,16 @@ function ConcDialog({ account, onClose }: ConcDialogProps) {
   const [saving, setSaving] = React.useState(false)
   const [hint, setHint] = React.useState('')
   const name = account.nickname || account.name || account.id
+
+  /**
+   * ── 「0 = 不限」这一句要按家分岔 ────────────────────────────
+   * CodeArts 的 3 是**上游硬顶**（超过它上游直接回 HTTP 400，且那是账号级冲突、
+   * 不会降级换号），所以那一家把 0 解释成「按默认 3」而不是「不限制」，后端公开
+   * 形态也会把一个没配过的账号报成 3（见 `to_codearts_public_account`）。
+   * 这条知识放在能力表的 `concurrencyDefault` 里（>0 = 本家没有「不限」这一档），
+   * 这里只读不说死 provider id —— 再加一家有同样约束的提供商，改的是能力表。
+   */
+  const floor = Number(providerFeatures(providerOf(account)).concurrencyDefault) || 0
 
   /**
    * 保存：PATCH `/api/accounts/{id}` 只带 `maxConcurrent` 一个字段（后端 apply_patch
@@ -106,8 +119,17 @@ function ConcDialog({ account, onClose }: ConcDialogProps) {
               />
             </div>
             <p>
-              该账号同时最多处理的请求数，0 表示不限制。达到上限的账号会跳过，请求转给其他账号；
-              全部账号都达上限时按余量挤占。
+              {floor > 0 ? (
+                <>
+                  该账号同时最多处理的请求数。本家受上游硬顶约束，<strong>0 表示按默认 {floor}</strong>，
+                  不是不限制。达到上限的账号会跳过，请求转给其他账号；全部账号都达上限时按余量挤占。
+                </>
+              ) : (
+                <>
+                  该账号同时最多处理的请求数，0 表示不限制。达到上限的账号会跳过，请求转给其他账号；
+                  全部账号都达上限时按余量挤占。
+                </>
+              )}
             </p>
           </DialogSection>
         </DialogBody>

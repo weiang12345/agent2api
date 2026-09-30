@@ -83,18 +83,18 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
-use crate::server::core::providers::content_block;
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
-use super::catalog;
 use super::credentials::{self, AutoClawCredentials, CredentialOrigin};
 use super::models;
 use super::refresh;
+use super::catalog;
 use super::region::Region;
 
 /// 客户端版本号（源实现 `createUpstreamClient` 的 `desktopAppVersion` 默认值；
@@ -137,9 +137,7 @@ pub struct AutoClawAdapter {
 /// 国内版实例（provider id `autoclaw`）
 pub static AUTOCLAW_ADAPTER: AutoClawAdapter = AutoClawAdapter { region: Region::Cn };
 /// 国际版实例（provider id `autoclaw-intl`）
-pub static AUTOCLAW_INTL_ADAPTER: AutoClawAdapter = AutoClawAdapter {
-    region: Region::Intl,
-};
+pub static AUTOCLAW_INTL_ADAPTER: AutoClawAdapter = AutoClawAdapter { region: Region::Intl };
 
 impl ProviderAdapter for AutoClawAdapter {
     fn kind(&self) -> ProviderKind {
@@ -212,10 +210,7 @@ impl ProviderAdapter for AutoClawAdapter {
         headers.extend(passthrough_session_headers(client_headers));
         let mut out_body = body.clone();
         if let Some(object) = out_body.as_object_mut() {
-            object.insert(
-                "model".to_string(),
-                Value::String(route.body_model_id.clone()),
-            );
+            object.insert("model".to_string(), Value::String(route.body_model_id.clone()));
         }
         // system 提示词规范化（上游白名单：身份前缀 + 外来身份句改写）。
         // 放在 model 改写之后、返回之前 —— 这里是「即将发出去的字节」的最后一道
@@ -223,14 +218,14 @@ impl ProviderAdapter for AutoClawAdapter {
         super::prompt::normalize(&mut out_body);
         // body 不是对象时原样透传（chat.rs 已保证是对象；这里的兜底只为不 panic，
         // 上游会自己报格式错误 —— 比在网关里编一个空对象更能说明问题）
-        Ok(ChatRequestPlan {
-            url: format!(
+        Ok(ChatRequestPlan::chat(
+            format!(
                 "{}/chat/completions",
                 credentials::upstream_base_url(self.region)
             ),
             headers,
-            body: out_body,
-        })
+            out_body,
+        ))
     }
 
     /// 上游错误分类（判定依据见下，逐条对照源实现 `forwardModelRequest`）：
@@ -371,7 +366,9 @@ impl ProviderAdapter for AutoClawAdapter {
         store: &'a AccountStore,
         account_id: &'a str,
         force: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
+    > {
         Box::pin(async move {
             // `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条账号
             // （resolve_credentials 按 id 直取；取不到时它自己给 401 文案，
@@ -500,9 +497,12 @@ impl ProviderAdapter for AutoClawAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
-    {
-        Box::pin(async move { super::balance::query_usage(self.region, store, account_id).await })
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            super::balance::query_usage(self.region, store, account_id).await
+        })
     }
 }
 

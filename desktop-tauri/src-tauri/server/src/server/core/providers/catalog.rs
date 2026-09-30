@@ -37,9 +37,7 @@ fn manifest_for(kind: ProviderKind) -> Vec<Value> {
     for item in model_rules::custom_models_for(kind_id(kind)) {
         let id = model_id(&item);
         if !id.is_empty()
-            && !models
-                .iter()
-                .any(|existing| model_id(existing).eq_ignore_ascii_case(&id))
+            && !models.iter().any(|existing| model_id(existing).eq_ignore_ascii_case(&id))
         {
             models.push(item);
         }
@@ -85,6 +83,10 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
                 || super::qoder::models::remote_refreshed(super::qoder::endpoints::Region::Cn),
             super::qoder::models::last_refreshed_at(),
         ),
+        ProviderKind::CodeArts => (
+            super::codearts::models::remote_refreshed(),
+            super::codearts::models::last_refreshed_at(),
+        ),
         ProviderKind::CatPaw => (
             !super::catpaw::catalog::remote_models().is_empty(),
             super::catpaw::catalog::last_refreshed_at(),
@@ -94,14 +96,6 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
         ProviderKind::ClineFree | ProviderKind::ClinePass => (
             super::cline::models::remote_refreshed(),
             super::cline::models::last_refreshed_at(),
-        ),
-        ProviderKind::AtmCode => (
-            super::atomcode::models::remote_refreshed(),
-            super::atomcode::models::last_refreshed_at(),
-        ),
-        ProviderKind::Trae => (
-            super::trae::models::remote_refreshed(),
-            super::trae::models::last_refreshed_at(),
         ),
         // Accio 两个地区各有自己的目录缓存（上游按 `x-package-region` 给清单）：
         // 两家任一刷过就算「有远程来源」，时间取两者里更近的那次
@@ -118,14 +112,18 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
         // 这里如实回 `(false, 0)` 而不是编一个时间 —— 界面的「来源」列会显示成
         // 内置清单，与事实相符。
         ProviderKind::Zcode | ProviderKind::ZcodeIntl => (false, 0),
+        // Trae 只有一张表（SOLO 通道），刷过就是远程来源；没刷到时是**空清单**
+        // 而不是静态兜底 —— 目录由 `X-Ide-Version-Code` 决定给哪张表，抄成
+        // 常量就是把一个时间点的读数当契约（见 `trae::models` 模块头）。
+        ProviderKind::Trae => (
+            super::trae::models::remote_refreshed(),
+            super::trae::models::last_refreshed_at(),
+        ),
     }
 }
 
 fn all_kinds() -> Vec<ProviderKind> {
-    PROVIDERS
-        .iter()
-        .filter_map(|meta| kind_from_id(meta.id))
-        .collect()
+    PROVIDERS.iter().filter_map(|meta| kind_from_id(meta.id)).collect()
 }
 
 pub fn provider_available(store: &AccountStore, kind: ProviderKind) -> bool {
@@ -152,12 +150,6 @@ fn aggregate_source(active: &[(ProviderKind, Vec<Value>)]) -> (&'static str, i64
             (if remote { "remote" } else { "builtin" }, refreshed_at)
         }
         [] => ("none", 0),
-        _ => (
-            "aggregate",
-            active
-                .first()
-                .map(|(kind, _)| refresh_meta(*kind).1)
-                .unwrap_or(0),
-        ),
+        _ => ("aggregate", active.first().map(|(kind, _)| refresh_meta(*kind).1).unwrap_or(0)),
     }
 }

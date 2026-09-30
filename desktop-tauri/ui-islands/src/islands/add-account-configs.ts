@@ -23,6 +23,14 @@ export type FieldSpec = {
   optional?: boolean
   rows?: number
   placeholder: string
+  /**
+   * 整段是一个 JSON（CodeArts 的凭据就是这么落到用户手上的），提交时**逐键并进
+   * 请求体**、原始那串文本不留。为什么在前端展开而不是把整串交给后端：
+   * `POST /api/accounts` 的各家分派读的是平铺字段（`Credential::from_payload`
+   * 认「带外层包装」与「铺平」两种形状，但不认「一个字符串里装着 JSON」），
+   * 让后端再多一种形状 = 给所有家共用的路径加一个只有一家走到的分支。
+   */
+  jsonExpand?: boolean
 }
 
 export type RegionOption = { value: string; label: string }
@@ -265,58 +273,6 @@ function clineForm(spec: { provider: string; label: string; poolNote: string }):
   }
 }
 
-/** AtomCode：云直连，凭证来自 AtomGit OAuth，不依赖本地客户端。 */
-const ATMCODE: ProviderConfig = {
-  provider: 'atomcode',
-  label: 'AtomCode',
-  desktop: false,
-  webLogin: {
-    noteHtml: '打开 AtomCode 授权页并完成登录，网关会自动取回 OAuth 凭证、领取 CodingPlan 并同步模型目录。'
-      + '全程不需要本地 AtomCode 客户端。',
-    button: '打开 AtomCode 授权页',
-    busyText: '等待 AtomCode 授权完成…',
-    modes: [
-      { value: 'embedded', label: '内嵌窗口（推荐）', hint: '将打开 AtomGit 授权页，确认后自动加入账号列表。关掉窗口即取消等待' },
-      { value: 'external', label: '系统浏览器', hint: '将用系统默认浏览器打开 AtomGit 授权页（会复用浏览器里已登录的 AtomGit 账号）；确认后自动加入账号列表' },
-    ],
-  },
-  manualTitle: '填写 OAuth 凭证',
-  manualNote: '优先使用上方网页登录。这里仅用于恢复已有账号：需要 AtomCode OAuth 的 accessToken、refreshToken 与 userId，三者缺一不可。',
-  fields: [
-    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: '粘贴 AtomCode OAuth access token' },
-    { key: 'refreshToken', label: 'refreshToken', rows: 2, placeholder: '粘贴 AtomCode OAuth refresh token' },
-    { key: 'userId', label: 'userId', placeholder: 'AtomGit 用户 ID' },
-    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空使用 AtomGit 昵称' },
-  ],
-}
-
-/** Trae SOLO 国内版：云直连，凭证来自 Trae OAuth。 */
-const TRAE: ProviderConfig = {
-  provider: 'trae',
-  label: 'Trae',
-  desktop: false,
-  webLogin: {
-    noteHtml: '打开 Trae 授权页并完成登录，网关会自动取回凭证并保存账号。'
-      + '当前接入的是国内版 Trae SOLO，不需要本地 Trae 客户端。',
-    button: '打开 Trae 授权页',
-    busyText: '等待 Trae 授权完成…',
-    modes: [
-      { value: 'embedded', label: '内嵌窗口（推荐）', hint: '将打开 Trae 授权页，确认后自动加入账号列表。关掉窗口即取消等待' },
-      { value: 'external', label: '系统浏览器', hint: '将用系统默认浏览器打开 Trae 授权页；确认后自动加入账号列表' },
-    ],
-  },
-  manualTitle: '填写 OAuth 凭证',
-  manualNote: '优先使用上方网页登录。这里仅用于恢复已有账号：需要 accessToken、refreshToken、userId、machineId、deviceId。',
-  fields: [
-    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: '粘贴 Trae access token' },
-    { key: 'refreshToken', label: 'refreshToken', rows: 2, placeholder: '粘贴 Trae refresh token' },
-    { key: 'userId', label: 'userId', placeholder: 'Trae 用户 ID' },
-    { key: 'machineId', label: 'machineId', placeholder: '登录时生成的 machineId' },
-    { key: 'deviceId', label: 'deviceId', placeholder: '登录时生成的 deviceId' },
-    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空使用 Trae 昵称' },
-  ],
-}
-
 /**
  * Accio 两个地区（国际版 / 国内版）：同一个网关、同一套接口，只有登录站点与
  * x-package-region 头不同。地区不是账号的字段而是身份，因此输出两份配置。
@@ -380,8 +336,9 @@ function zcodeForm(spec: { provider: string; label: string; site: string; planNo
     manualTitle: '填写凭证',
     manualNoteHtml: '本家有两个**互不替代**的凭证，按你要用的功能填，至少填一个：'
       + '<b>编码套餐 API Key</b> 用于转发推理（打 <code>' + site + '</code>）；'
-      + '<b>jwt</b> 用于领取套餐（打 <code>zcode.z.ai</code>，官方叫 Coding Plan JWT，'
-      + '是一串三段点分的字符串）。只填 jwt 的账号能领套餐但不能转发，反之亦然。'
+      + '<b>jwt</b> 用于领取套餐与查询余额（打 <code>zcode.z.ai</code> 的 billing 网关，'
+      + '官方叫 Coding Plan JWT，是一串三段点分的字符串）。只填 jwt 的账号能领套餐、'
+      + '能看余额但不能转发，反之亦然。'
       + `请填写 <b>${label}</b>账号的凭证 —— ${planNote}`
       + '（最容易拿到的办法：直接用上方的「网页登录」—— 它会替你把这个 API Key 换好，两个凭证一起拿到。）',
     fields: [
@@ -394,11 +351,144 @@ function zcodeForm(spec: { provider: string; label: string; site: string; planNo
         // 校验并回 401。官方客户端与「网页登录」这条链都是先换成编码套餐 API Key 再用。
         placeholder: '用于转发；形如 apiKey.secret 两段点分（不填则这个账号不能转发）',
       },
-      { key: 'jwt', label: 'Coding Plan JWT', inputKey: 'jwt', rows: 3, optional: true, placeholder: '用于领取套餐；不填则这个账号不能领取' },
+      { key: 'jwt', label: 'Coding Plan JWT', inputKey: 'jwt', rows: 3, optional: true, placeholder: '用于领取套餐与查询余额；不填则这个账号不能领取与查余额' },
       { key: 'userId', label: '用户 ID', optional: true, placeholder: '可选；用于生成账号 id 与展示名' },
       { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空自动生成' },
     ],
   }
+}
+
+/**
+ * CodeArts（华为云 AI 代码助手 / snap-access）。
+ *
+ * ── 网页登录（OAuth 授权码 + PKCE）────────────────────────
+ * 授权地址由网关拼（`providers::codearts::oauth::authorize_url`，参数与官方扩展
+ * 逐字对过向量），portal 完成后把浏览器送回**网关自己的端口**上的
+ * `http://127.0.0.1:<port>/oauth/callback` —— 路径不是我们能挑的：portal 只认授权
+ * 地址里给的 `port`。所以浏览器与网关在同一台机器时两次回调（先 secret+redirect、
+ * 再 code）都能落地；不在同一台时浏览器跳的是它自己的 127.0.0.1，到不了网关。
+ * 那种部署（网关跑在 NAS / 服务器上）的用法写在下面的提示里，两条通道都通：
+ *   · 地址栏里那条 localhost 地址**改成网关地址**再回车 —— 带 `code` 就直接落账；
+ *   · 只带 `secret` 时网关会转去走 ticket 轮询通道，代价是**拿不到 refresh token**
+ *     （约一小时后要重新登录一次），界面上这句提示是照实说的。
+ *
+ * ── 凭据为什么是一整块、且只有一个 JSON 框 ──────────────────
+ * CodeArts 的凭据是一次 OAuth/PKCE 登录换来的**临时三元组**（AK/SK/STS，实测约
+ * 一小时到期），续期还要出示**当初那次登录的 PKCE verifier 与 DPoP 私钥**，
+ * 所以少搬一半到期就刷不回来。而用户手上这份数据的**原生形状就是一段 JSON**
+ * （官方插件写 `codearts_provider_credential`、CLIProxyAPI 的 auth 文件整份包在
+ * 里面）：拆成六个框会把「粘哪一格」变成六次出错机会，`oauth_context` 本身还是
+ * 嵌套对象、框里塞不下。因此一个框整份粘，由 `jsonExpand` 解析后铺开。
+ */
+const CODEARTS: ProviderConfig = {
+  provider: 'codearts',
+  label: 'CodeArts',
+  // 本家**没有**「读本机客户端登录态」这条后端路径（凭据只能靠网页登录或粘贴）。
+  // 不显式关掉的话，桌面壳里会出现一个选了之后什么都没有的分段：chip 只看
+  // `desktop !== false`，而下面的 desktopNote 缺席就返回空串。
+  // 浏览器面板看不到这个洞（platform()==='web' 时整段收起），只有 App 里会露。
+  desktop: false,
+  webLogin: {
+    noteHtml: '打开华为云 CodeArts 的官方授权页登录：登录完成后官方页面会把浏览器带回<b>网关自己的</b> '
+      + '<code>/oauth/callback</code>，网关用一次性授权码换取临时凭据并加入账号列表。'
+      + '<br>网关跑在另一台机器上时（NAS / 服务器），浏览器跳的是它自己的 127.0.0.1 —— '
+      + '把地址栏里那条地址的主机端口改成网关的（如 <code>http://192.168.1.58:3065/oauth/callback?…</code>）再回车即可。',
+    button: '打开 CodeArts 授权页',
+    busyText: '等待 CodeArts 登录完成…',
+    modes: [
+      {
+        value: 'embedded',
+        label: '内嵌窗口（推荐）',
+        hint: '将打开内嵌窗口；登录完成后自动加入账号列表。关掉窗口即取消等待',
+      },
+      {
+        value: 'external',
+        label: '系统浏览器',
+        hint: '将用系统默认浏览器打开授权页（会复用浏览器里已登录的华为云账号）；'
+          + '浏览器与网关不在同一台机器时，按上方说明把回调地址改成网关地址再走一遍',
+      },
+    ],
+  },
+  manualTitle: '粘贴登录凭据',
+  manualNoteHtml: '整份粘贴官方插件 / CLIProxyAPI 落盘的凭据 JSON（形如 '
+    + '<code>{"codearts_provider_credential":{…}}</code>，铺平的也行）。'
+    + '<br>必填：<code>access_key_id</code>、<code>secret_access_key</code>、<code>security_token</code>。'
+    + '<b>要能自动续期，必须连 <code>refresh_token</code> 与 <code>oauth_context</code> 一起粘</b>'
+    + ' —— 临时凭据约一小时到期，缺这半块就续不回来，只能重新登录。',
+  fields: [
+    {
+      key: 'credentialJson',
+      label: '凭据 JSON',
+      rows: 8,
+      // 解析后按字段铺开进请求体（后端 `Credential::from_payload` 嵌套/平铺都认）
+      jsonExpand: true,
+      placeholder: '{"codearts_provider_credential":{"access_key_id":"HSTA…","secret_access_key":"…",'
+        + '"security_token":"…","expires_at":"2026-09-27T16:17:00.327Z","domain_id":"…","user_id":"…",'
+        + '"user_name":"…","refresh_token":"eyJ…","oauth_context":{…}}}',
+    },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空使用凭据里的 user_name' },
+  ],
+}
+
+/**
+ * Trae（字节 AI IDE 的 SOLO 通道）。
+ *
+ * ── 为什么只有一张卡、没有「地区」下拉 ──────────────────────
+ * AutoClaw / Accio / ZCode 的两地是**同一套协议换域名**，所以按地区参数化。
+ * Trae 不是：国内 SOLO 走 `trae-api-cn.mchost.guru` 的 `llm_utils_chat`
+ * （自定义信封 + 一套自己的 SSE 方言），国际版走 `chat_sessions` → `events`
+ * 两步握手、另一个 Origin、流是累积式要还原增量 —— 那是**两套协议**而不是一个
+ * 地区的两种拼法。把 `region` 做成这一家的字段，等于让"用哪套协议解释这个账号"
+ * 变成账号属性（本仓反复拒绝的那类坑）。国际版将来接入时另立 provider id。
+ *
+ * ── 为什么回调必须落在本机 ────────────────────────────────
+ * 上游对回调地址是**逐字正则校验**的（`^http://127.0.0.1:<port>/authorize$`），
+ * 且回调里**没有 state** —— 一轮登录只能靠端口认回来。所以浏览器必须与网关同机；
+ * 容器 / 远程部署形态收不到回调，只能在有浏览器的机器上登录后走粘贴那条路。
+ */
+const TRAE: ProviderConfig = {
+  provider: 'trae',
+  label: 'Trae',
+  // Trae 桌面端的登录态在它自己的加密存储里（与 Accio / ZCode 同一处境），
+  // 没有 auth.json 那种稳定可读的形态 —— 给了入口只会稳定失败。
+  desktop: false,
+  webLogin: {
+    noteHtml: '打开 <b>Trae SOLO</b> 的官方授权页（<code>trae.cn</code>）并用你的 Trae 账号登录：'
+      + '授权完成后官方页面会跳回<b>本机</b>的一个临时端口，网关自动用一次性授权码换取凭证并加入账号列表'
+      + '（授权码只在本机传给网关，界面不显示明文 token）。',
+    button: '打开 Trae 授权页',
+    busyText: '等待 Trae 授权完成…',
+    modes: [
+      {
+        value: 'embedded',
+        label: '内嵌窗口（推荐）',
+        hint: '将打开内嵌窗口；授权完成后自动加入账号列表。关掉窗口即取消等待。'
+          + '链接 5 分钟内有效，超时或未点就会作废（可重新发起）',
+      },
+      {
+        value: 'external',
+        label: '系统浏览器',
+        hint: '将用系统默认浏览器打开授权页（会复用浏览器里已登录的 Trae 账号）；'
+          + '完成后自动加入账号列表。<b>浏览器必须与网关在同一台机器上</b>'
+          + '（回调地址被上游钉成 127.0.0.1 的一个本机端口）',
+      },
+    ],
+  },
+  manualTitle: '填写凭证',
+  manualNoteHtml: 'accessToken 是 Trae 的 <code>Cloud-IDE-JWT</code>（三段点分），refreshToken 用于到期自动续期'
+    + '（本家 <b>refreshToken 一次一换</b>：换发一次旧的即作废，所以两份程序别同时刷同一个账号）。'
+    + '<br>手工粘贴时请连 <b>machineId / deviceId</b> 一起填：上游把它们与登录时上传的设备公钥绑在一起判设备，'
+    + '凭空换一对会撞 <code>2xxxx</code> 那族设备绑定拒绝。'
+    + '<br>没有这三样时的正路是用上方的「网页登录」；容器 / 远程部署形态本机收不到回调，'
+    + '只能在有浏览器的机器上登录后把凭据粘进来。',
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: 'Cloud-IDE-JWT（三段点分）' },
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: '可选；填了才能到期自动续期' },
+    { key: 'uid', label: '用户 ID', optional: true, placeholder: '可选；用于去重与展示名（留空时网关会问一次上游）' },
+    { key: 'machineId', label: 'machineId', optional: true, placeholder: '可选；UUID 形态，与凭据同生共死' },
+    { key: 'deviceId', label: 'deviceId', optional: true, placeholder: '可选；纯数字串（上游只收 8–24 位数字）' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空自动用昵称' },
+  ],
 }
 
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
@@ -411,14 +501,17 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // Cline 顺序即界面上「提供商」分段的顺序：免费池在前（无门槛，更常用）
   clineForm({ provider: 'cline-free', label: 'Cline Free', poolNote: '（免费额度池，模型名带 cline-free/ 前缀）。' }),
   clineForm({ provider: 'cline-pass', label: 'Cline Pass', poolNote: '（订阅池，模型名带 cline-pass/ 前缀，需要账号有对应订阅）。' }),
-  ATMCODE,
-  TRAE,
   // Accio 顺序：国际版在前（默认安装的版本）
   accioForm({ provider: 'accio', label: '国际版', site: 'www.accio.com', siteNote: '国际版与国内版是**两套独立的账号**（同一账号体系的两个站点），凭证不通用。' }),
   accioForm({ provider: 'accio-cn', label: '国内版', site: 'www.accio-ai.com', siteNote: '国内版的登录站点是 www.accio-ai.com，与国际版不是同一站。' }),
   // ZCode 顺序：国内版在前（国内网络环境下更常被添加的那个，与后端注册表 PROVIDERS 的排列一致）
   zcodeForm({ provider: 'zcode', label: '国内版', site: 'open.bigmodel.cn', planNote: '国内版与**国际版是两套独立的账号与套餐**，凭证与领取的套餐都不通用。' }),
   zcodeForm({ provider: 'zcode-intl', label: '国际版', site: 'api.z.ai', planNote: '国际版的推理站点是 api.z.ai，与国内版不是同一站；套餐也各自独立。' }),
+  // CodeArts（华为云 AI 代码助手）：一家一个 provider，没有地区/额度池之分
+  // （region 写死 cn-north-4，与 token 签发地必须一致）。
+  CODEARTS,
+  // Trae 只有 SOLO 那一家（没有地区分叉，理由见 TRAE 上方那段）
+  TRAE,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

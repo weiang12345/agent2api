@@ -118,7 +118,7 @@ pub fn models_by_provider(store: &AccountStore) -> Value {
 ///
 /// ── 能力位（`capabilities` / `capOverrides`）─────────────────
 /// 每行带两个能力字段（管理页的「上下文 / 输出」与「能力」两列读它们）：
-///   · `capabilities`：**生效值**（清单原值 + 用户覆盖，五项齐全，
+///   · `capabilities`：**生效值**（清单原值 + 用户覆盖，六项齐全，
 ///     `null` = 未声明 —— 与「不支持 / 0」区分开，用户编辑时要靠它分辨
 ///     「不知道」与「明确不支持」）；
 ///   · `capOverrides`：被用户覆盖的键（管理页据此给「已改」标记；

@@ -625,7 +625,7 @@ export async function writeRemoveModel(provider: string, id: string): Promise<un
  *   · 内置家：`POST /api/models/capabilities`（覆盖层落在 `modelRules.capabilities`，
  *     清单出口统一应用，见后端 `model_rules` 的「能力位覆盖」）。
  *
- * `capabilities` 是**全量五键**（弹窗一次提交全部）：`null` = 恢复继承 / 清除、
+ * `capabilities` 是**全量六键**（弹窗一次提交全部）：`null` = 恢复继承 / 清除、
  * 有值 = 覆盖 —— 与后端那条接口的三态协议同源。
  */
 export async function writeCapabilities(

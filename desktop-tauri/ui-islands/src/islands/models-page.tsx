@@ -366,7 +366,7 @@ function ModelsPage() {
   }
 
   /**
-   * 「能力」列：三枚布尔徽章（工具 / 图片 / 思考），三态各有一副样式 ——
+   * 「能力」列：四枚布尔徽章（工具 / 图片 / 视频 / 思考），三态各有一副样式 ——
    * 支持（实心）/ 明确不支持（压淡）/ 未声明（虚线）。悬停出完整文案
    * （`capabilityTip` 会写明「上游未声明时下游按不支持处理」这类事实）。
    */
@@ -375,7 +375,7 @@ function ModelsPage() {
     const overrides = normalizeOverrides(model.capOverrides)
     return (
       <button type='button' className='caps-open caps-badges'
-        title='对下游声明的能力（工具调用 / 图片识别 / 支持思考）—— 点击修改'
+        title='对下游声明的能力（工具调用 / 图片识别 / 视频识别 / 支持思考）—— 点击修改'
         onClick={() => openCapability(model.provider || '', model.id)}>
         {BOOLEAN_KEYS.map(key => {
           const value = caps[key] ?? null

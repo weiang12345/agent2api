@@ -135,7 +135,10 @@ impl UpdateManager {
         let key = self.check_key();
         let interval = config::scheduled_settings().update_check.interval * 60_000;
         let started = logging::now_ms();
-        let guard = match task_state::claim(&key, interval, manual, MIN_CHECK_GAP_MS)
+        // 手动检查仍受失败冷却约束（ManualBackoff::Respect）：这里的冷却记的是
+        // GitHub 配额桶的恢复时刻，提前打只会再吃一次 403。换令牌 / 换线路那条
+        // 口子走 clear_check_cooldown（见上）。
+        let guard = match task_state::claim(&key, interval, manual, task_state::ManualBackoff::Respect, MIN_CHECK_GAP_MS)
             .map_err(|error| UpdateError::new(error))?
         {
             Claim::Acquired(guard) => guard,

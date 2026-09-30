@@ -106,7 +106,8 @@ impl ZcodeCredentials {
 /// `expiresAt` 一律是毫秒（与 workbuddy / qoder 同口径），混用会让时间
 /// 显示成 1970 年。
 pub fn expires_at_ms(credentials: &ZcodeCredentials) -> Option<f64> {
-    jwt_expires_at_ms(&credentials.access_token).or_else(|| jwt_expires_at_ms(&credentials.jwt))
+    jwt_expires_at_ms(&credentials.access_token)
+        .or_else(|| jwt_expires_at_ms(&credentials.jwt))
 }
 
 /// 解一个 JWT 的 payload 段取 `exp`（秒 → 毫秒）。解不出返回 None。
@@ -122,7 +123,9 @@ fn jwt_expires_at_ms(token: &str) -> Option<f64> {
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
         normalized,
     )
-    .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, normalized))
+    .or_else(|_| {
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, normalized)
+    })
     .ok()?;
     let value: Value = serde_json::from_slice(&decoded).ok()?;
     let exp = value.get("exp").and_then(Value::as_f64)?;
@@ -141,6 +144,16 @@ fn jwt_expires_at_ms(token: &str) -> Option<f64> {
 /// 取不到随机数时返回 None 而不是 panic —— 调用方可以退回「不带该头」，
 /// 那虽然会命中 3001，但比整个进程 abort 好（release 是 `panic=abort`）。
 pub fn new_device_mid() -> Option<String> {
+    new_uuid()
+}
+
+/// 生成一个 UUID v4 形态的随机串。
+///
+/// 与 [`new_device_mid`] 同一个生成口径，只是用途不同：设备标识要**长期稳定**
+/// （生成一次落盘、之后一直用它），而活动套餐通道的追踪头（`x-request-id` /
+/// `x-zcode-trace-id`，见 `plan.rs`）要**每条请求都不同** —— 官方客户端在这
+/// 两处发的都是 `crypto.randomUUID()`。
+pub fn new_uuid() -> Option<String> {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes).ok()?;
     // 版本位（v4）与变体位（RFC 4122）

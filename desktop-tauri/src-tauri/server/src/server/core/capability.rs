@@ -1,12 +1,13 @@
-//! 模型能力位的共享知识：五个键名、值的归一，以及把覆盖写进目录条目。
+//! 模型能力位的共享知识：六个键名、值的归一，以及把覆盖写进目录条目。
 //!
-//! ── 这五个键是什么 ──────────────────────────────────────────
+//! ── 这六个键是什么 ──────────────────────────────────────────
 //! 它们是 `list_item`（`/v1/models` 的条目）向**下游客户端**声明的那组字段：
 //!
 //!   maxInputTokens     上下文窗口（客户端按它估算截断）
 //!   maxOutputTokens    单次回复的输出上限
 //!   supportsToolCall   支持工具调用
 //!   supportsImages     支持图片输入
+//!   supportsVideo      支持视频输入
 //!   supportsReasoning  支持思考
 //!
 //! 值来自各家的目录清单（代码里的静态表 / 上游远程目录）。**它们可以是错的**
@@ -27,13 +28,14 @@
 
 use serde_json::{Map, Value};
 
-/// 五个能力键。顺序即管理页弹窗字段与能力徽章的展示顺序（前端按同一顺序
+/// 六个能力键。顺序即管理页弹窗字段与能力徽章的展示顺序（前端按同一顺序
 /// 渲染，`overridden_keys` 也按它排）。
-pub const KEYS: [&str; 5] = [
+pub const KEYS: [&str; 6] = [
     "maxInputTokens",
     "maxOutputTokens",
     "supportsToolCall",
     "supportsImages",
+    "supportsVideo",
     "supportsReasoning",
 ];
 
@@ -49,7 +51,10 @@ pub fn is_token_key(key: &str) -> bool {
 
 /// 该键是不是布尔能力键。
 pub fn is_bool_key(key: &str) -> bool {
-    key == "supportsToolCall" || key == "supportsImages" || key == "supportsReasoning"
+    key == "supportsToolCall"
+        || key == "supportsImages"
+        || key == "supportsVideo"
+        || key == "supportsReasoning"
 }
 
 /// 单值归一：token 键收正整数（浮点写法取整，如 `200000.0`），布尔键收 bool；
@@ -98,7 +103,7 @@ pub fn apply_overrides(item: &mut Value, overrides: &Map<String, Value>) {
     }
 }
 
-/// 条目的生效能力：五个键齐全，**未声明给 null**。
+/// 条目的生效能力：六个键齐全，**未声明给 null**。
 ///
 /// 与 `list_item` 的输出刻意不同：那里布尔缺键回落 `false`（下游需求如此），
 /// 而管理页要区分「不支持」与「不知道」—— 否则用户编辑时会把「未声明」当成

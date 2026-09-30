@@ -84,6 +84,17 @@ pub fn supports_checkin(account: &Value) -> bool {
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    // CodeArts 与 Trae 两家都没有「签到」链路，必须先排除：
+    // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而这两家
+    // 的按钮在界面上由能力位 `checkin: false` 收起 —— 这一层是批量路径
+    // （`resolve_checkin_targets` 的 filter）与 API 直调的兜底，双保险。
+    // 注意 CodeArts 的每日福利**不是**签到（那是 ops 福利领取，独立的「领福利」
+    // 按钮，见 `providers::codearts::welfare`），与这条链无交集。
+    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID
+        || provider == crate::server::core::account_store::TRAE_PROVIDER_ID
+    {
+        return false;
+    }
     !crate::server::core::account_store::is_accio_family(provider)
 }
 
@@ -184,7 +195,6 @@ pub fn resolve_checkin_targets(
 ///     （`providers::autoclaw::checkin::claim_daily_signin`）；
 ///   - **Qoder**：活动（campaign）领取链路，只有中国版有
 ///     （`providers::qoder::checkin::claim_daily_checkin`）。
-///   - **Trae**：`checkin_credits` 领取链路（`providers::trae::models::checkin`）。
 ///
 /// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
@@ -230,39 +240,6 @@ pub async fn checkin_for(
                 crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-        "trae" => {
-            let claim = async {
-                let credentials =
-                    crate::server::core::providers::trae::credentials_for(store, &id)?;
-                let credentials = crate::server::core::providers::trae::refresh_if_needed(
-                    store,
-                    &id,
-                    &credentials,
-                    false,
-                )
-                .await?;
-                let proxy = crate::server::core::providers::trae::account_proxy(store, &id)?;
-                let generation = store.trae_checkin_generation(&id);
-                crate::server::core::providers::trae::models::checkin(
-                    &credentials,
-                    generation,
-                    proxy.as_ref(),
-                )
-                .await
-            }
-            .await
-            .map_err(|error| error.message);
-            if let Ok(value) = &claim {
-                if value.get("code").and_then(Value::as_i64) == Some(9074) {
-                    let generation = store.bump_trae_checkin_generation(&id);
-                    logging::log(
-                        "[Accounts]",
-                        &format!("Trae 账号 {display}: 签到设备已轮换到第 {generation} 代"),
-                    );
-                }
-            }
             claim_result(id, name, &display, true, claim)
         }
         // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。

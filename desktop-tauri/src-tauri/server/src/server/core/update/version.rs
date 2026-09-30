@@ -7,16 +7,8 @@
 
 use serde_json::Value;
 
-/// 默认仓库（**本 fork**，不是上游 aimod-cc/agent2api）。
-///
-/// 更新检查与安装包下载都从这里的 Release 走：指向 fork 才能拿到本仓库
-/// 自己打包的产物，否则会自动装回上游版本、把本地定制覆盖掉。
-/// 仍可用 `WORKBUDDY_UPDATE_REPO` 环境变量覆盖（见 `UpdateManager::new`）。
-///
-/// 注意：本 fork 是私有仓库时，匿名请求 `releases/latest` 会拿到 404
-/// （GitHub 对私有仓库一律回 404，不泄露存在性），表现为「始终无更新」。
-/// 需要把仓库设为公开，或给程序设置 `WORKBUDDY_GITHUB_TOKEN` / `GITHUB_TOKEN`。
-pub const DEFAULT_REPO: &str = "weiang12345/agent2api";
+/// 默认仓库（本项目的上游）；fork 后可自行覆盖（Node 版 DEFAULT_REPO）
+pub const DEFAULT_REPO: &str = "aimod-cc/agent2api";
 
 /// GitHub API 根（Node 版 GITHUB_API）
 pub const GITHUB_API: &str = "https://api.github.com";
@@ -47,17 +39,11 @@ pub struct UpdateError {
 
 impl UpdateError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            status_code: 502,
-        }
+        Self { message: message.into(), status_code: 502 }
     }
 
     pub fn with_status(status_code: i32, message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            status_code,
-        }
+        Self { message: message.into(), status_code }
     }
 
     /// 转成统一的网关错误。更新路由的失败 body 走 OpenAI 风格
@@ -127,8 +113,8 @@ pub fn compare_versions(a: &str, b: &str) -> Option<i32> {
 /// 非 https 抛 400「下载地址必须是 https」，域名不在列表抛 400
 /// 「下载地址域名不在允许列表内: <host>」。
 pub fn assert_downloadable(url: &str) -> Result<url::Url, UpdateError> {
-    let parsed =
-        url::Url::parse(url).map_err(|_| UpdateError::with_status(400, "下载地址不是合法 URL"))?;
+    let parsed = url::Url::parse(url)
+        .map_err(|_| UpdateError::with_status(400, "下载地址不是合法 URL"))?;
     if parsed.scheme() != "https" {
         return Err(UpdateError::with_status(400, "下载地址必须是 https"));
     }
@@ -246,7 +232,11 @@ fn js_trim(value: &str) -> &str {
 /// 有差别 —— 但紧接着的替换会把残留的 `\` 变成 `_`，最终文件名同样不含路径分隔符，
 /// 安全性一致（这里是**有意**用 Windows 语义，避免把 `..\evil.exe` 原样留下）。
 pub fn safe_file_name(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or("").to_string();
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_string();
     let cleaned: String = base
         .chars()
         .map(|ch| {

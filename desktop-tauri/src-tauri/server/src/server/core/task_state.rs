@@ -13,7 +13,8 @@
 //!   - **停机期间只补一次**：休眠 / 关机错过的那一轮在启动后跑一次，不补跑
 //!     期间的每一轮；
 //!   - **失败有冷却**：连续失败按间隔指数退避（上限一天），并且**重启不清零**
-//!     —— 否则「重启即可绕过冷却」等于没有冷却。
+//!     —— 否则「重启即可绕过冷却」等于没有冷却。手动触发要不要越过它由调用点
+//!     逐处选（见 [`ManualBackoff`]）。
 //!
 //! ── 硬约束：请求发出**之前**就记一笔尝试 ─────────────────────
 //! `claim` 在返回执行权之前就把 `lastAttemptAt` / `nextRunAt` 写进库。理由：
@@ -258,8 +259,37 @@ pub enum Claim {
     Deferred(TaskState),
 }
 
-/// 手动执行可以跳过普通排期，但不能跳过在途占位、最短请求间隔和失败冷却。
-pub fn claim(key: &str, interval_ms: i64, manual: bool, min_gap_ms: i64) -> Result<Claim, String> {
+/// 手动触发**越不越过失败冷却**（[`claim`] 的显式入参）。
+///
+/// 两种语义在仓库里同时存在，而且各有理由 —— 所以它不藏在 `manual` 里顺带决定：
+///   - [`ManualBackoff::Respect`]：冷却记的是**上游配额桶什么时候恢复**
+///     （检查更新的 GitHub 限额匿名按出口 IP 计、带令牌按用户计）。提前打一次
+///     只会再吃一次 403，还把恢复时刻重新顶到未来，不如如实告诉用户还要等多久；
+///   - [`ManualBackoff::Bypass`]：冷却记的是**上一轮为什么没成功**（模型目录按
+///     上游逐个 401 / 5xx 退避）。用户按下「获取模型」的预期就是「现在真打一次」，
+///     而且按按钮往往正是因为刚把那个原因修好（重新导入登录态、换账号）——
+///     继续拿旧结论挡着，界面上只会留着上一次的错误文案，看起来就是按钮坏了。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManualBackoff {
+    Respect,
+    Bypass,
+}
+
+/// 判定到期并占位（两种结果都是 `Ok`：Deferred 不是错误，只是这轮不该跑）。
+///
+/// `manual`（用户主动触发）跳过普通排期；**是否连失败冷却一起跳过**由 `backoff`
+/// 决定（见 [`ManualBackoff`]，逐个调用点自选）。
+///
+/// 在途占位与最短请求间隔**手动也不越过**：前者防同一时刻两个入口（或两个进程）
+/// 并排打上游，后者是「同一家一秒内不重复打」的底线 —— 冷却可以商量，并发与连点
+/// 不行：用户连点按钮时，真正保护上游的是这两条，而不是那个动辄几小时的冷却。
+pub fn claim(
+    key: &str,
+    interval_ms: i64,
+    manual: bool,
+    backoff: ManualBackoff,
+    min_gap_ms: i64,
+) -> Result<Claim, String> {
     let now = logging::now_ms();
     let owner = format!(
         "{}-{now}-{}",
@@ -269,8 +299,9 @@ pub fn claim(key: &str, interval_ms: i64, manual: bool, min_gap_ms: i64) -> Resu
     let mut acquired = false;
     let state = change(key, |state| {
         state.adjust_clock(now);
-        let earliest = state.retry_at.max(state.last_attempt_at.saturating_add(min_gap_ms));
-        if state.running() || now < earliest || (!manual && now < state.next_run_at) {
+        let earliest = state.last_attempt_at.saturating_add(min_gap_ms);
+        let cooling = state.retry_at > now && !(manual && backoff == ManualBackoff::Bypass);
+        if state.running() || now < earliest || cooling || (!manual && now < state.next_run_at) {
             return;
         }
         acquired = true;

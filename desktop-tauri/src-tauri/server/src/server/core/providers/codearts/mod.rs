@@ -1,0 +1,626 @@
+//! CodeArts（华为云 AI 代码助手 / snap-access）适配器。
+//!
+//! 上游不是 OpenAI 协议：请求要用华为云 **SDK-HMAC-SHA256**（AK/SK + STS）签名，
+//! 会话是有状态的（每个对话一个 `session_id`，且上游对**每账号只有 3 路并发**），
+//! 凭据是一次 OAuth/PKCE 登录换来的**临时**三元组、到期前 15 分钟就要续。
+//! 移植的语义来源与逐条依据见 `cpa-deploy/notes/agent2api-codearts-port-plan.md`。
+//!
+//! 全链已接齐：签名（`signer`）/ 凭据 + DPoP + OAuth + 单飞续期（`credentials`、
+//! `dpop`、`oauth`、`refresh`）/ 错误信封（`stream_fault`）/ 脱敏（`redact`）/
+//! 请求构造 + 聚合 + 首包门（`chat`）/ 会话心跳与准入（`session`）/
+//! 目录三源（`models`）/ 余额两份账（`balance`）/ 每日福利领取（`welfare`）/
+//! provider 体系与账号存储接线；转发入口 `forward_conversation` 已在沙箱网关上
+//! 真上游跑通（流式 + 非流式）。
+
+pub mod balance;
+pub mod chat;
+pub mod welfare;
+pub mod credentials;
+pub mod dpop;
+pub mod models;
+pub mod oauth;
+pub mod redact;
+pub mod refresh;
+pub mod session;
+pub mod signer;
+pub mod stream_fault;
+
+use std::pin::Pin;
+
+use axum::http::HeaderMap;
+use serde_json::Value;
+
+use crate::server::core::account_store::AccountStore;
+use crate::server::core::upstream::ForwardOutcome;
+use crate::server::core::upstream::usage::RequestTelemetry;
+use crate::server::errors::GatewayError;
+
+use super::adapter::{ChatRequestPlan, ProviderAdapter, UpstreamErrorClass};
+
+/// 进程级本地准入闸（同一上游身份的并发会话共享一个上限）。
+static SESSION_GATE: std::sync::OnceLock<session::SessionGate> = std::sync::OnceLock::new();
+use crate::server::core::providers::ProviderKind;
+
+/// CodeArts 适配器（无状态字段：目录缓存在 `models` 里，凭据在账号存储里）。
+pub struct CodeArtsAdapter;
+
+/// 静态实例：`adapter_for` 要的是 `&'static dyn ProviderAdapter`。
+pub static CODEARTS_ADAPTER: CodeArtsAdapter = CodeArtsAdapter;
+
+impl CodeArtsAdapter {
+    /// 从账号记录读回凭据（账号存储写的就是 `Credential` 的字段名）。
+    pub fn credential(record: &Value) -> Result<credentials::Credential, GatewayError> {
+        credentials::Credential::from_payload(record).map_err(|reason| GatewayError::with_status(503, reason))
+    }
+}
+
+impl ProviderAdapter for CodeArtsAdapter {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::CodeArts
+    }
+
+    /// 清单来自刷新链路落的进程内缓存（`list_models` 是同步契约，发不了网络请求）。
+    fn list_models(&self) -> Vec<Value> {
+        models::list()
+    }
+
+    /// 防御性报错：CodeArts 的对话要先占会话槽（每账号 3 路并发）、再签一次名、
+    /// 再按流内信封判成败，单请求构造路径容纳不了 —— 与 Qoder / Accio 同一处境。
+    fn build_chat_request(
+        &self,
+        _account: &Value,
+        _body: &Value,
+        _client_headers: &HeaderMap,
+    ) -> Result<ChatRequestPlan, GatewayError> {
+        Err(GatewayError::with_status(
+            503,
+            "CodeArts 走会话式转发，不走单请求路径（内部错误：编排层未按 is_stateful 分流）",
+        ))
+    }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
+
+    /// 会话式转发：占槽 → 签名发送 → 首包门 → 透传/折叠，结束时释放会话。
+    ///
+    /// 顺序是有意的：**先过本地准入再占上游会话**。反过来的话，一个满员的账号会
+    /// 白占一个上游槽位并立刻释放，把并发闸变成噪声。
+    ///
+    /// 两条收尾路径都必须走到 `ChatSession::stop()`（等 idle 真发出去）：
+    /// 中途 `?` 提前返回时由 `ChatSession` 的 `Drop` 发注销信号，但那条不等
+    /// idle 落地 —— 所以出错分支上显式 `stop().await`。
+    fn forward_conversation<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        body: &'a Value,
+        _client_headers: &'a HeaderMap,
+        proxy: Option<crate::server::core::proxies::ResolvedProxy>,
+        stream: bool,
+        _telemetry: &'a std::sync::Arc<RequestTelemetry>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<ForwardOutcome, GatewayError>> + Send + 'a>> {
+        Box::pin(async move {
+            // ① 凭据（含临期主动续期与写回）；代理沿用编排层为本账号解析出的那份
+            let credential = refresh::ensure_fresh(store, account_id, false, proxy.as_ref()).await?;
+            if !credential.valid() {
+                return Err(GatewayError::with_status(503, "CodeArts 账号缺少可用的临时凭据，请重新登录"));
+            }
+
+            // ② 模型名归一：客户端习惯小写，上游要真名；福利模型要带 maas_type
+            let requested = body.get("model").and_then(Value::as_str).unwrap_or("").trim();
+            let catalog = models::cached_catalog().ok_or_else(|| GatewayError::with_status(
+                503,
+                "CodeArts 模型目录还没拉取过：请先在模型页对该账号执行一次「获取模型」",
+            ))?;
+            let Some(model) = catalog.resolve(requested) else {
+                return Err(models::unknown_model_error(requested, &catalog));
+            };
+            let benefit = model.source.needs_benefit_header();
+            let upstream_model = model.id.clone();
+
+            // ③ 本地准入（满员回 409，不冷却账号）。
+            // 身份优先用凭据里的 domain+user；两个都取不到时退到**账号行 id**
+            // （不是 AK —— 它每次续期都换，用它当键等于每刷一次期就把并发上限清零）。
+            let gate_identity = if credential.domain_id.trim().is_empty() && credential.user_id.trim().is_empty() {
+                format!("account:{account_id}")
+            } else {
+                credential.identity()
+            };
+            // 面板那颗「并发上限」旋钮写的是账号上的 `maxConcurrent`，这里必须读它：
+            // 只按硬编码默认值准入的话，那个数字对本家就只是装饰（口径与
+            // `session::SessionGate::limit_for` 里写的「0 = 继承默认」一致）。
+            let gate_override = store
+                .codearts_account_record(account_id)
+                .and_then(|record| record.get("maxConcurrent").and_then(Value::as_u64));
+            let permit = SESSION_GATE
+                .get_or_init(|| session::SessionGate::new(session::DEFAULT_SESSION_LIMIT))
+                .acquire(models::DEFAULT_BASE_URL, &gate_identity, gate_override)?;
+
+            // ④ 占一个上游会话槽（心跳 busy + 后台续期）
+            let mut options = session::SessionOptions::new(
+                models::DEFAULT_BASE_URL,
+                &credential,
+                chat::DEFAULT_LANGUAGE,
+            );
+            options.interval = session::HEARTBEAT_INTERVAL;
+            let session = match session::ChatSession::begin(options).await {
+                Ok(session) => session,
+                Err(error) => {
+                    drop(permit);
+                    return Err(error);
+                }
+            };
+            let session_id = session.id().to_string();
+
+            // ⑤ 构造并发出（签名要覆盖到刚生成的 session id，所以顺序在后）
+            let profile = chat::HeaderProfile {
+                chat_session_id: Some(session_id),
+                ..Default::default()
+            };
+            let (url, headers, payload) =
+                match chat::build_upstream_request(models::DEFAULT_BASE_URL, &upstream_model, body.clone(), true, benefit, &profile, Some(&credential)) {
+                    Ok(built) => built,
+                    Err(error) => {
+                        session.stop().await;
+                        drop(permit);
+                        return Err(error);
+                    }
+                };
+            let mut request = crate::server::core::egress::client_for(proxy.as_ref()).post(&url);
+            for (name, value) in headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let response = match request.body(payload).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    session.stop().await;
+                    drop(permit);
+                    return Err(GatewayError::with_status(
+                        502,
+                        format!("CodeArts 对话请求失败：{}", crate::server::core::egress::describe_error_detail(&error)),
+                    ));
+                }
+            };
+
+            // ⑥ 非 2xx：原样带状态码 + 脱敏诊断体
+            let status = response.status().as_u16();
+            if !(200..300).contains(&status) {
+                // 有预算地读：见 `chat::read_error_body`（它同时把 truncated 如实带出来，
+                // 让脱敏那条"末尾正好是秘密前缀"的分支真的会被走到）
+                let (error_body, truncated) = chat::read_error_body(response).await;
+                session.stop().await;
+                drop(permit);
+                return Err(chat::upstream_http_error(status, &error_body, &credential, truncated));
+            }
+
+            // ⑦ 首包门：一个字节都没下发之前就决定"交出去"还是"换账号"
+            let (prefetched, rest) = match chat::prefetch_head(response).await {
+                Ok(head) => head,
+                Err(error) => {
+                    session.stop().await;
+                    drop(permit);
+                    return Err(error);
+                }
+            };
+
+            if !stream {
+                // 非流式：把剩下的读完再折叠（上游只有流式，与参考实现同一做法）
+                use futures::StreamExt;
+                let mut all = prefetched;
+                let mut rest = rest;
+                let read_error = loop {
+                    match rest.next().await {
+                        None => break None,
+                        Some(Err(error)) => break Some(error),
+                        Some(Ok(chunk)) => all.extend_from_slice(&chunk),
+                    }
+                };
+                session.stop().await;
+                drop(permit);
+                if let Some(error) = read_error {
+                    return Err(GatewayError::with_status(502, format!("CodeArts 上游流中断：{error}")));
+                }
+                return Ok(ForwardOutcome::Completion {
+                    body: chat::aggregate_sse(&all, &upstream_model)?,
+                });
+            }
+
+            // ⑧ 流式：透传（上游已是 OpenAI chunk 形状），结束时释放会话与许可
+            let (sender, receiver) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+            crate::spawn_task(async move {
+                use futures::StreamExt;
+                if !prefetched.is_empty() {
+                    if sender.send(Ok(bytes::Bytes::from(prefetched))).await.is_err() {
+                        session.stop().await;
+                        return;
+                    }
+                }
+                let mut rest = rest;
+                while let Some(item) = rest.next().await {
+                    if sender.send(item).await.is_err() {
+                        break;
+                    }
+                }
+                // 客户端断开也会走到这里：idle 必须发，否则上游槽位悬着
+                session.stop().await;
+                drop(permit);
+            });
+            Ok(ForwardOutcome::Stream {
+                status: 200,
+                stream: Box::new(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+            })
+        })
+    }
+
+    /// 非 2xx 的分类。
+    ///
+    /// **注意**：CodeArts 的业务失败常常不体现在状态码上（额度耗尽是 HTTP 200
+    /// SSE 里的信封），那部分由 `stream_fault` 负责；这里只管真的是状态码的错。
+    /// 三条口径与参考实现一致：403 = 额度、429 = 限流、其余透传。
+    fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
+        let raw = error_body
+            .get("message")
+            .or_else(|| error_body.get("error_msg"))
+            .or_else(|| error_body.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let message = format!("上游返回 {status}{}", raw_part(raw));
+        match status {
+            // 403：额度耗尽 —— 标记账号冷却并换下一账号
+            403 => UpstreamErrorClass::QuotaLimited {
+                reset_at: None,
+                message,
+                upstream_code: None,
+                status,
+            },
+            429 => UpstreamErrorClass::QuotaLimited {
+                reset_at: None,
+                message,
+                upstream_code: None,
+                status,
+            },
+            // 401：临时凭据过期/被换掉 —— 刷一次再用同一账号重试
+            401 => UpstreamErrorClass::TokenExpired { message },
+            _ => UpstreamErrorClass::Fatal {
+                status,
+                message,
+                upstream_code: None,
+            },
+        }
+    }
+
+    fn supports_chat(&self) -> bool {
+        true
+    }
+
+    /// 一次性 refresh token 决定了这条开关的分量：刷一次就轮换，所以
+    /// `supports_refresh` 与「把新串写回账号存储」必须同时成立，否则等于烧掉凭据
+    /// 且新串丢失（账号直接判死刑）。写回通路在 `refresh::ensure_fresh` →
+    /// `update_codearts_credentials_if_current`（按凭据形态比对后再写，见 store 侧）。
+    fn supports_refresh(&self) -> bool {
+        true
+    }
+
+    /// 取一个**可用**的 access key：临期就真刷并写回，与 cline/qoder 同口径。
+    fn ensure_access_token<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
+        Box::pin(async move {
+            let proxy = record_proxy(store, account_id)?;
+            Ok(refresh::ensure_fresh(store, account_id, false, proxy.as_ref())
+                .await?
+                .access_key_id)
+        })
+    }
+
+    /// 面板上那条「刷新凭据」走的是这条（`refresh_access_token`，不看临期窗口）。
+    ///
+    /// **不能省**：漏了它就落到 trait 的默认实现（= `ensure_access_token`），而默认
+    /// 实现早期版本只回读存储、不碰上游 —— 沙箱实测就是那样：接口回 `success` +
+    /// `refreshedId`，库里的 AK 一个字符都没变。用户点了刷新、看着成功，临期凭据
+    /// 照旧临期。这类「报成功但什么都没发生」比报错更难查。
+    fn refresh_access_token<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let proxy = record_proxy(store, account_id)?;
+            Ok(refresh::ensure_fresh(store, account_id, true, proxy.as_ref())
+                .await?
+                .access_key_id)
+        })
+    }
+
+    /// 临期判定要与 `ensure_fresh` 用同一个提前量：批量维护循环据此决定要不要动
+    /// 这个账号，回 false 就等于把它从维护范围里永久剔除（本家凭据默认只活一小时，
+    /// 后台不刷的话，闲置一阵后的第一个请求要先付一次换证的延时）。
+    fn credentials_expiring(&self, store: &AccountStore, account_id: &str) -> bool {
+        store
+            .codearts_account_record(account_id)
+            .and_then(|record| credentials::Credential::from_payload(&record).ok())
+            .is_some_and(|credential| credential.can_refresh() && credential.needs_refresh(refresh::REFRESH_LEAD_MS, crate::server::logging::now_ms()))
+    }
+
+    /// 余额可查（两份账，见 `balance.rs` 模块头：订阅统计 + 福利网关）。
+    fn supports_usage(&self) -> bool {
+        true
+    }
+
+    /// **两个源各自成功各自失败**：福利网关是另一台机器，它挂了不该让订阅统计
+    /// 显示不出来（反过来也是）。只有两边都失败才整次失败 —— 而那通常意味着
+    /// 凭据本身已经不行了，错误文案照 `statistics` 那侧给（它才是主账）。
+    ///
+    /// 失败的一侧仍写进 `benefitError` / `statisticsError`：界面上「读到 0」与
+    /// 「没读到」必须能区分开，这是本家面板最容易误判的一处。
+    fn query_usage<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>> {
+        Box::pin(async move {
+            let credential = welfare::current_credential(store, account_id).await?;
+            let (statistics, benefit) = balance::fetch_both(
+                models::DEFAULT_BASE_URL,
+                models::DEFAULT_BENEFIT_GATEWAY_URL,
+                &credential,
+                chat::DEFAULT_LANGUAGE,
+                chat::DEFAULT_PLUGIN_VERSION,
+            )
+            .await;
+            // 两边都失败才算整次失败（一边失败不抹掉另一边）。
+            // 注意「无福利」（`Ok(None)`）不是失败 —— 它是账号的正常状态
+            // （福利按活动下发，Free 账号常常没有），见 balance.rs 的
+            // `BENEFIT_ABSENT_CODE`。
+            if statistics.is_err() && benefit.is_err() {
+                let (first, second) = (statistics.unwrap_err(), benefit.unwrap_err());
+                return Err(GatewayError::with_status(
+                    first.status_code,
+                    format!("{}（福利网关：{}）", first.message, second.message),
+                ));
+            }
+            let benefit_value = benefit.as_ref().ok().and_then(|value| value.as_ref());
+            let mut document = balance::usage_document(statistics.as_ref().ok(), benefit_value);
+            match &benefit {
+                // 上游明说没有该账号的福利数据：落一个**中性**标记而不是错误，
+                // 界面上「没有福利」与「没读到」才分得开（前者不该报警告）。
+                Ok(None) => {
+                    document["benefitAbsent"] = Value::Bool(true);
+                }
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    document["benefitError"] = Value::String(error.message.clone());
+                }
+            }
+            if let Err(error) = &statistics {
+                document["statisticsError"] = Value::String(error.message.clone());
+            }
+            Ok(document)
+        })
+    }
+
+    /// 刷新要按账号取凭据（CodeArts 没有环境变量旁路：临时凭据必须配着
+    /// oauth_context 才成立）。
+    fn refresh_uses_account(&self) -> bool {
+        true
+    }
+
+    /// 网页登录：授权页 + 本机 loopback 回调（`oauth::begin_login` 与
+    /// `core::login::codearts`）。
+    fn supports_web_login(&self) -> bool {
+        true
+    }
+
+    /// 返回 `(授权地址, state)`，`state` 就是这一轮的 `ticket_id`。
+    ///
+    /// 待办条目（PKCE verifier + DPoP 私钥）留在 `oauth` 的进程级表里 —— 换码时
+    /// 只有那里有这两样，而它们**不能**进任务表（任务表会被 `/wait` 序列化给界面）。
+    ///
+    /// 收尾**不实现 trait 的 `exchange_login_code`**，写在 `core::login::codearts`：
+    /// 那家的 portal 可能只回带一个 `code`、不带任何配对信息，收尾要「逐个候选试
+    /// verifier」并把待办**取走**，而 trait 那条按 state 精确取一次 —— 两条路都留着
+    /// 会互相把对方的待办取空（先到的赢、后到的 404）。所以入口只有一个。
+    fn build_login_url(&self) -> Option<(String, String)> {
+        let (url, pending) = oauth::begin_login(
+            chat::DEFAULT_PLUGIN_NAME,
+            chat::DEFAULT_PLUGIN_VERSION,
+            chat::DEFAULT_LANGUAGE,
+        )
+        .ok()?;
+        Some((url, pending.ticket_id))
+    }
+
+    /// 本家的目录**能远程刷**（三源发现），必须显式打开：
+    ///
+    /// 这个开关在 `refresh_models` 之前就被刷新循环判掉——漏了它，接口实现了
+    /// 也永远不会被调用，界面还会反过来报"该提供商使用固定模型清单"。
+    /// （沙箱端到端实测抓到的：加上这条之前 `/v1/models` 里一个 codearts 模型都没有。）
+    fn supports_model_refresh(&self) -> bool {
+        true
+    }
+
+    /// 目录刷新：三源发现 → 落进程内缓存（M4 的 `models` 就是为这一步准备的）。
+    ///
+    /// 目录本身只读，但**取凭据要走 `ensure_fresh`**：本家的临时凭据只活一小时
+    /// 左右，用户很可能在闲置很久之后才第一次点「获取模型」——直接用盘上那份会
+    /// 撞 401，而 401 在目录这条路上只会显示成"刷新失败"，看不出是凭据临期。
+    fn refresh_models<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+        _force: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = super::adapter::ModelRefreshOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            // 空 id = 队首可用账号（自动路径的默认）；非空 = 用户在弹窗里点名的
+            // 那条。**「没有账号」不是失败**：自动路径每轮（启动、定时、被动拉
+            // /v1/models）都会走到这里，把它算成失败会给一家用户还没配置的家记上
+            // 一次失败、进而触发「间隔 × 2^(n-1)」的冷却退避（模型刷新间隔默认
+            // 60 分钟 ⇒ 一次失败就是 1 小时）。实测踩到过：用户 10:36 登录添加
+            // 完 CodeArts，点「获取模型」却被「请求处于冷却期，请在 2977 秒后
+            // 重试」挡住 —— 那次「失败」发生在账号存在之前（10:27）。
+            // 与 accio / qoder 逐字同口径：自动路径 `unchanged()`（没刷，
+            // 不是失败），点名取不到才 `failed()`。
+            if store.codearts_account_record(account_id).is_none() {
+                crate::server::logging::verbose("[Models]", "CodeArts 模型目录刷新跳过：尚未添加 CodeArts 账号");
+                if account_id.trim().is_empty() {
+                    return super::adapter::ModelRefreshOutcome::unchanged();
+                }
+                return super::adapter::ModelRefreshOutcome::failed("指定的 CodeArts 账号不存在或不可用，请重新选择");
+            };
+            let credential = match proxy_and_fresh(store, account_id).await {
+                Ok(credential) => credential,
+                Err(error) => return super::adapter::ModelRefreshOutcome::failed(error.message),
+            };
+            let endpoints = models::CatalogEndpoints {
+                base_url: models::DEFAULT_BASE_URL,
+                benefit_gateway_url: Some(models::DEFAULT_BENEFIT_GATEWAY_URL),
+                plugin_version: chat::DEFAULT_PLUGIN_VERSION,
+                language: chat::DEFAULT_LANGUAGE,
+            };
+            let catalog = models::discover(&endpoints, &credential).await;
+            if catalog.models.is_empty() {
+                return super::adapter::ModelRefreshOutcome::failed(
+                    catalog.warnings.first().cloned().unwrap_or_else(|| "该账号没有返回任何可用模型".to_string()),
+                );
+            }
+            let count = catalog.models.len();
+            models::store_catalog(catalog);
+            super::adapter::ModelRefreshOutcome::refreshed(count)
+        })
+    }
+}
+
+/// 账号自己配的代理，口径与 qoder 的 `auth::account_proxy` 一致：
+/// **解析失败就报错**，不静默降级成直连（直连出不了内网机器的话，用户只会看到
+/// "上游超时"，而不是"你配的代理解析不了"）。
+fn record_proxy(
+    store: &AccountStore,
+    account_id: &str,
+) -> Result<Option<crate::server::core::proxies::ResolvedProxy>, GatewayError> {
+    let record = store
+        .codearts_account_record(account_id)
+        .ok_or_else(|| GatewayError::with_status(503, "没有可用的 CodeArts 账号：请在账号页添加并启用账号"))?;
+    use crate::server::core::proxies::ProxyResolution;
+    match crate::server::core::proxies::resolve_account_proxy(record.get("proxy")) {
+        Some(ProxyResolution::Resolved(proxy)) => Ok(Some(proxy)),
+        Some(ProxyResolution::Failed(reason)) => Err(GatewayError::with_status(400, reason)),
+        None => Ok(None),
+    }
+}
+
+/// 没有编排层代理解析的那两条钩子（面板点刷新 / 目录刷新）用的组合。
+async fn proxy_and_fresh(store: &AccountStore, account_id: &str) -> Result<credentials::Credential, GatewayError> {
+    let proxy = record_proxy(store, account_id)?;
+    refresh::ensure_fresh(store, account_id, false, proxy.as_ref()).await
+}
+
+/// 把上游原文拼成统一文案的一截（空则不拼）。
+fn raw_part(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        String::new()
+    } else {
+        format!(": {}", raw.trim())
+    }
+}
+
+#[cfg(test)]
+mod store_hooks {
+    //! 三个存储侧钩子的接线验收。
+    //!
+    //! 为什么单独钉这一组：`ProviderAdapter` 的 `refresh_access_token` **有默认实现**
+    //! （转发到 `ensure_access_token`），忘了覆盖不会编译失败，只会让面板上那条
+    //! 「刷新凭据」变成一个报成功的空动作 —— 沙箱端到端实测就是这样：接口回
+    //! `success` + `refreshedId`，库里的 AK 一个字符都没变。这种失败没有任何报错，
+    //! 所以用一条「不联网、但默认实现与覆盖实现结果不同」的断言把它钉住。
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::server::core::account_store::AccountStore;
+    use crate::server::core::providers::codearts::credentials::{OAuthContext, PkcePair, Credential};
+    use crate::server::db::Db;
+
+    use super::{CODEARTS_ADAPTER, ProviderAdapter};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn store() -> AccountStore {
+        let id = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("codearts-hooks-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        AccountStore::with_db(Some(Db::open(&dir.join("agent2api.db")).expect("临时库应当能建起来")))
+    }
+
+    /// `minutes` 之后到期（负数即已过期）。
+    fn expiry(minutes: i64) -> String {
+        (chrono::Utc::now() + chrono::TimeDelta::minutes(minutes)).to_rfc3339()
+    }
+
+    fn credential(ak: &str, user: &str, minutes: i64, refreshable: bool) -> Credential {
+        Credential {
+            access_key_id: ak.to_string(),
+            secret_access_key: "SK".to_string(),
+            security_token: "sts".to_string(),
+            expires_at: expiry(minutes),
+            domain_id: "dom".to_string(),
+            user_id: user.to_string(),
+            refresh_token: if refreshable { "jwt".to_string() } else { String::new() },
+            oauth_context: refreshable.then(|| OAuthContext {
+                pkce_pair: PkcePair { code_verifier: "verifier".to_string(), ..Default::default() },
+                ..Default::default()
+            }),
+            ..Credential::default()
+        }
+    }
+
+    #[test]
+    fn expiring_follows_the_lead_window_and_a_usable_refresh_chain() {
+        let store = store();
+        // 三条各代表一种「后台维护该不该动手」：远端到期 / 只剩五分钟 / 临期但刷不了
+        store.add_codearts_account(&credential("AK_FAR", "far", 120, true), None, "manual").unwrap();
+        store.add_codearts_account(&credential("AK_NEAR", "near", 5, true), None, "manual").unwrap();
+        store.add_codearts_account(&credential("AK_BARE", "bare", 5, false), None, "manual").unwrap();
+        let id_of = |user: &str| {
+            store
+                .list_accounts()["accounts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|a| a["provider"] == serde_json::json!(crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID) && a["userId"] == serde_json::json!(user))
+                .unwrap_or_else(|| panic!("没有 userId={user} 这条账号"))
+                ["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+        };
+        // 「刷不了」不该变成「每轮都失败」：没有续期链的账号直接排除在维护之外
+        assert!(CODEARTS_ADAPTER.supports_refresh(), "写回通路已就绪，这条必须开着，否则临期凭据没人管");
+        assert!(!CODEARTS_ADAPTER.credentials_expiring(&store, &id_of("far")), "离到期两小时不该动手");
+        assert!(CODEARTS_ADAPTER.credentials_expiring(&store, &id_of("near")), "只剩十五分钟窗口内就该动手");
+        assert!(!CODEARTS_ADAPTER.credentials_expiring(&store, &id_of("bare")), "没有续期链就别让它进维护队列（每轮刷一次失败日志）");
+    }
+
+    #[tokio::test]
+    async fn force_refresh_is_the_override_not_the_default_no_op() {
+        let store = store();
+        store.add_codearts_account(&credential("AK_BARE", "bare", 120, false), None, "manual").unwrap();
+        let id = store.codearts_account_record("").expect("账号应当可读")["id"].as_str().unwrap().to_string();
+
+        // 非强制那条：没临期就原样返回，**不发网络请求**（临时库里是假串，真刷必炸）
+        let token = CODEARTS_ADAPTER.ensure_access_token(&store, &id).await.expect("未临期应当直接用盘上这份");
+        assert_eq!("AK_BARE", token);
+
+        // 强制那条必须真的走 store 路径：续期链不全时**本地就报错**，
+        // 而 trait 的默认实现只会把当前 AK 原样回给你（= 什么都没做却报成功）
+        let error = match CODEARTS_ADAPTER.refresh_access_token(&store, &id).await {
+            Ok(_) => panic!("刷新落到了默认实现（空动作）：覆盖被删掉了？"),
+            Err(error) => error,
+        };
+        assert_eq!(400, error.status_code, "缺续期链是用户可修的本地错误，不是上游错误");
+        assert!(error.message.contains("refresh token"), "文案要点名缺什么：{}", error.message);
+    }
+}

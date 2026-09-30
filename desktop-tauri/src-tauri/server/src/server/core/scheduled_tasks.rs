@@ -304,7 +304,15 @@ async fn run_backend(
             summary
         } else { "已完成版本检查".to_string() });
     }
-    let guard = match task_state::claim(task.id, interval_ms(task), manual, 1_000)? {
+    // 「模型目录刷新」的手动执行与界面上的「获取模型」是同一件事（都走
+    // `refresh_implemented_forced`），因此同样越过失败冷却；其余任务的手动执行
+    // 保持「只提前排期」—— 那些冷却记的是上游配额桶的恢复时刻（见 ManualBackoff）。
+    let backoff = if task.id == TASK_MODEL_REFRESH {
+        task_state::ManualBackoff::Bypass
+    } else {
+        task_state::ManualBackoff::Respect
+    };
+    let guard = match task_state::claim(task.id, interval_ms(task), manual, backoff, 1_000)? {
         Claim::Acquired(guard) => guard,
         Claim::Deferred(state) => return Err(state.waiting_message()),
     };

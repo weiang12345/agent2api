@@ -25,6 +25,7 @@ pub struct ApiRequest {
     #[serde(default)]
     pub body: Option<Value>,
 }
+
 /// 统一的管理 API 入口：返回后端 data，出错时返回可读消息。
 #[tauri::command]
 pub async fn api_request(request: ApiRequest) -> Result<Value, String> {
@@ -771,3 +772,4 @@ fn timestamp_for_filename() -> String {
 
     format!("{year:04}-{month:02}-{day:02}-{hour:02}-{minute:02}-{second:02}")
 }
+
