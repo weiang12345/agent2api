@@ -5,9 +5,9 @@
 #   bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 #
 # 做三件事：
-#   1. 下载 build 工作流的两个安装包 artifact（windows-nsis / macos-universal）到 dist/；
+#   1. 下载 build 工作流的 Windows 安装包 artifact（windows-nsis）到 dist/；
 #   2. 用 tag 所指提交的提交信息（= 更新日志，见 AGENT.md 第 2 节）创建 / 更新
-#      GitHub Release 并挂两个附件；
+#      GitHub Release 并挂 Windows 安装包；
 #   3. 打印验收提示。
 #
 # 幂等可重跑：附件 `--clobber` 覆盖上传。
@@ -47,18 +47,18 @@ fi
 # ── 1. 定位 build run 并下载安装包 ────────────────────────────
 if [ -z "$RUN_ID" ]; then
   echo "→ 查找 $TAG 触发的 build 工作流…"
-  # 不按 run 整体 conclusion 过滤：只验「两个安装包 artifact 是否齐全」，
+  # 不按 run 整体 conclusion 过滤：只验「安装包 artifact 是否齐全」，
   # 构建成功但别处失败的 run 里安装包照旧可用
   for id in $(gh run list --workflow=build --limit 30 --json databaseId,headBranch \
       | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{JSON.parse(s).filter(r=>r.headBranch===process.argv[1]).forEach(r=>process.stdout.write(r.databaseId+"\n"))})' "$TAG"); do
     if gh api "repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/actions/runs/$id/artifacts" \
-         --jq 'any(.artifacts[].name; . == "macos-universal") and any(.artifacts[].name; . == "windows-nsis")' >/dev/null 2>&1; then
+         --jq 'any(.artifacts[].name; . == "windows-nsis")' >/dev/null 2>&1; then
       RUN_ID=$id
       break
     fi
   done
   [ -n "$RUN_ID" ] || {
-    echo "错误: 没找到 $TAG 的可用 build run（需 macos-universal 与 windows-nsis 两个 artifact 齐全）—— 先确认 CI 跑完（gh run list），或手动传 run-id" >&2
+    echo "错误: 没找到 $TAG 的可用 build run（需 windows-nsis artifact）—— 先确认 CI 跑完（gh run list），或手动传 run-id" >&2
     exit 1
   }
 fi
@@ -67,8 +67,7 @@ echo "→ build run: $RUN_ID"
 rm -rf dist
 gh run download "$RUN_ID" -D dist
 EXE=$(ls dist/windows-nsis/*.exe)
-DMG=$(ls dist/macos-universal/*.dmg)
-echo "→ 已下载 $(basename "$EXE") / $(basename "$DMG")"
+echo "→ 已下载 $(basename "$EXE")"
 
 # ── 2. 更新日志 = tag 所指提交的提交信息 ──────────────────────
 NOTES_FILE=$(mktemp)
@@ -77,15 +76,15 @@ git log -1 --format=%B "$TAG" > "$NOTES_FILE"
 
 echo "→ GitHub Release"
 if gh release view "$TAG" >/dev/null 2>&1; then
-  gh release upload "$TAG" --clobber "$EXE" "$DMG"
+  gh release upload "$TAG" --clobber "$EXE"
   echo "  ↳ 已存在，附件覆盖上传"
 else
-  gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" "$EXE" "$DMG"
+  gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" "$EXE"
 fi
 
 # ── 3. 验收提示 ───────────────────────────────────────────────
 echo
 echo "发版收尾完成。核对："
 echo "  [1] GitHub Release:  gh release view $TAG"
-echo "  [2] Docker Hub:      https://hub.docker.com/r/aimodcc/agent2api/tags （$TAG 版本号 + latest）"
+echo "  [2] Windows 安装包:  $EXE"
 echo "  [3] 安装包「关于」页版本号与 $TAG 一致"

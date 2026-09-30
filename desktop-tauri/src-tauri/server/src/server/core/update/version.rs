@@ -7,8 +7,8 @@
 
 use serde_json::Value;
 
-/// 默认仓库（本项目的上游）；fork 后可自行覆盖（Node 版 DEFAULT_REPO）
-pub const DEFAULT_REPO: &str = "aimod-cc/agent2api";
+/// 默认更新仓库：fork 版发布到自己的 GitHub Release（Node 版 DEFAULT_REPO）
+pub const DEFAULT_REPO: &str = "weiang12345/agent2api";
 
 /// GitHub API 根（Node 版 GITHUB_API）
 pub const GITHUB_API: &str = "https://api.github.com";
@@ -66,7 +66,7 @@ impl std::fmt::Display for UpdateError {
 /// 对应 Node 版 parseVersion：先去首尾空白、剥掉可选的 `v` 前缀，
 /// 再要求以 `d+.d+.d+` **开头**（后面的预发布/构建元数据不管）。
 /// 非语义化版本返回 None（此时不做「有新版本」判断，只展示原文）。
-pub fn parse_version(text: &str) -> Option<[u64; 3]> {
+fn version_parts(text: &str) -> Option<([u64; 3], &str)> {
     let trimmed = text.trim();
     let body = trimmed
         .strip_prefix('v')
@@ -87,7 +87,20 @@ pub fn parse_version(text: &str) -> Option<[u64; 3]> {
             rest = rest.strip_prefix('.')?;
         }
     }
-    Some(parts)
+    Some((parts, rest))
+}
+
+pub fn parse_version(text: &str) -> Option<[u64; 3]> {
+    version_parts(text).map(|(parts, _)| parts)
+}
+
+/// 解析 fork 发布修订号：`2.9.0-fork.1` 返回 1。
+///
+/// 这个后缀不是 SemVer 预发布标识，而是 fork 在同一个上游版本上的增量发布号。
+/// 因此比较时排在同版本的上游 release 之后，让已安装上游版的用户能收到 fork 修订。
+fn fork_revision(text: &str) -> Option<u64> {
+    let (_, suffix) = version_parts(text)?;
+    suffix.strip_prefix("-fork.")?.parse().ok()
 }
 
 /// 语义化比较：a > b 返回 1，相等 0，a < b 返回 -1；无法解析时 None。
@@ -102,7 +115,14 @@ pub fn compare_versions(a: &str, b: &str) -> Option<i32> {
             return Some(-1);
         }
     }
-    Some(0)
+    let left_fork = fork_revision(a);
+    let right_fork = fork_revision(b);
+    Some(match (left_fork, right_fork) {
+        (Some(left), Some(right)) => left.cmp(&right) as i32,
+        (Some(_), None) => 1,
+        (None, Some(_)) => -1,
+        (None, None) => 0,
+    })
 }
 
 // ─── URL 与资产 ─────────────────────────────────────────────
@@ -254,5 +274,22 @@ pub fn safe_file_name(name: &str) -> String {
         format!("agent2api-update.{}", installer_suffix())
     } else {
         cleaned.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compare_versions;
+
+    #[test]
+    fn compares_fork_revisions_after_their_upstream_version() {
+        assert_eq!(compare_versions("2.9.0-fork.1", "2.9.0"), Some(1));
+        assert_eq!(compare_versions("2.9.0-fork.1", "2.9.1"), Some(-1));
+        assert_eq!(compare_versions("v2.9.0-fork.2", "2.9.0-fork.1"), Some(1));
+        assert_eq!(compare_versions("2.9.0-fork.1", "2.9.0-fork.2"), Some(-1));
+        assert_eq!(
+            compare_versions("2.7.10-fork.1", "2.9.0-fork.1"),
+            Some(-1)
+        );
     }
 }

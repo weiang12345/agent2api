@@ -3,9 +3,9 @@ name: docker
 # 构建网关镜像（amd64 + arm64）并推送到 Docker Hub。
 #
 # ── 触发方式 ──────────────────────────────────────────────────
-#   · 推送 v* tag（如 v2.7.1）：产出 aimodcc/agent2api:<版本号> 与 :latest
 #   · 手动 workflow_dispatch：产出 :dev（移动测试 tag，不碰正式 tag）
-#   推 v* tag 时与 build.yml 同时触发 —— 一次打 tag，安装包与镜像一起出来
+#
+# fork 发版 tag 只触发 Windows 安装包构建，不自动构建和推送 Docker 镜像。
 #
 # ── 为什么 runner 上不用装 QEMU ───────────────────────────────
 # Dockerfile 的 builder 固定跑在 $BUILDPLATFORM：runner 是 amd64，arm64
@@ -34,9 +34,6 @@ name: docker
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
 permissions:
   contents: read
