@@ -11,8 +11,10 @@
 //! 推理走 **OpenAI 兼容**端点：`POST {openai_base}/chat/completions`，
 //! `Authorization: Bearer {token}`。模型名不改写；思考等级是唯一被改写的
 //! 字段 —— 映射上绑定的默认档由 [`ProviderAdapter::reasoning_patch`] 注入，
-//! 随后 `reasoning::apply_to_chat` 把它归一成上游认的三档（见 `super::reasoning`
-//! 的模块头），客户端没点名等级时那条链什么也不做、保持上游默认。
+//! 随后 `reasoning::apply_to_chat` 把它归一成上游认的档位（5.3 是
+//! `low` / `high` / `max` 三档、5.2 是 `minimal` / `high` / `max` 三档；
+//! 见 `super::reasoning` 的模块头），客户端没点名等级时那条链什么也不做、
+//! 保持上游默认。
 //! 因此 `is_stateful()` 保持默认 false（一次发送由通用编排层完成），
 //! 与 CatPaw / Qoder / Accio 那三家「适配器自己发」的情形不同。
 //!
@@ -87,9 +89,11 @@ impl ProviderAdapter for ZcodeAdapter {
 
     /// 映射上绑定的思考等级作为**默认档**注入（客户端自己点名了就让位）。
     ///
-    /// ── 为什么只接 GLM-5.3 家族 ──────────────────────────────
-    /// 有依据的只有这两条 model id（官方目录 + 实测：上游只认 `low` / `high` /
-    /// `max`，见 `super::reasoning` 的模块头）。别的模型一律 `Skip` —— 通用 8 档
+    /// ── 为什么只接 GLM-5.2 / 5.3 家族 ─────────────────────────
+    /// 有依据的只有这两个家族：5.3 是官方目录 + 实测（上游只认 `low` / `high` /
+    /// `max`），5.2 是智谱开放文档给出的完整兼容映射（`none` / `minimal` 关思考、
+    /// `low` / `medium` → `high`、`xhigh` → `max`）—— 两族的归一规则都在
+    /// `super::reasoning`（模块头有出处）。别的模型一律 `Skip` —— 通用 8 档
     /// 表里没有「它们也收这个字段」的证据，塞一个上游不认识的键不叫生效，
     /// 只是把未知参数推给上游；而猜错档位的代价是把一条本来能用的请求打成 400。
     ///
@@ -98,7 +102,9 @@ impl ProviderAdapter for ZcodeAdapter {
     /// 通道由 `reasoning::apply_to_chat` 归一后原样发上游；活动套餐通道由
     /// `plan::build_request` 从发送体同一处读出来，交给
     /// `reasoning::apply_to_anthropic` 折成 thinking 预算 + `output_config.effort`
-    /// —— 所以绑一次，两条通道都生效，不需要各写一份。
+    /// —— 所以绑一次，两条通道都生效，不需要各写一份（5.2 的差别只在活动套餐
+    /// 通道走通用折算而不是 `apply_to_anthropic` 的三档装配，见 `super::reasoning`
+    /// 模块头「只归一、不做预算」一段）。
     ///
     /// ── 「客户端指定过」的判据 ────────────────────────────────
     /// 与 CatPaw 同一口径：绑定是**默认值**，不覆盖用户的显式意图。这里比
@@ -119,9 +125,9 @@ impl ProviderAdapter for ZcodeAdapter {
                 reason: "客户端请求体里已指定思考参数，绑定不覆盖",
             };
         }
-        if !super::reasoning::is_glm53(model) {
+        if !super::reasoning::is_glm53(model) && !super::reasoning::is_glm52(model) {
             return ReasoningPatch::Skip {
-                reason: "该模型没有已确认的 ZCode 思考档位（目前只有 GLM-5.3 家族）",
+                reason: "该模型没有已确认的 ZCode 思考档位（目前只有 GLM-5.2 / 5.3 家族）",
             };
         }
         // 表外等级（界面的「自定义输入」）不注入：上游收不收没有证据，
@@ -132,10 +138,10 @@ impl ProviderAdapter for ZcodeAdapter {
                 reason: "该等级不在通用档位表内（自定义等级不参与转发）",
             };
         }
-        match super::reasoning::normalize(Some(level)) {
-            Some(level) => ReasoningPatch::Set {
+        match super::reasoning::target_effort(model, Some(level)) {
+            Some(value) => ReasoningPatch::Set {
                 field: super::reasoning::EFFORT_FIELD,
-                value: Value::String(level.as_str().to_string()),
+                value: Value::String(value.to_string()),
             },
             None => ReasoningPatch::Skip {
                 reason: "该等级没有可翻译的 ZCode 目标值",
@@ -145,19 +151,19 @@ impl ProviderAdapter for ZcodeAdapter {
 
     /// 随请求上行的思考等级（请求日志「上游等级」列的采集口）。
     ///
-    /// 默认实现读的是**客户端原值**（并集键链），而本家对 GLM-5.3 家族会把它
-    /// 归一成上游认的三档再发 —— 那一列于是会写出一个没发出去的档位
-    /// （`xhigh` 而字节里是 `max`）。所以这里按**本家 resolver 的同一条规则**
-    /// 读：模型是 5.3 家族且体里有 `reasoning_effort` 时报归一后的值；
+    /// 默认实现读的是**客户端原值**（并集键链），而本家对 GLM-5.2 / 5.3 家族
+    /// 会把它归一成上游认的档位再发 —— 那一列于是会写出一个没发出去的档位
+    /// （`xhigh` 而字节里是 `max`；5.2 上 `none` 而字节里是 `minimal`）。所以
+    /// 这里按**本家 resolver 的同一条规则**读（[`super::reasoning::target_effort`]）：
+    /// 模型属于受管家族且体里有 `reasoning_effort` 时报归一后的值；
     /// 其余情形回落到默认实现（别的键名原样随请求上行，见 trait 的说明）。
     fn outbound_reasoning(&self, body: &Value) -> Option<String> {
         let model = body.get("model").and_then(Value::as_str).unwrap_or("");
         let declared = body
             .get(super::reasoning::EFFORT_FIELD)
-            .and_then(Value::as_str)
-            .filter(|_| super::reasoning::is_glm53(model));
-        if let Some(level) = declared.and_then(|level| super::reasoning::normalize(Some(level))) {
-            return Some(level.as_str().to_string());
+            .and_then(Value::as_str);
+        if let Some(level) = super::reasoning::target_effort(model, declared) {
+            return Some(level.to_string());
         }
         crate::server::core::model_rules::read_client_level(body)
             .filter(|level| !crate::server::core::model_rules::reasoning_is_off(level))
@@ -243,6 +249,19 @@ impl ProviderAdapter for ZcodeAdapter {
         ))
     }
 
+    /// 推理请求恒为 stream:true；ZCode 的 JSON 响应是业务拒绝，HTTP 200
+    /// 也要先读错误体（实测 1005 / exceed quota limit），不能当 SSE 消费。
+    fn is_error_response(&self, status: u16, headers: &HeaderMap) -> bool {
+        if !(200..300).contains(&status) {
+            return true;
+        }
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    }
+
     /// 上游错误分类。
     ///
     ///   - `401` → TokenExpired（编排层会刷新后同账号重试一次；本家当前的
@@ -251,6 +270,8 @@ impl ProviderAdapter for ZcodeAdapter {
     ///     上游不给结构化的恢复时间，`reset_at` 给 None 让冷却走兜底时长。
     ///     「套餐已到期」也是这条 —— 上游用 429 表达它，而**换通道**
     ///     （账号设置里的「使用套餐」）才是出路，见 `plan` 的模块头）
+    ///   - 业务码 `1005` → QuotaLimited / 429（活动套餐可用 HTTP 200 返回
+    ///     exceed quota limit；不猜测额度恢复时间）
     ///   - 其余 → 交给共用的内容拦截判定（`content_block`），
     ///     与其余各家同一口径 —— 编码套餐同样会有内容策略拦截
     ///
@@ -298,14 +319,17 @@ impl ProviderAdapter for ZcodeAdapter {
         if status == 401 {
             return UpstreamErrorClass::TokenExpired { message };
         }
-        if status == 429 {
+        if status == 429 || code == Some(1005) {
             return UpstreamErrorClass::QuotaLimited {
                 reset_at: None,
                 message,
                 upstream_code: code,
-                status,
+                status: 429,
             };
         }
+        // 被响应头检查拒绝的 2xx JSON 必须产生失败状态；保留原始 HTTP
+        // 状态在 message 中，未知业务码不猜测为凭证失效或额度用尽。
+        let status = if (200..300).contains(&status) { 502 } else { status };
         content_block::classify_or_fatal(status, error_body, message, code)
     }
 

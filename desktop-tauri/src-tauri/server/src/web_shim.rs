@@ -513,6 +513,10 @@ pub fn shim_js() -> &'static str {
     setModelCapabilities: function (provider, id, capabilities) {
       return call('POST', '/api/models/capabilities', { provider: provider, id: id, capabilities: capabilities });
     },
+    // 模型测试：真打上游、会消耗额度；payload 原样透传（与桌面 bridge 对齐），
+    // 各键都可选（account_id / prompt / system_prompt / reasoning / stream / test_id）。
+    // 结论失败也返回 2xx —— 上游的错误在返回值的 status / error 里
+    testModel: function (payload) { return call('POST', '/api/models/test', payload || {}); },
 
     // ── 网关 API Key（多把）──
     getKeys: function () { return call('GET', '/api/keys'); },
@@ -575,26 +579,46 @@ pub fn shim_js() -> &'static str {
     getAccountConnections: function () { return call('GET', '/api/accounts/connections'); },
     checkinAllAccounts: function (id) { return call('POST', '/api/accounts/checkin', id ? { id: id } : {}); },
 
-    // ── 手机验证码登录（AutoClaw 国内版）──
+    // ── 手机验证码登录（AutoClaw 国内版 / Loomy）──
+    // 与桌面 `bridge.rs` 的同名方法**必须成对存在**（理由见下面 ZCode 那段的
+    // 说明）：界面只知道「手机号 + 中间态」，走哪个端点由两份桥各自决定。
+    //
+    // ── 为什么这里要按 provider 选端点（曾经漏过，issue #93）──────
+    // Loomy 是**另一条链路**（自己的签名算法与站点，中间态叫 msgid 而不是
+    // deviceId），端点在服务端就是分开挂的（`api::session::login_loomy_*`）。
+    // 只补了桌面那份桥、漏了这里时，浏览器面板发的 loomy 会落进 AutoClaw
+    // 端点：验证码由 AutoClaw 发出、账号也存成 AutoClaw，界面却因为文案取自
+    // 卡片 label 而显示「Loomy 账号已添加」—— 全程没有一条报错。
     sendSmsCode: function (input) {
       var isObject = input && typeof input === 'object';
       var phone = String((isObject ? input.phone : input) || '');
       var provider = isObject && input.provider ? String(input.provider) : '';
-      return call('POST', '/api/session/login/sms/send', {
+      var path = provider === 'loomy'
+        ? '/api/session/login/loomy/sms/send'
+        : '/api/session/login/sms/send';
+      return call('POST', path, {
         phone: phone,
         provider: provider || undefined,
       });
     },
     verifySmsLogin: function (payload) {
       payload = payload || {};
+      var provider = payload.provider ? String(payload.provider) : '';
+      var path = provider === 'loomy'
+        ? '/api/session/login/loomy/sms/verify'
+        : '/api/session/login/sms/verify';
       var body = {
         phone: String(payload.phone || ''),
         code: String(payload.code || ''),
       };
+      // deviceId（AutoClaw）/ msgid（Loomy）：两个中间态都按「有值才带」整形
+      // —— 空串会被后端当成一个真值带上去。字段名由界面按各自链路给（见
+      // ui/sms-login.js 的 SMS_PROFILES），这里只透传，不替它做归一。
       if (payload.deviceId) body.deviceId = String(payload.deviceId);
+      if (payload.msgid) body.msgid = String(payload.msgid);
       if (payload.name) body.name = String(payload.name);
-      if (payload.provider) body.provider = String(payload.provider);
-      return call('POST', '/api/session/login/sms/verify', body);
+      if (provider) body.provider = provider;
+      return call('POST', path, body);
     },
 
     // ── 定时签到 ──
@@ -632,6 +656,25 @@ pub fn shim_js() -> &'static str {
     getSanitize: function () { return call('GET', '/api/sanitize'); },
     saveSanitize: function (enabled) {
       return call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true });
+    },
+
+    // ── Cline 伪装头（转发头逐键覆盖）──
+    // 与桌面桥（src/bridge.rs 的 getClineHeaders / saveClineHeaders）同一映射。
+    // 这两个方法曾经漏在网页桥里：设置页调用 `getClineHeaders` 抛
+    // 「不是函数」，面板因此一直显示「不可用」——后端接口本身是好的，
+    // 缺的只是这座桥。
+    getClineHeaders: function () { return call('GET', '/api/cline/headers'); },
+    saveClineHeaders: function (overrides) {
+      // 整体替换覆盖表（非增量 merge），与后端 PUT 同语义；界面传的就是
+      // 「编辑后的整张表」。返回值与 GET 同形（后端 PUT 回的就是那份三表），
+      // 界面拿它直接重画。
+      return call('PUT', '/api/cline/headers', { overrides: overrides || {} });
+    },
+
+    // ── 网关面跨域访问（/v1/*，默认关）──
+    getCors: function () { return call('GET', '/api/cors'); },
+    saveCors: function (enabled) {
+      return call('PUT', '/api/cors', { corsEnabled: enabled === true });
     },
 
     // ── 系统提示词与内容拦截降级 ──
