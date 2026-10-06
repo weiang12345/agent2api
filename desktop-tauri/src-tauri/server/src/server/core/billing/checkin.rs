@@ -255,13 +255,9 @@ pub async fn checkin_for(
                 crate::server::core::providers::loomy::checkin::claim_daily_login(store, &id)
                     .await
                     .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-                    .await
-                    .map_err(|error| error.message);
-            claim_result(id, name, &display, true, claim)
-        }
-        // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
+           claim_result(id, name, &display, true, claim)
+       }
+       // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
         // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露。
