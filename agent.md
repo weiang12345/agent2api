@@ -107,3 +107,12 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
   ```
 
   只设 `HTTPS_PROXY` 就够（gh 的请求全是 HTTPS，实测不读 `HTTP_PROXY`）。第 6 节的 `scripts/release.sh` 已内置这一步（从 git 配置读取后透传给 gh），用脚本发版无需手动设。代理没开时 gh 会立刻报 `proxyconnect tcp: ... connection refused` 而不回退直连 —— 与 `git push` 的表现一致。
+
+## 9. fork 维护备忘（weiang12345/agent2api）
+
+本节是 fork 相对上游的差异记录。第 5–7 节描述的是上游发版流程，fork 实际按本节执行。
+
+- **本机不编译，发版全走 GitHub Actions 云端构建**（2026-10-07 起）：本机 `target/`（约 26GB）与 `desktop-tauri/src-tauri/target`（约 3GB）构建产物已全部删除，后续发版只推 `v*` tag 让云端构建，`scripts/release.sh` 收尾挂 Release。只有本地调试需要时才重新 `cargo check`（依赖重编约 2-3 分钟），平时不要在本机跑构建占磁盘。
+- **CI 与上游的差异**：`build.yml` 只保留 `windows` job（不构建 macOS dmg，上游第 5 节表格里的 macOS 产物 fork 没有）；`docker.yml` 只允许手动 `workflow_dispatch`（发版 tag 不推 Docker Hub 镜像）；`release.sh` 只下载 `windows-nsis` 一个 artifact。
+- **合并上游时必须保留的 fork 功能**：Trae 签到、CatPaw `tools` 嵌套过深修复（ Responses 入参 anyOf 展平）、ZCode 活动套餐通道，以及上面两条 CI 差异。
+- **版本号格式**：fork 发版用 `X.Y.Z-fork.N`，`X.Y.Z` 跟随上游当前版本，fork 序号从 1 递增（如上游 2.9.4 → `2.9.4-fork.1`）。改完版本号用 `cargo update -p agent2api-server -p workbuddy-proxy-desktop` 刷新 Cargo.lock，不要在本机跑 `cargo check` 重编 22GB 依赖。
