@@ -53,7 +53,7 @@ import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick, checkinErrorOf,
   commitPriority, connectionsOf, maskName, moveAccount, openSettingsDialog, poolError,
   proxyPoolSnapshot, queryUsageOnce, runCheckin, setAccountEnabled, setPanelOpen,
-  startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntries, usageFailureOf,
+  startCodeArtsWelfare, startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
 /** 图标（icons.js 的内联 SVG 串）：整站共用一份图标集，这里只做注入 */
 function iconHtml(name: string, size: number): string {
@@ -420,7 +420,9 @@ export function UsageCell({ account }: { account: AccountRecord }) {
   if (!supportsUsage(account)) {
     return <span className='muted' title='该提供商没有余额查询'>—</span>
   }
-  const entry = usageEntries().get(account.id)
+  // 读入口走 usageEntryOf（不是裸的 usageEntries().get）：它会作废「比账号记录还旧」
+  // 的失败结论，理由与后端快照出口一致
+  const entry = usageEntryOf(account)
   const summary = usageSummary(entry)
   // 失败 / 未配置那些档不画进度条：读数本身就不是「还剩多少」，
   // 给它配个进度条会把一句错误装饰成一条可信的读数

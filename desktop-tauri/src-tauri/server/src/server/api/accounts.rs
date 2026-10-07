@@ -239,7 +239,7 @@ pub async fn dispatch(
         }
         // 定时查询那一轮的结果快照（形状同 usage，多一个 `at`）
         ("GET", "usage/snapshot") => {
-            return super::accounts_usage::accounts_usage_snapshot().await
+            return super::accounts_usage::accounts_usage_snapshot(&state).await
         }
         // 账号级活跃连接数（账号页「连接数」列；见 `core::upstream::connections`）
         ("GET", "connections") => return account_connections(&state),

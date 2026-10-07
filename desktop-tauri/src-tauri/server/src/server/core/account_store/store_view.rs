@@ -16,6 +16,8 @@
 //!
 //! 这些方法仍是 `impl AccountStore` 的分块（同一个类型，跨文件不改变可见性）。
 
+use std::collections::HashMap;
+
 use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::state::{AccountState, StoredAccount};
@@ -154,6 +156,31 @@ impl AccountStore {
         let _guard = self.guard();
         let state = self.load(&_guard);
         self.snapshot(&state)
+    }
+
+    /// 账号 id → 该记录最近一次改动的时刻（`max(addedAt, updatedAt)`，毫秒）。
+    ///
+    /// 给「这条结论现在还算不算数」的时效判定用（见 `core::usage_query` 的快照
+    /// 出口过滤）。判据刻意只看记录自己的时间戳：重新登录、重新导入、token 被
+    /// 刷新、改设置都会把它往前推，而**凭证内容本身不必为了这个判定被读出来**
+    /// —— 比指纹更省事，也不给「把 token 拼进一个新结构」多开一条口子。
+    ///
+    /// 代价是改动类型区分不出来（换凭证与改备注名同样是「记录变了」）：判定方
+    /// 按「记录变了就作废旧结论」处理，多作废一条失败提示，比留着一条过期结论
+    /// 更轻 —— 用户手点一次查询就能得到新的（见 `usage_query` 的说明）。
+    pub fn account_change_times(&self) -> HashMap<String, i64> {
+        let _guard = self.guard();
+        let state = self.load(&_guard);
+        state
+            .accounts
+            .iter()
+            .map(|record| {
+                (
+                    record.id().to_string(),
+                    record.added_at().max(record.updated_at()),
+                )
+            })
+            .collect()
     }
 
     /// 已持锁时的列表快照（CRUD 内部要在同一次锁里连做「写入 + 取快照」）

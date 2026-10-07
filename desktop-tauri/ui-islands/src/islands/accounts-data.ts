@@ -57,7 +57,60 @@ export const NOT_CONFIGURED_CODE = 'usage_not_configured'
  */
 const usageMap = new Map<string, UsageEntry>()
 
+/**
+ * 失败结论的**取得时刻**（按账号 id，毫秒）。只有失败条目需要它：失败行是对
+ * 「当时那份凭证」的断言，账号记录一变（重新登录 / 重导入 / 刷过 token）就作废
+ * —— 判据与读入口见 `usageEntryOf`。成功读数不记时刻：「上次读数」本来就会旧，
+ * 界面按读数展示，不作废。
+ */
+const usageFailureAt = new Map<string, number>()
+
+/**
+ * **原始**缓存（含已过期的失败结论）：余额列的读入口是 [`usageEntryOf`]，它做
+ * 时效过滤（见那里的说明）。新加读取点请走 `usageEntryOf` —— 直接读这张表就会
+ * 把「重新登录前的旧失败结论」又显示出来，那正是这条过滤要挡的 bug。
+ */
 export const usageEntries = (): ReadonlyMap<string, UsageEntry> => usageMap
+
+/**
+ * 写一条余额缓存（`at` = 这条结论的取得时刻：快照行用它自己的 `at`，手动查询
+ * 用当刻）。失败结论记时刻、其它形态清掉残留 —— 同一行「失败过、后来又成功了」
+ * 时必须把旧时刻删掉，否则下一次失败的判定会拿一个更早的戳去比。
+ */
+function putUsage(id: string, entry: UsageEntry, at: number): void {
+  usageMap.set(id, entry)
+  if (entry !== null && entry !== undefined && usageFailureOf(entry)) {
+    usageFailureAt.set(id, at)
+  } else {
+    usageFailureAt.delete(id)
+  }
+}
+
+/**
+ * 该账号**此刻可用**的余额缓存条目（余额列的唯一读入口）。
+ *
+ * ── 过期的失败结论在这里作废（返回 undefined = 界面显示「未查询」）──
+ * 失败行说的是「这个账号此刻查不到 / 续期不了」，而缓存按账号 id 存：账号重新
+ * 登录、重新导入、或 token 被刷新（记录的 `updatedAt` 往前走）之后，那条断言就
+ * 不再成立 —— 继续显示只会让人以为账号还是坏的。真实事故：两个小浣熊账号 12:39
+ * 重新登录成功、转发与余额都恢复正常，界面上却一直挂着上午的「小浣熊刷新接口
+ * 失败（HTTP 401）」。后端在快照出口做同一条判定
+ * （`core::usage_query::prune_stale_failures`）；这里管的是**本地缓存**，重新
+ * 登录后不必等下一轮查询才纠正。
+ *
+ * 成功读数不受影响：「可用 5147 积分」是一次读数的事实，凭证换了它也不会变成
+ * 假话，界面本来就按「上次读数」展示。
+ *
+ * 判据用「记录改动时间」而不是凭证指纹：与后端同一取舍 —— 改备注名这类改动也会
+ * 让旧失败作废，多作废一条提示比留着过期结论轻（手点一次查询就能拿到新的）。
+ */
+export function usageEntryOf(account: AccountRecord): UsageEntry {
+  const entry = usageMap.get(account.id)
+  if (entry === undefined) return undefined
+  if (!usageFailureOf(entry)) return entry
+  const changedAt = Math.max(Number(account.addedAt) || 0, Number(account.updatedAt) || 0)
+  return (usageFailureAt.get(account.id) || 0) >= changedAt ? entry : undefined
+}
 
 /**
  * 上一次签到的**失败原因**（按账号 id）。
@@ -230,6 +283,9 @@ export function openBatchDialog(ids: string[], action = 'enable'): void {
 export function refreshCaches(validIds: Set<string>): void {
   let touched = false
   for (const id of [...usageMap.keys()]) if (!validIds.has(id)) { usageMap.delete(id); touched = true }
+  // 失败结论的时刻表跟着条目一起清：账号删掉后同 id 可能被「重新添加」复用，
+  // 留着的旧时刻会让那条新记录继承一个本该作废的失败结论
+  for (const id of [...usageFailureAt.keys()]) if (!validIds.has(id)) usageFailureAt.delete(id)
   for (const id of [...checkinErrors.keys()]) if (!validIds.has(id)) { checkinErrors.delete(id); touched = true }
   const panels = new Map(getStore().panels)
   for (const id of [...panels.keys()]) if (!validIds.has(id)) { panels.delete(id); touched = true }
@@ -329,13 +385,21 @@ function cacheEntryOf(row: Record<string, unknown>): UsageEntry {
   return { error: row.error ? String(row.error) : '余额响应为空', code: row.code }
 }
 
-/** 把一批余额结果写进列表缓存（定时快照、批量查询与外部调用共用）。返回写入条数。 */
-export function applyBalances(balances: { results?: Array<Record<string, unknown>> } | null | undefined): number {
+/**
+ * 把一批余额结果写进列表缓存（定时快照、批量查询与外部调用共用）。返回写入条数。
+ *
+ * 行的时间戳取 `balances.at`（后端快照自带的查询时刻），没有就按「刚刚」——
+ * 手动查询的那一批结果没有 `at` 字段，而它本来就是当刻的结论。
+ */
+export function applyBalances(
+  balances: { results?: Array<Record<string, unknown>>; at?: unknown } | null | undefined,
+): number {
   const rows = Array.isArray(balances?.results) ? balances.results : []
+  const at = Number(balances?.at) || Date.now()
   let applied = 0
   for (const row of rows) {
     if (!row?.id) continue
-    usageMap.set(String(row.id), cacheEntryOf(row))
+    putUsage(String(row.id), cacheEntryOf(row), at)
     applied++
   }
   if (applied) bump()
@@ -350,7 +414,8 @@ export function applyBalances(balances: { results?: Array<Record<string, unknown
  * 那一次的旧余额，那正是「定时查询」最容易让人觉得「没生效」的地方。
  * `at` 是那一刻的毫秒时间戳，用它判断「这一轮我应用过了没」：时间戳没变就直接返回，
  * 不做无谓的重绘。**失败的行同样会被应用**（后端快照里就带着它们），于是账号页会
- * 明确显示「查询失败」而不是悄悄留着上一个成功的旧值。
+ * 明确显示「查询失败」而不是悄悄留着上一个成功的旧值 —— 但后端出口会先丢掉
+ * 「账号记录比快照还新」的失败行（见 `usageEntryOf` 的说明），那些行这里也就收不到。
  * 失败静默（不 toast）：它是 20 秒一次的轮询，网关长时间不可用会变成刷屏。
  */
 let lastSnapshotAt = 0
@@ -381,17 +446,19 @@ export async function syncBalancesSnapshot(): Promise<boolean> {
 export async function queryUsageFor(id?: string | null): Promise<{ results?: Array<Record<string, unknown>> } | null | undefined> {
   const data = await shared().workbuddyDesktop?.getAllBalances?.(id || undefined)
   const rows = Array.isArray(data?.results) ? data.results : []
+  // 手动查询的结论就是当刻的（后端这一轮可能顺手刷过 token，那也是「现在」）
+  const at = Date.now()
   const returned = new Set<string>()
   for (const row of rows) {
     if (!row?.id) continue
     const rowId = String(row.id)
     if (id && rowId !== id) continue
     returned.add(rowId)
-    usageMap.set(rowId, cacheEntryOf(row))
+    putUsage(rowId, cacheEntryOf(row), at)
   }
   if (id) {
     // 后端返回了 0 行才是真的「没数据」（账号刚被删、或 provider 不认这个 id）
-    if (!returned.has(id)) usageMap.set(id, '未返回余额数据')
+    if (!returned.has(id)) putUsage(id, '未返回余额数据', at)
     bump()
     return data
   }
@@ -400,7 +467,7 @@ export async function queryUsageFor(id?: string | null): Promise<{ results?: Arr
   // 本轮查询」说成「上游没给数据」—— 与单查那个 bug 同源。判据走 `batchUsageTargets`，
   // 与后端 `resolve_batch_targets` 逐字一致。
   for (const account of batchUsageTargets()) {
-    if (!returned.has(account.id)) usageMap.set(account.id, '未返回余额数据')
+    if (!returned.has(account.id)) putUsage(account.id, '未返回余额数据', at)
   }
   bump()
   return data
@@ -419,7 +486,7 @@ export async function queryAllUsage(): Promise<void> {
   if (!targets.length) { toast('暂无可查询余额的账号', 'err'); return }
   patch({ usageBusy: true })
   // 先写「查询中」再重绘：余额列立刻显示查询中，结果回来了直接换成读数
-  targets.forEach(account => usageMap.set(account.id, null))
+  targets.forEach(account => putUsage(account.id, null, Date.now()))
   bump()
   try {
     const rows = (await queryUsageFor(null))?.results || []
@@ -433,7 +500,7 @@ export async function queryAllUsage(): Promise<void> {
       : `已更新 ${ok}/${rows.length} 个账号，${failed} 个失败`, failed ? 'err' : 'ok')
   } catch (error) {
     const message = errorMessage(error)
-    targets.forEach(account => usageMap.set(account.id, `查询失败：${message}`))
+    targets.forEach(account => putUsage(account.id, `查询失败：${message}`, Date.now()))
     bump()
     toast(`余额查询失败：${message}`, 'err')
   } finally {
@@ -589,7 +656,7 @@ async function runUsageQuery(id: string): Promise<void> {
   if (getStore().usageInflight.has(id)) return
   const inflight = new Set(getStore().usageInflight)
   inflight.add(id)
-  usageMap.set(id, null)
+  putUsage(id, null, Date.now())
   patch({ usageInflight: inflight })
   try {
     await queryUsageFor(id)
@@ -612,7 +679,7 @@ export async function queryUsageOnce(id: string): Promise<void> {
     else if (failure) toast(`余额查询失败：${failure.message}`, 'err')
     else toast('✅ 已更新余额')
   } catch (error) {
-    usageMap.set(id, `查询失败：${errorMessage(error)}`)
+    putUsage(id, `查询失败：${errorMessage(error)}`, Date.now())
     bump()
     toast(`余额查询失败：${errorMessage(error)}`, 'err')
   }
@@ -649,7 +716,7 @@ export async function refreshUsageAfterCheckin(id?: string): Promise<void> {
     try {
       await runUsageQuery(id)
     } catch (error) {
-      usageMap.set(id, `查询失败：${errorMessage(error)}`)
+      putUsage(id, `查询失败：${errorMessage(error)}`, Date.now())
       bump()
     }
     return
@@ -658,13 +725,13 @@ export async function refreshUsageAfterCheckin(id?: string): Promise<void> {
   const targets = batchUsageTargets()
   if (!targets.length) return
   patch({ usageBusy: true })
-  targets.forEach(account => usageMap.set(account.id, null))
+  targets.forEach(account => putUsage(account.id, null, Date.now()))
   bump()
   try {
     await queryUsageFor(null)
   } catch (error) {
     const message = errorMessage(error)
-    targets.forEach(account => usageMap.set(account.id, `查询失败：${message}`))
+    targets.forEach(account => putUsage(account.id, `查询失败：${message}`, Date.now()))
     bump()
   } finally {
     patch({ usageBusy: false })
@@ -867,7 +934,9 @@ export type AccountsViewApi = {
   refreshCaches(validIds: Set<string>): void
   openPanels(ids: string[], kind: PanelKind): void
   syncConnections(): Promise<boolean>
-  applyBalances(balances: { results?: Array<Record<string, unknown>> } | null | undefined): number
+  applyBalances(
+    balances: { results?: Array<Record<string, unknown>>; at?: unknown } | null | undefined,
+  ): number
   syncBalancesSnapshot(): Promise<boolean>
   queryUsageFor(id?: string | null): Promise<unknown>
   queryAllUsage(): Promise<void>
