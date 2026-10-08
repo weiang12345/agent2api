@@ -142,6 +142,7 @@ bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 
 - **本机不编译，发版全走 GitHub Actions 云端构建**（2026-10-07 起）：本机 `target/`（约 26GB）与 `desktop-tauri/src-tauri/target`（约 3GB）构建产物已全部删除，后续发版只推 `v*` tag 让云端构建，`scripts/release.sh` 收尾挂 Release。只有本地调试需要时才重新 `cargo check`（依赖重编约 2-3 分钟），平时不要在本机跑构建占磁盘。
 - **CI 与上游的差异**：`build.yml` 只保留 `windows` job（不构建 macOS dmg，上游第 7 节表格里的 macOS 产物 fork 没有）；`docker.yml` 只允许手动 `workflow_dispatch`（发版 tag 不推 Docker Hub 镜像）；`release.sh` 只下载 `windows-nsis` 一个 artifact。
-- **合并上游时必须保留的 fork 功能**：Trae 签到、CatPaw `tools` 嵌套过深修复（ Responses 入参 anyOf 展平）、ZCode 活动套餐通道，以及上面两条 CI 差异。
+- **合并上游时必须保留的 fork 功能**：CatPaw `tools` 嵌套过深修复（ Responses 入参 anyOf 展平）、ZCode 活动套餐通道，以及上面两条 CI 差异。上游 v2.9.7 已实现 Trae 签到，之后以**上游版**为准，不要再保留 fork 的旧 Trae 签到实现；`trae/checkin.rs`、`auto_checkin.rs`、`billing/checkin.rs` 和前端能力表冲突时优先取上游。
+- **合并验证口径**（2026-10-08 实测）：先跑 `npm --prefix desktop-tauri/ui-islands run build` 重建 `ui/islands/ui.js` / `ui.css`，再跑 `cargo check --workspace` 和 `cargo test --workspace`；验证后删除本机 `desktop-tauri/src-tauri/target`，不要把本地构建产物留在仓库里。
 - **版本号格式**：fork 发版用 `X.Y.Z-fork.N`，`X.Y.Z` 跟随上游当前版本，fork 序号从 1 递增（如上游 2.9.5 → `2.9.5-fork.1`）。改完版本号用 `cargo update -p agent2api-server -p workbuddy-proxy-desktop` 刷新 Cargo.lock，不要在本机跑 `cargo check` 重编 22GB 依赖。
 - **Windows 本机跑 release.sh 的两个坑**（2026-10-07 实测）：`scripts/release.sh` 检出后是 CRLF，bash 会报 `$'\r': command not found` —— 先复制一份去掉 `\r` 再跑；`docs/` 在 gitignore 里，release-notes 草稿进不了提交，发布提交必须 `git commit --allow-empty -F docs/release-notes/X.Y.Z.md` 创建，别把草稿当提交内容加进暂存区。
