@@ -46,11 +46,9 @@
 //!     禁用只影响本端的取用。
 //!
 //! ── 端口跟随引用（双向对账，`api::proxies::reconcile_listeners`）────
-//! 专用端口只为账号转发而存在（测试走统一测试口，见下节），于是「引用 ⇄
-//! 端口」两个方向都自动收敛：新增引用补监听器，**失去引用（删账号 / 改走
-//! 别的代理）回收端口**。账号每次写操作后对账一次，缺口非空就投一次内核
-//! 重建（重建按最新引用全量重算，一次同时补缺与回收）。「无引用却还挂着
-//! 端口」因此只是两次重建之间的瞬时态，不是需要用户手动清理的状态。
+//! 专用端口服务账号转发与更新、下载等服务线路（引用合集见 `usage`）。新增
+//! 引用补监听器，失去全部引用则回收端口；账号或更新线路保存后对账，缺口
+//! 非空才投内核重建。测试走统一测试口，不参与引用统计。
 //!
 //! ── 测试走统一测试口（不占节点端口）────────────────────────
 //! 内核里有一个固定的「测试口」监听器，背后是 select 策略组（成员 = 全部
@@ -58,7 +56,7 @@
 //! `sub_kernel::runtime::select_test_node`），**不为被测节点开专用端口**。
 //! 于是「先测一个节点、测通了再决定给哪个账号用」这条最自然的用法零成本 ——
 //! 曾经为此存在的 `pinned`（测试前把条目钉住、请内核补建、等端口写回）
-//! 整套机制随之退役。专用端口只服务真正在用的节点（账号引用，lazy listeners）；
+//! 整套机制随之退役。专用端口只服务被账号或服务线路引用的节点（lazy listeners）；
 //! 未引用的节点条目端口为 null（「未分配端口」），这是正常状态而不是待补建的缺口。
 
 //! ── 同步（`sync_clash`，对标 OmniProxy 的 syncClashVergeListeners）──
@@ -98,6 +96,8 @@ use serde_json::{json, Map, Value};
 use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution};
 use crate::server::db::Db;
 use crate::server::logging;
+
+pub mod usage;
 
 /// `kv` 表里的键名（保留键，见 `db::schema::RESERVED_KV_KEYS`）
 pub const KV_KEY: &str = "proxyPool";
@@ -159,16 +159,21 @@ fn write_items(items: &[Value]) -> Result<(), String> {
     let db = database()?;
     let text = serde_json::to_string(&json!({ "items": items }))
         .map_err(|error| format!("编码代理池失败: {error}"))?;
-    db.with(|conn| {
-        conn.execute(
-            "INSERT INTO kv (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![KV_KEY, text],
-        )
-        .map(|_| ())
-        .map_err(|error| format!("保存代理池失败: {error}"))
-    })
-    .ok_or_else(|| "代理池数据库不可用".to_string())?
+    let written = db
+        .with(|conn| {
+            conn.execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![KV_KEY, text],
+            )
+            .map(|_| ())
+            .map_err(|error| format!("保存代理池失败: {error}"))
+        })
+        .ok_or_else(|| "代理池数据库不可用".to_string())?;
+    written?;
+    // 保留键不走 `config::update`，显式通知自动同步（见 cloud_sync::auto_sync）
+    crate::server::core::cloud_sync::auto_sync::notify_change();
+    Ok(())
 }
 
 // ─── 正规化与校验 ───────────────────────────────────────────
@@ -329,9 +334,7 @@ pub fn resolve_item(item: &Value) -> Option<ProxyResolution> {
         json!({ "source": "clash", "listenerUid": text_of(item, "listenerUid") })
     } else if source == "subscription" {
         let Some(port) = valid_port(item.get("port")) else {
-            // 两种「没有端口」要分开说：节点还在但还没有账号引用它（lazy
-            // listeners 只给引用中的节点开监听器；刚保存引用的话，内核可能
-            // 还在重建），与节点已被订阅移除 —— 处置动作完全不同。
+            // 无引用或内核重建中的节点没有端口，与所属订阅已移除分开报错
             //
             // 「没有端口」是未引用节点的**正常状态**而不是待补建的缺口：
             // 测试走统一测试口（见模块头），不再需要端口；地址只在「真在用」
@@ -339,7 +342,7 @@ pub fn resolve_item(item: &Value) -> Option<ProxyResolution> {
             let node_alive = crate::server::core::subscriptions::ids()
                 .contains(&text_of(item, "providerId"));
             return Some(ProxyResolution::Failed(if node_alive {
-                "该节点还没有监听端口（还没有账号引用它 —— 在账号里选它并保存后，内核会自动开端口）".to_string()
+                "该节点的监听端口尚未就绪（在账号或更新设置中选中并保存后，内核会自动分配端口；已保存的请稍等或检查内核状态）".to_string()
             } else {
                 "订阅节点已不存在（订阅更新后节点被移除，等下一次同步或重新订阅）".to_string()
             }));
@@ -801,6 +804,40 @@ pub fn record_test(id: &str, result: &TestOutcome) -> Result<Vec<Value>, String>
     Ok(list())
 }
 
+/// 摘掉**不属于任何现存订阅**的订阅镜像条目，返回清理条数。
+///
+/// 正常路径下这件事由内核同步做（`sync_subscription_nodes` 按 providerId
+/// 摘条目）。但内核同步只有在「内核装好且没被手动关闭」时才会跑：
+///   · 内核未安装 —— restart 早退在 `installed()` 上；
+///   · 手动关闭内核 —— 变更只落库不重启（见 `sub_kernel::is_manually_halted`）。
+/// 这两种状态下删掉订阅，镜像条目就没有任何同步会来收，从此挂在池里变成
+/// 「孤儿」：用户明明删了订阅，节点却还在列表上。所以 api 层在变更后**直接**
+/// 调这里做一次兜底清理 —— 不依赖内核，读到什么就按什么清。
+///
+/// `live_provider_ids` 由调用方从订阅存储取（本模块不认识订阅存储，依赖方向
+/// 是 subscriptions / sub_kernel → proxy_pool）。只动 subscription 条目：
+/// manual / clash 从不被碰。
+pub fn prune_orphan_subscription_items(
+    live_provider_ids: &std::collections::HashSet<String>,
+) -> Result<usize, String> {
+    let mut items = read_items();
+    let before = items.len();
+    items.retain(|item| {
+        if !is_subscription_item(item) {
+            return true;
+        }
+        item.get("providerId")
+            .and_then(Value::as_str)
+            .map(|provider_id| live_provider_ids.contains(provider_id))
+            .unwrap_or(false) // 没有归属信息的坏行（手工改库）：清掉
+    });
+    let changes = before - items.len();
+    if changes > 0 {
+        write_items(&items)?;
+    }
+    Ok(changes)
+}
+
 /// 删除一条订阅节点的**孤儿**条目（所属订阅已不存在）。
 ///
 /// 只服务「手动清理」这一条出路：正常路径下订阅删除 / 禁用后条目会随
@@ -848,7 +885,7 @@ pub struct SubscriptionNodeTarget {
     pub sub_name: String,
     /// 节点名（条目名的后半段；同时是内核配置里监听器绑定的出口名）
     pub node: String,
-    /// 内核监听端口；**None = 未分配**（lazy listeners：内核只为被账号引用的
+    /// 内核监听端口；**None = 未分配**（lazy listeners：只为账号或服务线路引用的
     /// 节点开监听器，未引用的节点仍镜像进池供浏览选择，端口为空 —— 引用后
     /// 由对账链路触发内核重启补上，见 `api::proxies::reconcile_listeners`）
     pub port: Option<u16>,
@@ -859,12 +896,20 @@ pub struct SubscriptionNodeTarget {
 ///   · 集合里的节点 upsert（按 `providerId + node` 定位：**已存在的沿用 id**
 ///     —— 账号按 id 引用池条目，重生成 id 会让引用全部悬空）；
 ///   · 订阅侧已消失的（或订阅被删 / 被禁用后不再出现在集合里的）镜像条目摘掉；
+///   · 同一订阅内**本次清单里已不存在**的节点条目也摘掉（见下方 ③）；
 ///   · manual 与 clash 条目从不被碰。
 ///
 /// 返回变更条数（「已是最新」时为 0）。注意目标集合是**全部启用订阅的全部
 /// 节点**：只传一条订阅的节点时，其它订阅的条目会被当作「已消失」摘掉
 /// （调用方要传全量 —— sub_kernel 的同步总是构造全量）。
-pub fn sync_subscription_nodes(targets: &[SubscriptionNodeTarget]) -> Result<usize, String> {
+///
+/// `referenced_ids` 是被账号 / 服务线路引用的池条目 id：③ 的清理会跳过它们
+/// （节点在订阅里没了但账号还挂着 —— 保留条目让用户看见「这条引用失效了」，
+/// 比静默删掉、账号侧变成「代理不存在」更容易排查）。
+pub fn sync_subscription_nodes(
+    targets: &[SubscriptionNodeTarget],
+    referenced_ids: &std::collections::HashSet<String>,
+) -> Result<usize, String> {
     let now = logging::now_ms();
     let mut items = read_items();
     let mut changes = 0usize;
@@ -928,9 +973,20 @@ pub fn sync_subscription_nodes(targets: &[SubscriptionNodeTarget]) -> Result<usi
     // 改名很常见），按名判定会把改名后的节点删了重加（id 变了，账号引用
     // 悬空）。providerId 不在本次集合 = 该订阅被删 / 被禁用 / 已无节点，
     // 它名下的全部条目才真正该走。
+    //
+    // ③ 同一订阅内、本次清单里已经没有的节点条目摘掉 —— 这一段正是「按名
+    // 判定会误删改名节点」的代价兑现处：不改名就没事，一旦改名旧条目就永远
+    // 等不到同名节点来更新它，从此挂在池里（实测「魔戒」订阅的
+    // `剩余流量：X GB` 每更新一次沉淀一条，攒了 7 条）。判据取交集而非并集：
+    // 只有「providerId 还活着」时才进 ③，providerId 整个消失的走 ②。
     let live_providers: std::collections::HashSet<&str> = targets
         .iter()
         .map(|target| target.provider_id.as_str())
+        .collect();
+    // 本次清单里的 (providerId, node) 全集：③ 用它判断某条目是否还该存在
+    let live_nodes: std::collections::HashSet<(&str, &str)> = targets
+        .iter()
+        .map(|target| (target.provider_id.as_str(), target.node.as_str()))
         .collect();
     let before = items.len();
     items.retain(|item| {
@@ -940,7 +996,23 @@ pub fn sync_subscription_nodes(targets: &[SubscriptionNodeTarget]) -> Result<usi
         let Some(provider_id) = item.get("providerId").and_then(Value::as_str) else {
             return false; // 没有引用信息的坏行（手工改库），清掉
         };
-        live_providers.contains(provider_id)
+        if !live_providers.contains(provider_id) {
+            return false; // ②：订阅整个没了
+        }
+        // ③：订阅还在，但这个节点在最新清单里已经不存在
+        let Some(node) = item.get("node").and_then(Value::as_str) else {
+            return false; // 缺节点名的坏行，与上面同理
+        };
+        if live_nodes.contains(&(provider_id, node)) {
+            return true;
+        }
+        // 账号还挂着这条引用：留着，让用户看到「引用失效」而不是让它凭空消失
+        let referenced = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| referenced_ids.contains(id))
+            .unwrap_or(false);
+        referenced
     });
     changes += before - items.len();
 
@@ -983,7 +1055,7 @@ pub fn unprovision_subscription_nodes() -> Result<usize, String> {
 
 /// 被引用的订阅节点键集合（`<订阅id>::<节点名>`，与内核端口注册表的键同一形态）。
 ///
-/// `pool_ids` 是账号 proxy 指向的池条目 id（调用方从账号存储收集）。id 不在池里
+/// `pool_ids` 是账号与服务线路的池引用合集（`usage::referenced_pool_ids`）。id 不在池里
 /// 的引用（条目已被删）查不出节点、自然跳过 —— 那类引用解析时本来就会报「不存在」。
 /// 内核的 `allocate_listeners` 用它决定「哪些节点开监听器」（lazy listeners）。
 ///
@@ -1008,7 +1080,7 @@ pub fn subscription_node_keys(pool_ids: &std::collections::HashSet<&str>) -> std
         .collect()
 }
 
-/// 内核该给哪些节点开监听器：**账号引用中的条目**（禁用中的不算）。
+/// 内核该给哪些节点开监听器：**账号或服务线路引用中的条目**（禁用中的不算）。
 ///
 /// 内核侧（`runtime::listener_node_keys`）与对账判定
 /// （`api::proxies::reconcile_listeners`）都从这一处取，必须同一口径
@@ -1046,9 +1118,8 @@ pub fn test_target(id: &str) -> Result<TestTarget, String> {
 
 /// 这条订阅条目现在**需要监听器却没有端口**吗（启用后要不要补建的判据）。
 ///
-/// 判据与 `listener_node_keys` 完全同口径（账号引用，禁用中的不算），只是限定
-/// 到一条：条目自身已启用（禁用中的节点不要监听器）、是订阅节点、端口还空着，
-/// 且确实被引用。`referenced` 是账号引用中的池条目 id 集合（调用方从账号存储取）。
+/// 判据与 `listener_node_keys` 完全同口径（账号或服务线路引用，禁用中的不算），
+/// 只是限定到一条：订阅条目已启用、端口还空着，并且在 `referenced` 引用合集里。
 ///
 /// 与内核侧同口径是硬要求：口径不一致就会出现「判定说没有缺口、内核却不建」
 /// 这类谁也解释不清的状态（补建那条链的注释里也写着同一句话）。
@@ -1062,7 +1133,6 @@ pub fn needs_listener(id: &str, referenced: &std::collections::HashSet<&str>) ->
     if valid_port(item.get("port")).is_some() {
         return false;
     }
-    // `listener_node_keys` 的唯一来源是账号引用；条目已启用，引用即算数
     referenced.contains(id)
 }
 

@@ -52,7 +52,7 @@ import {
   Progress,
   SegmentedControl,
   Switch,
-} from '@ui'
+  Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '@ui'
 import {
   addSubscription, decodeQrImage, errorMessage, kernel, loadSection,
   readFileAsBase64, refreshSubscription, removeKernel, removeSubscription, restartKernel, saveSubscription,
@@ -60,6 +60,7 @@ import {
   getSnapshot, toggleSubscription, type SubscriptionItem,
 } from './proxies-sub-state'
 import { KernelDownloadDialog } from './proxies-kernel-dialog'
+import { KernelImportDialog } from './proxies-kernel-import'
 import {
   formatTime, loadSettings,
   // 代理池那份 store 与同步动作（本弹窗底部的「同步 Clash Verge」用；
@@ -92,6 +93,7 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
   const [range, setRange] = React.useState<{ base: number; end: number } | null>(null)
   /** 「下载内核」弹窗（出口 / 存放位置 / 进度 / 停止都在里面，见 proxies-kernel-dialog） */
   const [downloadOpen, setDownloadOpen] = React.useState(false)
+  const [importOpen, setImportOpen] = React.useState(false)
 
   // 端口范围是低频配置：挂载时静默读一次，读不到就不显示这一段（不影响内核状态本身）
   React.useEffect(() => {
@@ -111,6 +113,8 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
   }, [])
 
   const downloading = status?.download.state === 'downloading'
+  const importing = status?.import?.active === true
+  const installBusy = status?.installBusy === true
   const percent =
     downloading && status!.download.total > 0
       ? Math.round((status!.download.received / status!.download.total) * 100)
@@ -132,9 +136,11 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
         </Badge>
         <span className='text-[12.5px] text-text-2'>
           {/* 版本号是 t 的形参（占位符不传参会原样显示 "{version}"）；
-              未安装时不显示版本段，只留按需下载的说明 */}
+              未安装时不显示版本段，只留按需下载的说明。
+              显示的是**磁盘上实际生效的版本**（installedVersion，旧布局迁移
+              过来时可能与期望版本不同），缺失时回落到 status.version */}
           {status?.installed
-            ? t('内核 {version}', { version: status.version }) + '　·　'
+            ? t('内核 {version}', { version: status.installedVersion || status.version }) + '　·　'
             : ''}
           {status?.running
             ? t('控制端口 {port} · {n} 个节点监听器', { port: status?.controllerPort ?? '—', n: status?.listenerCount ?? 0 })
@@ -150,19 +156,21 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
           </span>
         ) : null}
         <div className='ml-auto flex items-center gap-2'>
+          <Button size='sm' variant='outline' disabled={(snapshot.pending || installBusy) && !importing}
+            onClick={() => setImportOpen(true)}>{importing ? t('正在导入…') : t('手动导入内核')}</Button>
           {!status?.installed ? (
             /* 点它开**下载弹窗**（选出口 / 选目录 / 看进度 / 停下载都在那里）——
                不再直接开始下载：GitHub 直连不通时，「点了没反应」没有任何补救
                余地，而现在第一件事就是选一条线路。
                下载中按钮**保持可点**（打开弹窗看进度、停止）：`pending` 在下载
                全程为 true，若照旧禁用掉，用户把弹窗一关就再也回不到进度界面了 */
-            <Button size='sm' variant='outline' disabled={snapshot.pending && !downloading}
+            <Button size='sm' variant='outline' disabled={(snapshot.pending || installBusy) && !downloading}
               onClick={() => setDownloadOpen(true)}>
               {downloading ? t('下载中…') : t('下载内核')}
             </Button>
           ) : (
             <>
-              <Button size='sm' variant='outline' disabled={snapshot.pending || downloading}
+              <Button size='sm' variant='outline' disabled={snapshot.pending || downloading || installBusy}
                 onClick={() => void restartKernel()}>
                 {status?.running ? t('重启内核') : t('启动内核')}
               </Button>
@@ -171,7 +179,7 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
                   保留，「启动内核」后原位恢复（见 proxies-sub-state 的
                   stopKernel）；与破坏性的「删除内核」是两回事 */}
               {status?.running ? (
-                <Button size='sm' variant='outline' disabled={snapshot.pending || downloading}
+                <Button size='sm' variant='outline' disabled={snapshot.pending || downloading || installBusy}
                   onClick={() => void stopKernel()}>
                   {t('关闭内核')}
                 </Button>
@@ -179,7 +187,7 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
               {/* 删除：装过内核之后才有意义（没装时摆了也只是个永远灰着的按钮），
                   破坏性且低频 —— 摆在启动 / 重启右侧、用危险语义，点开还有一道
                   确认（见 proxies-sub-state 的 removeKernel） */}
-              <Button size='sm' variant='destructive' disabled={snapshot.pending || downloading}
+              <Button size='sm' variant='destructive' disabled={snapshot.pending || downloading || installBusy}
                 onClick={() => void removeKernel()}>
                 {t('删除内核')}
               </Button>
@@ -204,7 +212,10 @@ export function KernelBar({ showPortRange = false }: { showPortRange?: boolean }
       {status?.lastError ? (
         <span className='text-[12px] text-destructive'>{status.lastError}</span>
       ) : null}
+      {importing ? <div className='flex items-center gap-3'><Progress className='flex-1' value={null} /><span className='text-xs text-subtle'>{t('正在导入…')}</span></div> : null}
+      {status?.import?.state === 'error' && status.import.error ? <span className='text-xs text-destructive'>{status.import.error}</span> : null}
       {downloadOpen ? <KernelDownloadDialog onClose={() => setDownloadOpen(false)} /> : null}
+      {importOpen ? <KernelImportDialog onClose={() => setImportOpen(false)} /> : null}
     </div>
   )
 }
@@ -240,7 +251,7 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
           <KernelBar />
 
           <div className='models-table-wrap'>
-            <table className='models-table'>
+            <Table container={false} className='models-table'>
               <colgroup>
                 <col className='w-[18%]' />
                 <col className='w-[31%]' />
@@ -249,25 +260,25 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
                 <col className='w-[8%]' />
                 <col className='w-[20%]' />
               </colgroup>
-              <thead>
-                <tr>
-                  <th>{t('名称')}</th>
-                  <th>{t('订阅来源')}</th>
-                  <th className='ta-center'>{t('节点')}</th>
-                  <th>{t('上次同步')}</th>
-                  <th className='ta-center'>{t('启用')}</th>
-                  <th className='ta-right'>{t('操作')}</th>
-                </tr>
-              </thead>
-              <tbody>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t('名称')}</TableHead>
+                  <TableHead>{t('订阅来源')}</TableHead>
+                  <TableHead className='ta-center'>{t('节点')}</TableHead>
+                  <TableHead>{t('上次同步')}</TableHead>
+                  <TableHead className='ta-center'>{t('启用')}</TableHead>
+                  <TableHead className='ta-right'>{t('操作')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {items.length ? items.map(item => {
                   const sync = kernel()?.providerSync?.[item.id]
                   return (
-                    <tr key={item.id} className={item.enabled ? '' : 'off'}>
-                      <td><b>{item.name || t('未命名')}</b></td>
+                    <TableRow key={item.id} className={item.enabled ? '' : 'off'}>
+                      <TableCell><b>{item.name || t('未命名')}</b></TableCell>
                       {/* 来源列：链接订阅显示主机段 + hover 复制；本地文件订阅
                           显示文件名（没有链接可复制，「立即更新」对它也无意义） */}
-                      <td className='group'>
+                      <TableCell className='group'>
                         <div className='flex min-w-0 items-center gap-1'>
                           {item.kind === 'local' ? (
                             <>
@@ -285,32 +296,32 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
                             </>
                           )}
                         </div>
-                      </td>
+                      </TableCell>
                       {/* 节点列只放读数；同步时间归「上次同步」列（两列各就各位）。
                           节点数优先取内核状态里的**实时**同步结果：条目上的 nodeCount
                           是列表响应注入的快照，写操作后的轮询窗口里可能还是旧的 0
                           （徽标曾冻在「—」上 —— 列表与内核一起轮询 + 这里的实时兜底，
                           双保险） */}
-                      <td className='ta-center'>
+                      <TableCell className='ta-center'>
                         {liveNodeCount(sync, item) > 0 ? (
                           <Badge variant='secondary'>{t('{n} 个', { n: liveNodeCount(sync, item) })}</Badge>
                         ) : (
                           <span className='text-subtle'>{t('—')}</span>
                         )}
-                      </td>
-                      <td>
+                      </TableCell>
+                      <TableCell>
                         {sync?.at ? (
                           <span className='text-[12px] text-text-2'>{formatTime(sync.at)}</span>
                         ) : (
                           <span className='text-subtle'>{t('未同步')}</span>
                         )}
-                      </td>
-                      <td className='ta-center'>
+                      </TableCell>
+                      <TableCell className='ta-center'>
                         <Switch checked={item.enabled} disabled={snapshot.pending}
                           aria-label={t('启用订阅「{name}」', { name: item.name || t('未命名') })}
                           onCheckedChange={next => void toggleSubscription(item, next)} />
-                      </td>
-                      <td>
+                      </TableCell>
+                      <TableCell>
                         <div className='row-actions'>
                           {/* 本地文件订阅没有链接可拉，「立即更新」对它无意义
                               （后端也会拒）—— 停用并说明，而不是让它白报一次错 */}
@@ -327,12 +338,12 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
                           <Button size='sm' variant='destructive' disabled={snapshot.pending}
                             onClick={() => void removeSubscription(item)}>{t('删除')}</Button>
                         </div>
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   )
                 }) : (
-                  <tr>
-                    <td colSpan={6} className='empty'>
+                  <TableRow>
+                    <TableCell colSpan={6} className='empty'>
                       {ready ? (
                         /* 空态内嵌主操作按钮（视线不用跳到页脚）：一句话 + 按钮 +
                            一句「接下来会发生什么」的副提示 */
@@ -345,11 +356,11 @@ export function SubscriptionManagerDialog({ onClose }: { onClose: () => void }) 
                           </span>
                         </div>
                       ) : t('加载中…')}
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 )}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
 
           <p className='text-xs leading-[1.65] text-subtle'>
@@ -480,7 +491,7 @@ function SubModal({
   const [name, setName] = React.useState(item?.name || '')
   const [url, setUrl] = React.useState(item?.url || '')
   const [fileName, setFileName] = React.useState(item?.fileName || '')
-  const [contentB64, setContentB64] = React.useState('')
+  const [contentBase64, setContentBase64] = React.useState('')
   const [enabled, setEnabled] = React.useState(item ? item.enabled : true)
   const [saving, setSaving] = React.useState(false)
   const [decoding, setDecoding] = React.useState(false)
@@ -500,25 +511,25 @@ function SubModal({
       setStatus(<span className='text-destructive'>❌ {t('订阅链接必须是 http:// 或 https:// 开头')}</span>)
       return
     }
-    if (!editing && source === 'local' && !contentB64) {
+    if (!editing && source === 'local' && !contentBase64) {
       setStatus(<span className='text-destructive'>❌ {t('请选择要导入的 YAML 文件')}</span>)
       return
     }
     setSaving(true)
     try {
       if (editing && source === 'local') {
-        // 没重选文件就不带 contentB64 —— 后端沿用导入时的内容
+        // 没重选文件就不带 contentBase64 —— 后端沿用导入时的内容
         await saveSubscription(item!, {
           name: nameText,
           enabled,
           kind: 'local',
           fileName: fileName || undefined,
-          ...(contentB64 ? { contentB64 } : {}),
+          ...(contentBase64 ? { contentBase64 } : {}),
         })
       } else if (editing) {
         await saveSubscription(item!, { name: nameText, url: urlText, enabled, kind: 'url' })
       } else if (source === 'local') {
-        await addSubscription({ name: nameText, kind: 'local', fileName: fileName || undefined, contentB64 })
+        await addSubscription({ name: nameText, kind: 'local', fileName: fileName || undefined, contentBase64 })
       } else {
         await addSubscription({ name: nameText, kind: 'url', url: urlText })
       }
@@ -552,7 +563,7 @@ function SubModal({
     setStatus(null)
     try {
       const base64 = await readFileAsBase64(file)
-      setContentB64(base64)
+      setContentBase64(base64)
       setFileName(file.name)
       setStatus(<span className='text-success'>✅ {t('已选择「{name}」，保存后导入', { name: file.name })}</span>)
     } catch (error) {
@@ -627,7 +638,7 @@ function SubModal({
                   {decoding ? t('识别中…') : t('从图片识别二维码')}
                 </Button>
                 <span className='text-[11px] text-subtle'>{t('也可以把二维码截图直接粘贴到弹窗里（Ctrl+V）')}</span>
-                <input ref={fileInput} type='file' accept='image/*' className='hidden'
+                <Input ref={fileInput} type='file' accept='image/*' className='hidden'
                   onChange={event => {
                     const file = event.currentTarget.files?.[0]
                     if (file) void decodeFrom(file)
@@ -655,7 +666,7 @@ function SubModal({
                   {t('本地文件不会自动更新：要更新节点，重新选择文件后保存；不重选则内容保持不变。')}
                 </span>
               ) : null}
-              <input ref={fileInput} type='file' accept='.yaml,.yml,text/yaml,application/yaml,text/plain'
+              <Input ref={fileInput} type='file' accept='.yaml,.yml,text/yaml,application/yaml,text/plain'
                 className='hidden'
                 onChange={event => {
                   const file = event.currentTarget.files?.[0]

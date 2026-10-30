@@ -103,10 +103,10 @@ pub fn record_row(row: &Value, provider: &str, source: &str, reason: &str) {
             OUTCOME_ALREADY
         };
         (outcome, None)
-    } else if claim_pending(&claim) {
-        (OUTCOME_PENDING, None)
     } else if activity_report_ok(row) || web_conversation_ok(row) {
         (OUTCOME_ALREADY, None)
+    } else if claim_pending(&claim) {
+        (OUTCOME_PENDING, None)
     } else {
         // 失败且行上没有 error：失败文案在 claim.msg 里（claim_result 的
         // Err 分支已经把 message 放进行 error，这里兜的是直接给出
@@ -177,12 +177,10 @@ pub fn record_activity(row: &Value, provider: &str, mode: &str) {
             OUTCOME_ALREADY
         };
         (outcome, None, true)
+    } else if report_ok {
+        (OUTCOME_ALREADY, None, true)
     } else if claim_pending(&claim) {
         (OUTCOME_PENDING, None, false)
-    } else if report_ok {
-        // full / claim 模式「活动未开启但活跃上报成功」：与 record_row 同款，
-        // 这一天的国际版日活实际完成了，不落 failed。
-        (OUTCOME_ALREADY, None, true)
     } else {
         (
             OUTCOME_FAILED,
@@ -380,7 +378,14 @@ pub fn query(query: &Query, limit: usize, offset: usize) -> Value {
                         "reason": row.get::<_, String>("reason")?,
                         "accountId": row.get::<_, String>("account_id")?,
                         "accountName": row.get::<_, String>("account_name")?,
-                        "provider": row.get::<_, String>("provider")?,
+                        // 存的是 provider id，读出来换成展示名（`qoder-intl`
+                        // → 「Qoder 国际版」）：界面上直接展示这一列，而 id
+                        // 只有开发者认得出。历史记录同样受益 —— 转换在读侧做，
+                        // 不改库（改库要迁移，且旧行本来也只需换名字）。
+                        "provider": crate::server::core::providers::label_of(
+                            &row.get::<_, String>("provider")?
+                        ),
+                        "providerId": row.get::<_, String>("provider")?,
                         "outcome": row.get::<_, String>("outcome")?,
                         "ok": row.get::<_, i64>("ok").unwrap_or(0) != 0,
                         "message": row.get::<_, Option<String>>("message")?,

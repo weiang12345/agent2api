@@ -41,8 +41,12 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::core::proxy_pool;
 use crate::server::logging;
 
+pub mod assets;
 pub mod download;
+pub mod import;
+pub mod layout;
 pub mod runtime;
+pub mod zip;
 
 /// 内核版本（pin 死：换版本时改这里并同步 4 份 sha256 —— 不追 latest，
 /// 避免上游发版悄悄改行为）
@@ -92,33 +96,7 @@ fn account_store() -> Option<&'static AccountStore> {
 /// 不支持的平台返回 None（界面提示「暂不支持的平台」；内核是 Go 预编译
 /// 二进制，官方 Release 只出这几组）。
 pub fn asset_for_current_platform() -> Option<(&'static str, &'static str)> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Some((
-            "mihomo-windows-amd64-v1.19.32.zip",
-            "1ac84e795b5b915446e20139677fb6cc013a0778e876e8d4c96f994750b4c4a3",
-        )),
-        ("windows", "aarch64") => Some((
-            "mihomo-windows-arm64-v1.19.32.zip",
-            "7a4f6e58af9a120920935f2150cf642d945085fdb3e753314505b334234e1d1e",
-        )),
-        ("macos", "x86_64") => Some((
-            "mihomo-darwin-amd64-v1.19.32.gz",
-            "b7de9fc46af2ca985ecfb302a6362170e04ff2023dee1e82addc54133e669bc9",
-        )),
-        ("macos", "aarch64") => Some((
-            "mihomo-darwin-arm64-v1.19.32.gz",
-            "3312a6780652c622890fd4357c6a853bbf865464fd047ac7b7f52dab8de18652",
-        )),
-        ("linux", "x86_64") => Some((
-            "mihomo-linux-amd64-v1.19.32.gz",
-            "8451100836c9eda194331c2babfad490b2faf30cebc1a04b0e76fd8ac2d35d10",
-        )),
-        ("linux", "aarch64") => Some((
-            "mihomo-linux-arm64-v1.19.32.gz",
-            "9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0",
-        )),
-        _ => None,
-    }
+    assets::current().map(|asset| (asset.name, asset.archive_sha256))
 }
 
 /// 内核二进制的期望文件名（下载后统一改名到它，config / 状态文件引用固定名）
@@ -130,9 +108,10 @@ pub fn kernel_binary_name() -> &'static str {
     }
 }
 
-/// 内核是否已安装（二进制存在即视为已装）
+/// 内核是否已安装（`current` 指针 → 版本目录 → 二进制 + `.ok` 标记，缺一不可；
+/// 旧布局的根目录 exe 也算，见 `layout::resolve_install`）
 pub fn installed() -> bool {
-    kernel_dir().join(kernel_binary_name()).exists()
+    layout::installed()
 }
 
 // ─── 一条订阅的输入形态 ─────────────────────────────────────
@@ -168,6 +147,7 @@ pub struct StatusSnapshot {
     /// 各订阅最后一次成功同步：`subId → {name, count, at}`
     pub provider_sync: Map<String, Value>,
     pub download: DownloadProgress,
+    pub import: ImportProgress,
     /// 手动关闭闩：「关闭内核」（[`request_halt`]）置位，任何 Restart 执行时
     /// 清零。置位期间测试 / 保存引用 / 订阅同步不再悄悄把内核拉起来，
     /// 改为提示先点「启动内核」。
@@ -185,6 +165,21 @@ pub struct DownloadProgress {
     pub error: Option<String>,
 }
 
+pub struct ImportProgress {
+    pub id: String,
+    pub active: bool,
+    pub state: &'static str,
+    pub error: Option<String>,
+    pub start_error: Option<String>,
+    pub saved: bool,
+}
+
+impl Default for ImportProgress {
+    fn default() -> Self {
+        Self { id: String::new(), active: false, state: "idle", error: None, start_error: None, saved: true }
+    }
+}
+
 impl Default for StatusSnapshot {
     fn default() -> Self {
         Self {
@@ -199,6 +194,7 @@ impl Default for StatusSnapshot {
                 total: 0,
                 error: None,
             },
+            import: ImportProgress::default(),
             halted: false,
         }
     }
@@ -233,7 +229,8 @@ enum Command {
     /// 变了才重建配置
     Refresh { sub_id: String, providers: Vec<ProviderInput> },
     /// 下载内核；带非空 providers 时下完自动拉起
-    Download(Vec<ProviderInput>),
+    Download { providers: Vec<ProviderInput>, permit: import::InstallPermit },
+    Import(import::Job),
     /// 停掉内核并删除已下载的内核（二进制 / 配置 / 端口映射）
     Remove,
     /// 停掉内核。`clear_pool` = 是否把订阅节点镜像一并摘掉：
@@ -256,7 +253,16 @@ fn send(command: Command) {
 }
 
 /// 起 worker（bootstrap 调用一次；重复调用无副作用 —— sender 只 set 一次）。
+///
+/// 起 worker 之前先做两件磁盘上的事（都是 best-effort，失败不影响功能）：
+///   ① `layout::migrate_legacy()`：老布局的根目录 `mihomo.exe` 搬进
+///      `versions/<版本>/` —— 必须赶在自动拉起内核**之前**做，否则内核一跑
+///      起来，运行中的 exe 就 rename 不动了；
+///   ② `layout::cleanup_residue()`：清半截下载包、解压暂存目录、回收位与
+///      不被指针引用的旧版本目录。
 pub fn spawn_worker() {
+    layout::migrate_legacy();
+    layout::cleanup_residue();
     let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
     if SENDER.set(tx).is_err() {
         return;
@@ -293,7 +299,7 @@ async fn execute(command: Command) {
                 logging::log("[Subscription]", &format!("❌ 订阅刷新失败: {error}"));
             }
         }
-        Command::Download(providers) => {
+        Command::Download { providers, permit: _permit } => {
             match download::run_download().await {
                 Ok(download::DownloadOutcome::Done) => {
                     patch_status(|snapshot| {
@@ -337,15 +343,40 @@ async fn execute(command: Command) {
                 }
             }
         }
+        Command::Import(job) => {
+            let import::Job { source, dir, replace, providers, permit: _permit } = job;
+            match import::run(source, dir, replace, providers).await {
+                Ok(result) => patch_status(|snapshot| {
+                    snapshot.import.active = false;
+                    snapshot.import.state = "done";
+                    snapshot.import.saved = result.saved;
+                    snapshot.import.start_error = result.start_error.clone();
+                    snapshot.last_error = result.start_error;
+                }),
+                Err(error) => {
+                    log_line(&format!("❌ 手动导入代理内核失败: {error}"));
+                    patch_status(|snapshot| {
+                        snapshot.import.active = false;
+                        snapshot.import.state = "error";
+                        snapshot.import.error = Some(error);
+                    });
+                }
+            }
+        }
         Command::Remove => {
             // 先停进程再动文件：Windows 上运行中的 exe 删不掉（共享冲突）。
             // 两步都做：cleanup_stale_kernel 收拾上次运行遗留的（pid 从状态文件里来，
             // 控制器的 secret 对上才杀），stop_kernel 收当前这个子进程句柄 ——
             // 只做后者时，遗留进程占着二进制会让删除失败。
+            //
+            // 但**不再依赖「进程一定停干净」**：uninstall 会先摘 current 指针
+            // （之后 installed() 立刻为 false），删不掉的文件改名进回收位，
+            // 下次启动由 layout::cleanup_residue 清 —— 用户的操作不被一个还活着
+            // 的进程挡住。
             runtime::cleanup_stale_kernel().await;
             runtime::stop_kernel().await;
             match download::uninstall() {
-                Ok(()) => {
+                Ok(outcome) => {
                     // 内核没了 = 订阅节点的监听器全没了：端口必须一起回收，否则
                     // 池里那些地址指向的是**没人监听**的端口，界面上却看着像能用。
                     // 不摘条目（保 id / 保账号引用），只把端口置空 —— 重装内核后
@@ -371,6 +402,17 @@ async fn execute(command: Command) {
                         "[Subscription]",
                         &format!("🗑️ 已删除代理内核 {KERNEL_VERSION}（订阅与账号引用保留）"),
                     );
+                    if outcome.residue {
+                        // 指针已摘（installed 立刻为 false），只是磁盘上还有
+                        // 删不掉的残留 —— 如实说一句，别让用户以为目录是空的
+                        logging::log(
+                            "[Subscription]",
+                            &format!(
+                                "🧹 仍有残留文件未能删除（{}），将在下次启动时清理",
+                                outcome.detail.as_deref().unwrap_or("被进程占用")
+                            ),
+                        );
+                    }
                 }
                 Err(error) => {
                     patch_status(|snapshot| {
@@ -412,7 +454,7 @@ async fn execute(command: Command) {
 /// （`kernelProxy` / `kernelDir`），api 层在投命令之前就已落盘 —— 命令里再带
 /// 一份就等于同一件事有两个真相，而 worker 执行时刻读配置拿到的必然是最新的
 /// 那个（包括「投命令之后又改了一次设置」的极端时序）。
-pub fn request_download(providers: Vec<ProviderInput>) {
+pub fn request_download(providers: Vec<ProviderInput>, permit: import::InstallPermit) {
     // 新一轮下载：上一轮可能残留的「停止」请求作废。要在这里清而不是在
     // download::run_download 里清 —— 「点下载」与「worker 真正开跑」之间隔着
     // 队列（前面可能排着一次内核重启），这期间用户点停止必须算数。
@@ -423,7 +465,41 @@ pub fn request_download(providers: Vec<ProviderInput>) {
         snapshot.download.total = 0;
         snapshot.download.error = None;
     });
-    send(Command::Download(providers));
+    send(Command::Download { providers, permit });
+}
+
+pub fn request_import(source: import::Source, dir: PathBuf, replace: bool, providers: Vec<ProviderInput>, permit: import::InstallPermit) -> Result<String, String> {
+    let sender = SENDER.get().ok_or_else(|| "内核任务队列尚未就绪".to_string())?;
+    if sender.is_closed() { return Err("内核任务队列已经停止".to_string()); }
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random).map_err(|error| format!("无法创建内核导入任务: {error}"))?;
+    let id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    patch_status(|snapshot| {
+        snapshot.import = ImportProgress { id: id.clone(), active: true, state: "queued", ..Default::default() };
+    });
+    if sender.send(Command::Import(import::Job { source, dir, replace, providers, permit })).is_err() {
+        patch_status(|snapshot| {
+            snapshot.import.active = false;
+            snapshot.import.state = "error";
+            snapshot.import.error = Some("内核任务队列已经停止".to_string());
+        });
+        return Err("内核任务队列已经停止".to_string());
+    }
+    Ok(id)
+}
+
+pub(super) fn import_phase(state: &'static str) {
+    patch_status(|snapshot| { snapshot.import.state = state; });
+}
+
+pub(super) fn reset_runtime_snapshot() {
+    patch_status(|snapshot| {
+        snapshot.running = false;
+        snapshot.controller_port = None;
+        snapshot.listener_count = 0;
+        snapshot.last_error = None;
+        snapshot.provider_sync.clear();
+    });
 }
 
 /// 请求停止正在进行的下载（界面上的「停止下载」）。
@@ -508,7 +584,29 @@ pub fn status_json() -> Value {
         json!({
             "installed": installed(),
             "version": KERNEL_VERSION,
+            // 磁盘上实际生效的版本（版本化目录后可能与 pin 的 KERNEL_VERSION
+            // 不同 —— 比如旧布局迁移过来的）；未安装为 null
+            "installedVersion": layout::installed_version(),
+            // 卸载后仍有删不掉的文件（已移入回收位，下次启动清理）：界面据此
+            // 说明「已卸载，残留稍后清理」，而不是假装磁盘上什么都没有
+            "pendingCleanup": layout::pending_cleanup(),
             "asset": asset_for_current_platform().map(|(name, _)| name),
+            "downloadUrl": assets::download_url(),
+            "releaseUrl": assets::release_url(),
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "binaryName": kernel_binary_name(),
+            "maxImportBytes": import::MAX_FILE_BYTES,
+            "sha256": assets::current().map(|asset| asset.archive_sha256),
+            "installBusy": import::busy(),
+            "import": {
+                "id": snapshot.import.id,
+                "active": snapshot.import.active,
+                "state": snapshot.import.state,
+                "error": snapshot.import.error,
+                "startError": snapshot.import.start_error,
+                "saved": snapshot.import.saved,
+            },
             "running": running,
             "controllerPort": controller_port,
             "listenerCount": listener_count,
@@ -563,8 +661,13 @@ pub fn shutdown() {
 /// 目标类型定义在 proxy_pool（`SubscriptionNodeTarget`）：本模块 → proxy_pool
 /// 单向依赖，proxy_pool 不反过来认识内核（订阅条目的端口存在条目自身里，
 /// 解析不需要查内核状态）。
+///
+/// 引用集合在这里取：worker 是独立任务、拿不到 `ServerState`，账号引用只有
+/// 装进来的那个 `AccountStore` 知道（见 [`account_store`]）。取不到时按空处理
+/// —— 那种情况下「已消失节点」的条目会被清理，而它们本来也解析不出端口。
 pub fn sync_nodes_to_pool(targets: &[proxy_pool::SubscriptionNodeTarget]) {
-    match proxy_pool::sync_subscription_nodes(targets) {
+    let referenced = proxy_pool::usage::referenced_pool_ids(account_store());
+    match proxy_pool::sync_subscription_nodes(targets, &referenced) {
         Ok(changes) if changes > 0 => {
             logging::log(
                 "[Subscription]",

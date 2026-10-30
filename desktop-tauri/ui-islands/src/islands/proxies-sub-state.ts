@@ -24,6 +24,7 @@
 import { t } from '../i18n'
 import type { PoolItem, ProxyConfig } from './accounts-shared'
 import { loadPanel } from './proxies-state'
+import type { KernelImportInput, KernelImportStatus } from '../../../ui-shared/kernel-import'
 
 /* ─── 后端形态 ───────────────────────────────── */
 
@@ -44,9 +45,19 @@ export type SubscriptionItem = {
 }
 
 /** 内核状态（`sub_kernel::status_json`） */
-export type KernelStatus = {
+export type KernelStatus = KernelImportStatus & {
   installed: boolean
   version: string
+  /**
+   * 磁盘上实际生效的版本（版本化目录后可能与 pin 的 `version` 不同，
+   * 比如旧布局迁移过来的）；未安装为 null / 缺省。
+   */
+  installedVersion?: string | null
+  /**
+   * 卸载后磁盘上仍有删不掉的文件（已移入回收位，下次启动清理）。界面据此
+   * 说明「已卸载，残留稍后清理」，而不是假装磁盘上什么都没有。
+   */
+  pendingCleanup?: boolean
   asset?: string
   running: boolean
   controllerPort?: number
@@ -114,6 +125,7 @@ export type SubscriptionBridge = {
   decodeQrImage?: (payload: { imageBase64: string }) => Promise<{ url?: string } | null | undefined>
   getKernelStatus?: () => Promise<KernelStatus | null | undefined>
   downloadKernel?: (choice?: KernelDownloadChoice) => Promise<KernelStatus | null | undefined>
+  importKernel?: (input: KernelImportInput) => Promise<KernelStatus | null | undefined>
   cancelKernelDownload?: () => Promise<KernelStatus | null | undefined>
   restartKernel?: () => Promise<KernelStatus | null | undefined>
   /** 手动关闭内核（只停进程；订阅与端口注册表保留，见 stopKernel） */
@@ -251,7 +263,7 @@ const POLL_ROUNDS = 20
  */
 function sectionSettled(payload: SubscriptionsPayload): boolean {
   const kernel = payload.kernel
-  if (!kernel || kernel.download.state === 'downloading') return false
+  if (!kernel || kernel.installBusy || kernel.import?.active || kernel.download.state === 'downloading') return false
   if (!kernel.installed) return true
   if (kernel.lastError && !kernel.running) return true
   const synced = kernel.providerSync ?? {}
@@ -293,15 +305,17 @@ async function pollSectionAfterChange(): Promise<void> {
 /**
  * 新增订阅的输入（两种来源二选一）：
  *   · 链接订阅 → `url`；
- *   · 本地文件 → `kind: 'local'` + `contentB64`（`fileName` 只做展示）。
- * `contentB64` 走 base64（与二维码图片同一传输形态），后端解出明文并校验。
+ *   · 本地文件 → `kind: 'local'` + `contentBase64`（`fileName` 只做展示）。
+ * `contentBase64` 走 base64（与二维码图片同一传输形态），后端
+ * `api::subscriptions::attach_local_content` 解出明文并校验 —— 字段名必须
+ * 与后端读的键一致，写成别的名字会被当成「没带文件」。
  */
 export type NewSubscriptionInput = {
   name: string
   kind?: 'url' | 'local'
   url?: string
   fileName?: string
-  contentB64?: string
+  contentBase64?: string
 }
 
 export async function addSubscription(input: NewSubscriptionInput): Promise<SubscriptionsPayload | null> {
@@ -314,14 +328,14 @@ export async function addSubscription(input: NewSubscriptionInput): Promise<Subs
   return data ?? null
 }
 
-/** 编辑订阅的载荷：本地订阅换文件时带 `contentB64`（不带 = 内容保持不变） */
+/** 编辑订阅的载荷：本地订阅换文件时带 `contentBase64`（不带 = 内容保持不变） */
 export type SaveSubscriptionPayload = {
   name: string
   url?: string
   enabled: boolean
   kind?: 'url' | 'local'
   fileName?: string
-  contentB64?: string
+  contentBase64?: string
 }
 
 export async function saveSubscription(
@@ -458,6 +472,41 @@ export async function downloadKernel(choice?: KernelDownloadChoice): Promise<voi
   }
 }
 
+export async function importKernel(input: KernelImportInput): Promise<void> {
+  const bridge = wb().workbuddyDesktop
+  if (typeof bridge?.importKernel !== 'function' || typeof bridge.getKernelStatus !== 'function') {
+    throw new Error(t('当前客户端不支持手动导入内核，请更新或刷新页面'))
+  }
+  if (state.pending || kernel()?.installBusy) throw new Error(t('内核正在执行操作，请稍后重试'))
+  patch({ pending: true })
+  try {
+    const first = await bridge.importKernel(input)
+    if (!first?.import?.id) throw new Error(t('网关未返回内核导入任务，请刷新状态后确认'))
+    if (first.import.state === 'error') throw new Error(first.import.error || t('内核导入失败'))
+    const id = first.import.id
+    if (state.data) patch({ data: { ...state.data, kernel: first } })
+    for (let round = 0; round < 300; round += 1) {
+      const next = round === 0 ? first : await bridge.getKernelStatus()
+      if (!next?.import || next.import.id !== id) throw new Error(t('内核导入状态已变化，请刷新后确认'))
+      if (state.data) patch({ data: { ...state.data, kernel: next } })
+      if (!next.import.active) {
+        if (next.import.state !== 'done') throw new Error(next.import.error || t('内核导入失败'))
+        refreshPool()
+        void pollSectionAfterChange()
+        if (next.import.saved === false) toast(t('内核已导入，但存放目录未能保存，重启网关后会恢复原位置'), 'err')
+        if (next.import.startError) toast(t('内核已导入，但启动失败：{reason}', { reason: next.import.startError }), 'err')
+        else toast(t('✅ 内核已手动导入到 {dir}', { dir: next.kernelDir }))
+        return
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+    throw new Error(t('内核导入仍在后台执行，请刷新状态查看结果'))
+  } finally {
+    patch({ pending: false })
+    void loadSection(true)
+  }
+}
+
 /**
  * 停止正在进行的下载（弹窗的「停止下载」）。
  *
@@ -574,7 +623,7 @@ export async function stopKernel(): Promise<void> {
  * ── 为什么带一段轮询 ───────────────────────────────────────
  * 命令是异步的（走内核 worker 的串行队列），投出去那一刻返回的快照还是
  * 删之前的样子。这里轮询到 `installed` 真的落成 false 再收手，然后刷代理池
- * —— 池里那一批订阅节点要跟着变成「未分配端口」（只刷内核状态的话，地址列
+ * —— 池里那一批订阅节点要跟着丢掉监听端口（只刷内核状态的话，地址列
  * 会停在旧端口上，看着像还能用）。
  */
 export async function removeKernel(): Promise<void> {
@@ -586,7 +635,7 @@ export async function removeKernel(): Promise<void> {
   const version = kernel()?.version
   const ok = await window.wbConfirm?.ask?.({
     title: t('删除内核'),
-    html: t('确定删除已下载的内核{version}？内核文件与端口映射会被移除，订阅节点会变成「未分配端口」，引用它们的账号会暂时回退直连；订阅本身保留，重新下载内核后会重新分配端口。', {
+    html: t('确定删除已下载的内核{version}？内核文件与端口映射会被移除，订阅节点会失去监听端口（地址列显示「端口准备中」），引用它们的账号会暂时回退直连；订阅本身保留，重新下载内核后会重新分配端口。', {
       version: version ? `（${version}）` : '',
     }),
     okText: t('删除内核'),
@@ -615,7 +664,13 @@ export async function removeKernel(): Promise<void> {
     // 「没抛错」就报成功的话，用户会看到「已删除」而内核还好端端在跑
     const finalKernel = state.data?.kernel
     if (finalKernel?.installed === false) {
-      toast(t('已删除内核（订阅与账号引用保留，重新下载后会重新分配端口）'))
+      // 卸载已降级：指针一摘就算卸载成功，磁盘上可能还剩删不掉的文件
+      // （内核进程占着 exe）。残留会在下次启动时清理，如实说一句
+      if (finalKernel.pendingCleanup) {
+        toast(t('已删除内核（订阅与账号引用保留；有文件仍被占用，将在下次启动时清理）'))
+      } else {
+        toast(t('已删除内核（订阅与账号引用保留，重新下载后会重新分配端口）'))
+      }
       refreshPool()
     } else {
       const reason =

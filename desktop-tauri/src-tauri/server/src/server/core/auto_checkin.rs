@@ -56,6 +56,9 @@ use crate::server::core::billing::BillingService;
 use crate::server::core::checkin_schedules::{self, Schedule};
 use crate::server::logging;
 
+mod retry;
+pub mod times;
+
 /// 轮询间隔：30 秒足够精确到分钟，又不会让计时器显得忙（Node 版 TICK_MS）
 pub const TICK_MS: u64 = 30_000;
 
@@ -75,13 +78,13 @@ pub fn default_time() -> String {
 ///     普通签到接口，但上游客户端把这条活跃链接在同一个每日调度上 —— 保活的
 ///     成功不落 `checkinAt`、单独统计在 `active`；免费模型链可在签到中心自定义
 ///     （`billing::keepalive`）。
-///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
+///   - **小浣熊**：「桌面登录积分」链路（实现已搬到插件）；
 ///     首次登录奖励（电脑端 / 手机端各一条端点）是一次性新手福利，不在这条
-///     每日链路里（见 `providers::raccoon::onboarding`，挂新手任务分组）；
+///     每日链路里（插件的 `raccoon::onboarding`，挂新手任务分组）；
 ///   - **AutoClaw 国内版 / 国际版**：通用任务接口的 `daily_signin` 任务
-///     （`providers::autoclaw::checkin`）。两个地区**都支持** —— 任务接口在
-///     两地是同一套路径、同一套任务 id，只是站点不同（已实测），因此两家
-///     都列进来；地区由 `billing::checkin` 从账号的 provider 反查。
+///     （实现已搬到插件）。两个地区**都支持** —— 任务接口在两地是同一套路径、
+///     同一套任务 id，只是站点不同（已实测），因此两家都列进来；地区由
+///     `billing::checkin` 按账号的 provider 分流到插件。
 ///   - **Qoder 中国版**：活动（campaign）领取链路（`providers::qoder::checkin`）。
 ///     Free 套餐账号也可能没有被下发活动（实测如此），那种情况实现返回一条
 ///     中性结果（「当前没有可领取的签到活动」），不算失败。
@@ -90,7 +93,7 @@ pub fn default_time() -> String {
 ///     Qoder 客户端 / qodercli 的 UMID 组件生成（`providers::qoder::risk`），
 ///     Linux/Docker 可一键安装组件。缺组件时得到的是明确的说明而不是报错
 ///     （也不落当日台账，第二天组件就位后照常领）。
-///   - **Trae**：SOLO 的 `checkin_credits` 领取（`providers::trae::checkin`）。
+///   - **Trae**：SOLO 的 `checkin_credits` 领取（实现已搬到提供商插件）。
 ///     加它不是因为"别家有"，而是这条链**有钱**：SOLO 转积分制后，模型调用花的
 ///     正是签到钱包那份积分，不签就是每天白丢一笔额度。它的风险不在"该不该签"
 ///     而在"怎么签"：设备号每轮全新（复用是风控可疑项）、请求体恒空对象、
@@ -107,25 +110,32 @@ pub fn default_time() -> String {
 ///     重复领取只返回 reward_point=0；业务会话由换发的 genflowpro STOKEN
 ///     保障（`kuku::engine`）。
 ///   - **OfficeAce 果办**：**一次调用**领当天全部奖励（每日签到 + 一次性新人礼
-///     是同一条上游动作，`POST /v1/subscription/bonus/claim`，见
-///     `providers::officeace::checkin`）。幂等由上游保证：一天一个活动只能领一次，
-///     重复领不报错、返回同一份列表 —— 所以它也没有「已领过」分支。
-///   - **CodeArts**：当日**ops 福利**（`/v1/ops` 的 delivery → claim → confirm，
-///     见 `providers::codearts::welfare`）。它与别家的形态差别最大（三个接口、
-///     两套状态、一个幂等键），所以 2026-10 之前一直**不进**这条链、只在签到
-///     中心留一颗手动「领福利」按钮；按用户要求纳入本链后，它就是那一家账号的
-///     「签到」：列进每日签到清单、被批量与定时执行，收尾（落 `checkinAt`、
-///     计 succeeded、记签到记录台账）与别家完全一致。
-///     ⚠️ 两点与别家不同，改这块前先读 `welfare` 的模块头：
-///     ① 它是**写请求有限流闸**的（每天 ≤6 次写、间隔 ≥10 分钟）—— 自动路径
-///     受闸（`checkin_for` 传 manual=false），用户在面板上点不受闸；
-///     ② 「暂无可领取活动 / 等待重试」是**中性未领取**（不落当日台账，定时链
+///     是同一条上游动作）。实现已搬到提供商插件，幂等由上游保证。
+///   - **CodeArts**：当日**ops 福利**（实现已搬到插件，`checkin.claim` 走
+///     `welfare.claim`）。它与别家的形态差别最大（三个接口、两套状态、一个
+///     幂等键），所以 2026-10 之前一直**不进**这条链、只在签到中心留一颗手动
+///     「领福利」按钮；按用户要求纳入本链后，它就是那一家账号的「签到」。
+///     ⚠️ 「暂无可领取活动 / 等待重试」是**中性未领取**（不落当日台账，定时链
 ///     稍后重试），不是失败 —— `claim_pending` 认这两个文案。
+///   - **ModelScope 国内版 / 国际版**：**没有独立签到接口** —— 调一次登录信息
+///     接口（`GET /api/v1/users/login/info`）**本身就触发当日魔粒签到**（幂等），
+///     见 `providers::modelscope::checkin`。两个站点各打各的网页站，令牌不通用
+///     （打错得 401）。链路依据是 CPA 的 `modelscope-ratelimit` 插件源码，
+///     2026-10 实测复核。
+///   - **ZCode 国内版 / 国际版**：签到 = **领当天那份赠送套餐**。上游每天下发
+///     一份带日期段的新套餐（`zcode-v3-start-plan-<日期>` 这类），在客户端里
+///     点一下就领，那一动作就是本家的签到；同一期再领回 `1003 already claimed`，
+///     所以「今天领过没」不需要本地记账（见 `providers::zcode::checkin`）。
+///     ⚠️ 窗口是**每天 19:00 开启**（官方公告：19:00 起可领，23:00 至次日 09:00
+///     可用），所以它的生效时刻在 `times::PROVIDER_TIMES` 里钉的是 19:01 ——
+///     跟其它家一起在 00:01 去签只会拿到「窗口没开」。
+///     ⚠️ 领取要阿里云人机验证令牌（由界面 WebView 铸造）：headless 部署拿不到
+///     令牌时这一家回中性未领取（不落账、次日再试），不是失败。
 ///
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
 /// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 12] = [
+pub const CHECKIN_PROVIDERS: [&str; 19] = [
     "workbuddy",
     "workbuddy-intl",
     "raccoon",
@@ -140,16 +150,102 @@ pub const CHECKIN_PROVIDERS: [&str; 12] = [
     // 追加在**末尾**：这个数组的顺序就是界面复选框与签到中心分组行的顺序，
     // 插在中间会让所有存量用户的清单顺序变一下（没有功能影响，但没必要动）。
     "codearts",
+    // 智谱清言：「每日登录积分」即本家的签到（实现已搬到提供商插件）。
+    // **访客账号不在本链范围内** —— 访客没有积分体系（相关接口对访客一律 401），
+    // 由 `billing::checkin::supports_checkin` 的 `isGuest` 分支排除，改在签到
+    // 中心的「不参与每日签到」里如实说明原因（见那里的说明）。
+    // （id 仍留在这张表里：它是落盘契约，也是「签到范围」的默认清单。）
+    "chatglm",
+    // ModelScope（魔搭）两个站点：签到就是调一次登录信息接口
+    // （`GET {网页站}/api/v1/users/login/info`，调用即触发当日魔粒，幂等），
+    // 链路 2026-10-16 实测存在，见 `providers::modelscope::checkin` 的模块头。
+    // 两个站点各打各的网页站，令牌不通用（打错得 401）。
+    "modelscope",
+    "modelscope-intl",
+    // AtomCode（AtomGit / GitCode）：本家的「签到」是**领取免费 CodingPlan**
+    // （一次性授权，见 `atomcode::checkin` 的模块头）。挂在这里是因为
+    // 「新账号必须领一次」「套餐到期要能续领」两件事都需要一个逐账号、
+    // 每天跑一次的调度与台账 —— 签到链本来就有。
+    "atomcode",
+    // LobsterAI（网易有道「有道龙虾」）：每日活动三步（查活动位 → 取上下文 →
+    // check_in），实测 +100 积分/号/天。幂等靠客户端（idempotencyKey + 上游
+    // 的 `claimedToday` 预检），见 `lobsterai::checkin` 的模块头。
+    "lobsterai",
+    // ZCode 两地：签到 = 领当天那份赠送套餐（见上面那条说明）。
+    // 两个地区各打各的站点、令牌不通用，因此两个 id 分开登记。
+    "zcode",
+    "zcode-intl",
 ];
 
-/// 缺省的签到提供商集合（全选）
+/// 缺省的签到提供商集合（全选 = **已知**清单，不是「此刻可用」清单）。
+///
+/// 用途有两处，都要求完整：① 定时条目「一个都没勾」时的兜底范围；
+/// ② 存量条目的默认值。执行侧会再按账号过滤（`resolve_checkin_targets`
+/// 只挑 `supports_checkin` 且有凭证的账号），所以多列几家不产生空转。
+/// 界面渲染用 [`available_checkin_providers`]。
 pub fn default_providers() -> Vec<String> {
-    CHECKIN_PROVIDERS.iter().map(|id| id.to_string()).collect()
+    checkin_providers()
 }
 
-/// 签到范围清单的**增量版本**：每给 [`CHECKIN_PROVIDERS`] 追加新家就 +1，
-/// 并把新家连同它的版本登记进 [`PROVIDERS_ADDED_IN`]。
+/// 当前**实际可用**的签到提供商清单：内置常量表 + 已装入且申报了签到能力的插件家。
 ///
+/// ── 为什么插件家不写进 [`CHECKIN_PROVIDERS`] ─────────────────
+/// 那是编译期常量（`PROVIDERS_ADDED_IN` 与 `PROVIDERS_VERSION` 的增量记账
+/// 都建立在它之上），而插件是**运行期**装进来的 —— 写进去就得在每次装包时
+/// 改常量，等于把「用户装了什么」编进发版内容。
+///
+/// ── 插件家追加在末尾 ────────────────────────────────────────
+/// 顺序就是签到中心分组行与勾选框的顺序。内置家的顺序是存量契约（插在中间
+/// 会让所有用户的清单顺序变一下），所以插件家只能排在后面。
+/// `installed_ids()` 已排序，因此同一个包里的多家顺序也稳定。
+///
+/// ── 这是「**已知**清单」，不是「**可用**清单」（别拿它直接渲染）──
+/// 它同时是配置校验的白名单（`normalize_providers`）与保存接口的过滤器。
+/// 那两处**必须**用完整清单：插件卸载后用户存的签到范围要原样保留，
+/// 按「此刻可用」过滤会把读出来的清单塌成空数组，下一次保存就把配置写没了。
+/// 界面渲染（签到中心分组、范围复选框）一律用
+/// [`available_checkin_providers`]。
+pub fn checkin_providers() -> Vec<String> {
+    let mut list: Vec<String> = CHECKIN_PROVIDERS.iter().map(|id| id.to_string()).collect();
+    for id in crate::server::core::plugin_host::installed_ids() {
+        if list.iter().any(|known| known == &id) {
+            continue;
+        }
+        let supported = crate::server::core::providers::adapter::adapter_by_id(&id)
+            .and_then(|adapter| adapter.plugin_checkin_capability())
+            == Some(true);
+        if supported {
+            list.push(id);
+        }
+    }
+    for id in raw_object().get("pluginProvidersSeen").and_then(Value::as_array)
+        .into_iter().flatten().filter_map(Value::as_str) {
+        if !list.iter().any(|known| known == id) { list.push(id.to_string()); }
+    }
+    list
+}
+
+/// 界面上**该显示**的签到提供商清单（签到中心分组、范围复选框、筛选项）。
+///
+/// ── 与 [`checkin_providers`] 的分工（改之前先读这段）────────────
+/// `checkin_providers` = 「已知有哪些家能签到」——配置校验的白名单，必须完整。
+/// 本函数 = 「此刻哪些家真的能签」——只给界面用。没装插件时这里就是空的，
+/// 那正是真实状态：本版本的签到执行体全在插件里（连 WorkBuddy 的
+/// `billing.checkin-claim` 都要经 `billing.admin` 转给插件），网关里一个都没有。
+///
+/// ── 判据只有「插件接管了吗」（2026-10 用户决定）────────────────
+/// **不**看「库里有没有它的账号」。用户明确：插件不在，这家就该不存在；
+/// 已有账号的数据留在库里，装上插件后原样回来。带上「有账号也显示」会让
+/// 没装插件的用户看到一屏点了必然失败的行。
+///
+/// ⚠️ 别在这里按「哪一类提供商」写死判断（比如「反代才有签到」）：那是把
+/// 今天的事实当永久约定，将来给自定义家接签到链路时会静默失效。
+pub fn available_checkin_providers(_store: &AccountStore) -> Vec<String> {
+    checkin_providers()
+        .into_iter()
+        .filter(|id| crate::server::core::plugin_host::serves_provider(id))
+        .collect()
+}
 /// ── 为什么需要一个版本号（而不是读的时候无条件补齐）───────────
 /// 「签到范围」是**每条定时条目自己勾的清单**（`checkin_schedules`）。新加进来的
 /// 家不可能出现在存量条目的清单里，而用户的期望是**默认就在范围内** ——
@@ -157,12 +253,25 @@ pub fn default_providers() -> Vec<String> {
 /// 会让这一家的勾选框再也取消不掉（读完就补回来，界面上表现为「取消勾选没反应」）。
 /// 所以补齐只做一次，靠配置里的版本号记账；版本一旦写上去，用户之后再取消勾选
 /// 就真的生效了。执行点见 `checkin_schedules::extend_providers_once`。
-pub const PROVIDERS_VERSION: i64 = 2;
+pub const PROVIDERS_VERSION: i64 = 6;
 
 /// 「哪一版加入的家」——条目清单的版本低于它 = 这家还没被提供过 ⇒ 补进去。
 /// 版本 1 = 多条目改造上线时的形态（9 家；`qoder-intl` 由 `normalize_providers`
 /// 的存量兼容规则跟着 `qoder` 带上，不在这里重复登记）。
-const PROVIDERS_ADDED_IN: [(&str, i64); 2] = [("officeace", 2), ("codearts", 2)];
+/// 版本 3 = 智谱清言；版本 4 = ModelScope 的两个站点与 AtomCode；
+/// 版本 5 = LobsterAI（两条 provider PR 各自用了一个号，合起来取并集）；
+/// 版本 6 = ZCode 的两个站点（签到 = 领当天赠送套餐）。
+const PROVIDERS_ADDED_IN: [(&str, i64); 9] = [
+    ("officeace", 2),
+    ("codearts", 2),
+    ("chatglm", 3),
+    ("modelscope", 4),
+    ("modelscope-intl", 4),
+    ("atomcode", 4),
+    ("lobsterai", 5),
+    ("zcode", 6),
+    ("zcode-intl", 6),
+];
 
 /// 版本 `version` 之后才加入清单的家（按注册顺序）。空数组 = 这一版没有新家，
 /// 或配置比代码还新（装过更新的版本又退回来）——两种情况都只记账、不动清单。
@@ -208,13 +317,13 @@ pub fn normalize_providers(value: Option<&Value>) -> Vec<String> {
     let Some(list) = value.and_then(Value::as_array) else {
         return default_providers();
     };
-    let picked: Vec<String> = CHECKIN_PROVIDERS
+    // 用 `checkin_providers()`（含插件家）而不是常量表：插件的签到能力位在
+    // 运行期才知道，拿常量表过滤会把用户勾选的插件家静默丢掉。
+    let known = checkin_providers();
+    let picked: Vec<String> = known
         .iter()
-        .filter(|id| {
-            list.iter()
-                .any(|item| item.as_str() == Some(*id))
-        })
-        .map(|id| id.to_string())
+        .filter(|id| list.iter().any(|item| item.as_str() == Some(id.as_str())))
+        .cloned()
         .collect();
     let mut picked = if picked.is_empty() {
         default_providers()
@@ -331,33 +440,6 @@ pub fn today_key() -> String {
     beijing::today_key()
 }
 
-/// 今天的触发时刻（北京时间）；已过则返回 Some，未到返回 None。
-/// 对应 Node 版 dueNow：非法的 time 文本在这里同样表现为 None（Node 是抛异常，
-/// 但调用方一律 catch 后 return，结果一致）。
-fn due_now(time_text: &str, now: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
-    let target = today_at(time_text, now)?;
-    if now >= target {
-        Some(target)
-    } else {
-        None
-    }
-}
-
-/// 「下次执行」的绝对时刻（毫秒时间戳），给界面展示用。
-///
-/// 对应 Node 版 msUntilNext 的语义（目标时刻已过顺延到明天）外加**已触发**
-/// 分支：启动补签会在条目时刻之前就把今天落账（补签只看日期不看时点），
-/// 这时「下次执行」必须是明天 —— 只按时刻算会得到今天的未来时刻，
-/// 界面显示一个其实不会跑的点。time 非法 → None（调度起不来的情形
-/// 不该编一个时间出来）。
-fn next_run_at_ms(time_text: &str, fired_today: bool, now: DateTime<FixedOffset>) -> Option<i64> {
-    let mut target = today_at(time_text, now)?;
-    if fired_today || target <= now {
-        target += chrono::Duration::days(1);
-    }
-    Some(target.timestamp_millis())
-}
-
 /// 今天的 HH:MM 时刻（北京时间）；time 文本非法时 None。
 ///
 /// Node 用 `target.setHours(hour, minute, 0, 0)`（就地改到当天）；
@@ -366,7 +448,14 @@ fn next_run_at_ms(time_text: &str, fired_today: bool, now: DateTime<FixedOffset>
 /// 「DST 当天该时刻不存在」的兜底 —— `single()` 取不到就当 None，
 /// 也就是这台机器上的时钟环境异常到连北京时间的固定偏移都构造不出来。
 fn today_at(time_text: &str, now: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
-    let normalized = normalize_time(Some(&Value::String(time_text.to_string()))).ok()?;
+    normalize_today_at(time_text, now)
+}
+
+/// [`today_at`] 的实现本体（`times` 子模块要用同一套构造，见那里的说明）
+pub(crate) fn normalize_today_at(
+    time_text: &str,
+    now: DateTime<FixedOffset>,
+) -> Option<DateTime<FixedOffset>> {    let normalized = normalize_time(Some(&Value::String(time_text.to_string()))).ok()?;
     let (hour, minute) = normalized.split_once(':')?;
     let hour: u32 = hour.parse().ok()?;
     let minute: u32 = minute.parse().ok()?;
@@ -480,7 +569,8 @@ impl AutoCheckin {
     ///
     /// 形状分两层：
     ///   - `schedules`：条目视图（每条含自己的 enabled / time / providers /
-    ///     lastFiredToday / nextRunAt / lastResult），签到中心的「定时签到」页直接渲染；
+    ///     providerTimes / retryTime / lastFiredToday / nextRunAt / lastResult），
+    ///     签到中心的「定时签到」页直接渲染；
     ///   - 顶层 `time` / `providers` / `lastFiredDate` / `lastFiredToday` /
     ///     `lastResult` / `nextRunAt`：**兼容视图**——顶层 nextRunAt 是所有启用
     ///     条目里最近的一次（顶栏徽标用），其余字段取默认条目（合成的或显式的
@@ -493,12 +583,38 @@ impl AutoCheckin {
         let entries: Vec<Value> = schedules
             .iter()
             .map(|schedule| {
-                let fired_today = schedule.last_fired_date.as_deref() == Some(today.as_str());
+                // 「今天跑过了吗」按**逐家**标记算：条目里所有家都跑过才算整体完成
+                // （存量条目没有逐家标记时回落到旧的 lastFiredDate，见 times::main_fired）
+                let pending = times::pending_providers(schedule, &today);
+                let fired_today = pending.is_empty();
                 let next_run_at = if master && schedule.enabled {
-                    next_run_at_ms(&schedule.time, fired_today, now)
+                    retry::next_at(schedule.last_result.as_ref(), &today)
+                        .or_else(|| times::next_run_at(schedule, now, &today))
                 } else {
                     None
                 };
+                // 逐家的生效时刻：界面上每一行要能看到「这家到底几点签」
+                // 到点了但还没跑的家（界面标「待执行」）；还没到点的是「等窗口」，
+                // 两者不能混成一句话 —— 早上 08:00 看一条 00:01 的条目，Qoder
+                // （10:01）不是卡住了，是在等窗口。
+                let overdue = times::overdue_providers(schedule, now, &today);
+                let provider_times: Vec<Value> = schedule
+                    .providers
+                    .iter()
+                    .map(|id| {
+                        json!({
+                            "id": id,
+                            "label": provider_label(id),
+                            "time": times::effective_time(schedule, id),
+                            // 这一家自己的时刻是不是内置的（界面据此标注「专属」）
+                            "builtin": times::provider_time(id),
+                            // 今天这家跑过没有（逐家状态，替代整条条目的布尔）
+                            "firedToday": !pending.iter().any(|item| item == id),
+                            // 到点了还没跑 = 待执行（与「等窗口」区分）
+                            "overdue": overdue.iter().any(|item| item == id),
+                        })
+                    })
+                    .collect();
                 json!({
                     "id": schedule.id,
                     "label": schedule.label,
@@ -507,9 +623,28 @@ impl AutoCheckin {
                     "enabled": schedule.enabled,
                     "time": schedule.time,
                     "providers": schedule.providers,
+                    "providerTimes": schedule.provider_times,
+                    "providerRows": provider_times,
+                    "retryTime": schedule.retry_time,
+                    // 逐家的补签时刻（主轮时刻 + 重试间隔，不早于 retryTime）
+                    "providerRetryTimes": schedule.providers.iter()
+                        .filter_map(|id| times::provider_retry_time(schedule, id)
+                            .map(|time| (id.clone(), Value::from(time))))
+                        .collect::<serde_json::Map<String, Value>>(),
+                    "retryGapMinutes": schedule.retry_gap_minutes,
+                    "retryLimit": schedule.retry_limit,
                     "lastFiredDate": schedule.last_fired_date,
                     "lastFiredToday": fired_today,
+                    // 今天还没跑的家（界面显示「待执行：Qoder 国际版 10:01」）
+                    "pendingProviders": pending,
                     "nextRunAt": next_run_at,
+                    // 中性未领取、等窗口重试的账号数（界面上要说清「还会再试」）
+                    "retryCount": schedule.last_result.as_ref()
+                        .filter(|value| value.get("date").and_then(Value::as_str) == Some(today.as_str()))
+                        .and_then(|value| value.get("retryAccounts"))
+                        .and_then(Value::as_object)
+                        .map(|map| map.len())
+                        .unwrap_or(0),
                     "lastResult": schedule.last_result,
                 })
             })
@@ -530,7 +665,13 @@ impl AutoCheckin {
             enabled: false,
             time: default_time(),
             providers: default_providers(),
+            provider_times: std::collections::BTreeMap::new(),
+            retry_time: times::DEFAULT_RETRY_TIME.to_string(),
+            retry_gap_minutes: 10,
+            retry_limit: 3,
             last_fired_date: None,
+            last_fired_providers: std::collections::BTreeMap::new(),
+            last_retried_providers: std::collections::BTreeMap::new(),
             last_result: None,
         };
         let default_entry = schedules
@@ -545,13 +686,23 @@ impl AutoCheckin {
             "providers": default_entry.providers,
             "lastFiredDate": default_entry.last_fired_date,
             "lastFiredToday":
-                default_entry.last_fired_date.as_deref() == Some(today.as_str()),
+                times::pending_providers(default_entry, &today).is_empty(),
             "lastResult": default_entry.last_result,
             "nextRunAt": next_run_at,
-            // 界面的复选框清单（签到范围），顺序即 CHECKIN_PROVIDERS 注册顺序
-            "providerOptions": CHECKIN_PROVIDERS.iter().map(|id| {
-                json!({ "id": id, "label": provider_label(id) })
+            // 界面的复选框清单（签到范围），顺序即注册顺序（插件家追加在末尾）。
+            // 用**可用**清单而不是 `checkin_providers()`：没装插件时那 17 家
+            // 全是点了必然失败的勾选框（2026-10 用户反馈）。条目里已存的
+            // 范围不受影响 —— 落盘的是 id 数组，这里只决定「能勾哪些」。
+            "providerOptions": available_checkin_providers(&self.store).iter().map(|id| {
+                json!({
+                    "id": id,
+                    "label": provider_label(id),
+                    // 内置专属时刻（None = 跟随条目时刻），界面在复选框旁标注
+                    "builtinTime": times::provider_time(id),
+                })
             }).collect::<Vec<_>>(),
+            // 缺省补签时刻：界面「补签时刻」输入框的 placeholder 用
+            "defaultRetryTime": times::DEFAULT_RETRY_TIME,
             "schedules": entries,
             "running": self.is_running(),
         })
@@ -583,6 +734,25 @@ impl AutoCheckin {
         schedule_id: Option<&str>,
         source: &str,
     ) -> Option<Value> {
+        self.fire_scoped(reason, schedule_id, source, None, None).await
+    }
+
+    /// [`fire_for`] 的完整形态：`only` 限定这一轮只签哪几家，`retry_round`
+    /// 标记这是补签轮（只签今天还没签上的账号，并落补签轮标记）。
+    ///
+    /// ── 为什么要 `only`（本次改造的核心）────────────────────────
+    /// 上游的每日窗口各不相同（Qoder 10:00、ZCode 19:00），一条条目里的家不再
+    /// 能在同一时刻一起签。`tick` 按每家自己的生效时刻算出「此刻到点的几家」，
+    /// 用 `only` 传进来 —— 于是 00:01 的条目里，普通家 00:01 签、Qoder 10:01
+    /// 签、ZCode 19:01 签，一天各跑一次，签到记录里不再有 7 条白撞的「未领取」。
+    pub async fn fire_scoped(
+        &self,
+        reason: &str,
+        schedule_id: Option<&str>,
+        source: &str,
+        only: Option<&[String]>,
+        retry_round: Option<&str>,
+    ) -> Option<Value> {
         // 先抢「执行中」标记；抢不到说明上一次还在跑
         let guard = {
             let mut inner = self.lock();
@@ -596,6 +766,51 @@ impl AutoCheckin {
         };
 
         let today = today_key();
+        let schedule = schedule_id.and_then(|id| checkin_schedules::list()
+            .into_iter().find(|schedule| schedule.id == id));
+        // 范围：条目轮次用那条自己勾的提供商；手动全量（无条目）= 全部提供商。
+        // 条目可能在执行前被删（罕见）：拿不到就按全量兜，不空跑。
+        // `only` 有值时以它为准（按时刻分批的那一轮）。
+        let mut providers = schedule.as_ref().map(|schedule| schedule.providers.clone())
+            .unwrap_or_else(default_providers);
+        if let Some(only) = only {
+            providers.retain(|id| only.iter().any(|picked| picked == id));
+        }
+        let fired_scope = providers.clone();
+        // ── 目标账号集合 ────────────────────────────────────────
+        // 补签轮：只签今天还没签上的账号（判据是账号的 `checkinAt`，与账号页
+        // 「今日已签到」同一份事实）。其余轮次沿用「等窗口重试」那条链。
+        // ── 三个来源各自的目标集合（别混）────────────────────────
+        //   · 补签轮（retry_round 有值）：今天还没签上的账号；
+        //   · 按时刻分批的主轮（only 有值）：**不受** retryAccounts 限制 ——
+        //     那张表记的是「等窗口」的账号，主轮该签的是这一批里的全部账号，
+        //     被它一过滤就会漏签（改造前不存在这个问题，因为主轮与重试轮互斥）；
+        //   · 其余（重试轮 / 启动补签）：等窗口到点的那批。
+        let selected = match retry_round {
+            Some(_) => Some(retry::unsigned_accounts(&self.store)),
+            None if only.is_none() && matches!(source, "schedule" | "startup") => {
+                retry::due_accounts_scoped(
+                    schedule.as_ref().and_then(|schedule| schedule.last_result.as_ref()),
+                    logging::now_ms(),
+                    retry::gap_ms_of(schedule.as_ref()),
+                    retry::limit_of(schedule.as_ref()),
+                )
+            }
+            None => None,
+        };
+        if selected.as_ref().is_some_and(Vec::is_empty) {
+            // 补签轮没有可补的账号：标记照落（今天这一轮算跑过了），免得每 30 秒
+            // 进来查一遍
+            if let (Some(id), Some(_)) = (schedule_id, retry_round) {
+                checkin_schedules::mark_retried_providers(id, &fired_scope, &today);
+                logging::log(
+                    "[Checkin]",
+                    &format!("补签轮无需执行（今天都已签到）：{reason}"),
+                );
+            }
+            drop(guard);
+            return None;
+        }
         // 先落日期再执行：即便签到中途进程被杀，也不会在重启后反复补签
         write_state(json!({ "lastFiredDate": today }));
         if let Some(id) = schedule_id {
@@ -603,28 +818,27 @@ impl AutoCheckin {
         }
         logging::log("[Checkin]", &format!("⏰ 定时签到开始（{reason}）"));
 
-        // 范围：条目轮次用那条自己勾的提供商；手动全量（无条目）= 全部提供商。
-        // 条目可能在执行前被删（罕见）：拿不到就按全量兜，不空跑。
-        let providers = match schedule_id {
-            Some(id) => checkin_schedules::list()
-                .into_iter()
-                .find(|schedule| schedule.id == id)
-                .map(|schedule| schedule.providers)
-                .unwrap_or_else(default_providers),
-            None => default_providers(),
-        };
-        let outcome = match checkin::run_checkin(
+        let outcome = match checkin::run_checkin_selected(
             &self.store,
             &self.billing,
             providers.as_slice(),
             None,
             reason,
             source,
+            selected.as_deref(),
         )
         .await
         {
             Ok(result) => {
-                let summary = self.record_success(&result, &today, reason);
+                let summary = retry::merge(
+                    &self.store,
+                    self.record_success(&result, &today, reason),
+                    &result,
+                    schedule.as_ref().and_then(|schedule| schedule.last_result.as_ref()),
+                    selected.as_deref(),
+                    retry::gap_ms_of(schedule.as_ref()),
+                );
+                write_state(json!({ "lastResult": summary }));
                 if let Some(id) = schedule_id {
                     checkin_schedules::mark_result(id, Some(summary.clone()));
                 }
@@ -651,27 +865,16 @@ impl AutoCheckin {
                 None
             }
         };
+        // 逐家标记：成功失败都记（失败不重跑主轮 —— 重试由 `retryAccounts` 那条
+        // 链按间隔补，不靠「主轮再来一遍」；否则一次上游抖动会把整条条目重签 N 次）
+        if let Some(id) = schedule_id {
+            match retry_round {
+                Some(_) => checkin_schedules::mark_retried_providers(id, &fired_scope, &today),
+                None => checkin_schedules::mark_fired_providers(id, &fired_scope, &today),
+            }
+        }
         drop(guard);
         outcome
-    }
-
-    /// 本轮是否有「Qoder 国际版账号没领到且不算已签」的行 —— 有则今天保持
-    /// 未落账状态，等窗口开了重试（见 tick 的说明）。
-    fn qoder_intl_pending(result: &Value) -> bool {
-        result
-            .get("results")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items.iter().any(|item| {
-                    item.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| id.starts_with("qoder-global-"))
-                        && crate::server::core::billing::checkin::claim_pending(
-                            &item.get("claim").cloned().unwrap_or(Value::Null),
-                        )
-                })
-            })
-            .unwrap_or(false)
     }
 
     /// 成功分支：汇总 + 记录 lastResult + 日志（对应 Node fire 里的 try 主体）
@@ -693,16 +896,7 @@ impl AutoCheckin {
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| {
-                        let error = item.get("error").and_then(Value::as_str)?;
-                        let name = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.is_empty())
-                            .or_else(|| item.get("id").and_then(Value::as_str))
-                            .unwrap_or("未知账号");
-                        Some(format!("{name}（{error}）"))
-                    })
+                    .filter_map(checkin::failure_of)
                     .collect()
             })
             .unwrap_or_default();
@@ -736,33 +930,25 @@ impl AutoCheckin {
                 },
             ),
         );
-        // qoderIntlPending 不进 lastResult（那是给界面看的快照），单独放在
-        // fire 的返回值上供 tick 决定今天要不要保持未落账
-        let mut summary = summary;
-        if let Some(object) = summary.as_object_mut() {
-            object.insert(
-                "qoderIntlPending".to_string(),
-                Value::Bool(Self::qoder_intl_pending(result)),
-            );
-        }
         summary
     }
 
     // ─── 调度 ───────────────────────────────────────────────
 
-    /// 轮询回调：每条启用的条目各自「到点 + 今天没跑过」就执行（对应 Node 版
-    /// tick 的多条目版）。
+    /// 到点执行整轮；中性未领取只按插件给出的时刻重试对应账号，失败不反复打上游。
     ///
-    /// ── Qoder 国际版的窗口补领（2026-10，issue #140）────────────
-    /// 国际版「每日 100 Credits」的官方窗口**每天 10:00（UTC+8）开启**，而
-    /// 缺省触发时刻是 00:01 —— 那时窗口还没开，活动列表里没有积分活动，
-    /// 领取轮次对它只能得到「无活动」。若就此落条目的 `lastFiredDate` 整天
-    /// 不再重试，国际版账号等于永远领不到。所以条目轮次**照常在配置时刻跑**，
-    /// 但当轮次里存在「Qoder 国际版无活动未落账」的行时，**这一条**今天暂不落
-    /// 到点标记：之后每个 tick 会重新进来，直到 10:00 窗口开启领到（或活动行
-    /// 出现 CLAIMED）才落账 —— 与 10router「no-activity 刻意不记忆、下个
-    /// tick 再看」同一语义。窗口判定按条目独立：没勾 qoder-intl 的条目
-    /// 不会有这种行，到点即落账。
+    /// ── 一天里会跑三次（改之前先读）────────────────────────────
+    /// 每个 tick 对每条启用的条目依次判定三件事，命中哪件跑哪件：
+    ///
+    ///   1. **等窗口重试**（`retryAccounts`）：上一轮拿到「中性未领取」的账号到点
+    ///      了 —— 只签这几个，与「主轮」无关；
+    ///   2. **主轮**：这一条里还有家今天没跑过、且那家的生效时刻已到 —— 只签
+    ///      这几家（`only`），于是 00:01 / 10:01 / 19:01 各跑一批；
+    ///   3. **补签轮**：补签时刻已到、这家今天还没补过、且窗口已过 —— 只签今天
+    ///      还没签上的账号（`unsigned_accounts`）。
+    ///
+    /// 三件事都有各自的「今天跑过了」标记，所以每个 tick 最多各跑一次，且互不
+    /// 影响 —— 这是本次改造消掉「00:01 设的却签了 7 次」的关键。
     pub async fn tick(&self) {
         if !master_enabled() {
             return;
@@ -774,30 +960,52 @@ impl AutoCheckin {
             if !schedule.enabled {
                 continue;
             }
-            // 未到点直接看下一条（time 在读取时已归一，这里不会解析失败）
-            if due_now(&schedule.time, now).is_none() {
-                continue;
-            }
-            // 条目级当天去重
-            if schedule.last_fired_date.as_deref() == Some(today.as_str()) {
-                continue;
-            }
-            let reason =
-                format!("到点触发（{}）", checkin_schedules::display_label(&schedule));
-            match self.fire_for(&reason, Some(&schedule.id), "schedule").await {
-                Some(result) => {
-                    // 领取轮次完成，但里面有「Qoder 国际版无活动」的行 → 这一条
-                    // 不落账，今天窗口开了之后由后续 tick 重试
-                    if result.get("qoderIntlPending").and_then(Value::as_bool) == Some(true) {
-                        checkin_schedules::mark_fired(&schedule.id, None);
-                        logging::log(
-                            "[Checkin]",
-                            "⏳ Qoder 国际版的活动窗口未开（官方每日 10:00 UTC+8），今天会自动重试到领到为止",
-                        );
-                    }
+            // ① 等窗口重试：范围由 `retryAccounts` 决定，不走「到点」判定
+            let retry_due = retry::due_accounts_scoped(
+                schedule.last_result.as_ref(),
+                logging::now_ms(),
+                retry::gap_ms_of(Some(&schedule)),
+                retry::limit_of(Some(&schedule)),
+            );
+            if let Some(accounts) = &retry_due {
+                if !accounts.is_empty() {
+                    let reason = format!("窗口重试（{}）", checkin_schedules::display_label(&schedule));
+                    self.fire_for(&reason, Some(&schedule.id), "schedule").await;
+                    continue;
                 }
-                // None = 已有轮次在跑或执行出错：照旧落账（fire 内部已写），行为不变
-                None => {}
+            }
+            // ② 主轮：逐家判定「时刻到了没有」，只跑到点的那几家
+            let due = times::due_providers(&schedule, now, &today);
+            if !due.is_empty() {
+                let names = due.iter().map(|id| provider_label(id)).collect::<Vec<_>>().join("、");
+                let reason = format!(
+                    "到点触发（{} · {names}）",
+                    checkin_schedules::display_label(&schedule)
+                );
+                self.fire_scoped(&reason, Some(&schedule.id), "schedule", Some(&due), None)
+                    .await;
+                continue;
+            }
+            // ③ 补签轮：只补今天还没签上的账号
+            let retry_providers = times::retry_due_providers(&schedule, now, &today);
+            if !retry_providers.is_empty() {
+                let names = retry_providers
+                    .iter()
+                    .map(|id| provider_label(id))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                let reason = format!(
+                    "补签（{} · {names}）",
+                    checkin_schedules::display_label(&schedule)
+                );
+                self.fire_scoped(
+                    &reason,
+                    Some(&schedule.id),
+                    "schedule",
+                    Some(&retry_providers),
+                    Some(times::DEFAULT_RETRY_TIME),
+                )
+                .await;
             }
         }
     }
@@ -834,21 +1042,32 @@ impl AutoCheckin {
 
     /// 启动调度（对应 Node 版 start 的多条目版）。
     ///
-    /// 开启状态下立即检查一次：**只看「今天签过没有」，不看时点是否已过**
-    /// （理由见模块头部「补签」）。多条目之后按条目各补各的：今天没跑过的
-    /// **启用**条目每条补一次，串在一个任务里跑（fire 的全局防重本来就只允许
+    /// ── 启动补签的范围（本次改造后）────────────────────────────
+    /// 只看「这家今天签过没有 + 它的生效时刻已经过了」：时刻**还没到**的家不补
+    /// —— 那会在窗口开启前白撞一次上游（Qoder 10:01 才开，早上 08:00 开机去签
+    /// 只会拿到「暂未下发」）。过了时刻却没签的照旧立刻补一次（模块头「补签」
+    /// 那条语义保留：整天没开机才是反直觉的结果）。
+    ///
+    /// 多条目之后按条目各补各的，串在一个任务里跑（fire 的全局防重本来就只允许
     /// 一轮在跑，串行省得互相抢空）。
     pub fn start(&self) {
         if !master_enabled() {
             return;
         }
         self.schedule();
-        let today = today_key();
-        let pending: Vec<Schedule> = checkin_schedules::list()
+        let now = beijing::now();
+        let today = date_key(now);
+        // (条目, 这一轮要补哪几家)
+        let pending: Vec<(Schedule, Vec<String>)> = checkin_schedules::list()
             .into_iter()
-            .filter(|schedule| {
-                schedule.enabled
-                    && schedule.last_fired_date.as_deref() != Some(today.as_str())
+            .filter(|schedule| schedule.enabled)
+            .filter_map(|schedule| {
+                let due = times::due_providers(&schedule, now, &today);
+                if due.is_empty() {
+                    None
+                } else {
+                    Some((schedule, due))
+                }
             })
             .collect();
         if pending.is_empty() {
@@ -857,12 +1076,14 @@ impl AutoCheckin {
         }
         let service = self.clone();
         crate::spawn_task(async move {
-            for schedule in pending {
+            for (schedule, due) in pending {
                 let reason = format!(
                     "启动补签（{}）",
                     checkin_schedules::display_label(&schedule)
                 );
-                service.fire_for(&reason, Some(&schedule.id), "startup").await;
+                service
+                    .fire_scoped(&reason, Some(&schedule.id), "startup", Some(&due), None)
+                    .await;
             }
         });
     }
@@ -902,7 +1123,12 @@ impl AutoCheckin {
         let has_enabled = payload.get("enabled").is_some();
         let has_time = payload.get("time").is_some();
         let has_providers = payload.get("providers").is_some();
-        if !has_enabled && !has_time && !has_providers {
+        // 逐家时刻 / 补签时刻也走这条兼容入口（老界面只传前三个，新界面可以全传）
+        let has_times = payload.get("providerTimes").is_some()
+            || payload.get("retryTime").is_some()
+            || payload.get("retryGapMinutes").is_some()
+            || payload.get("retryLimit").is_some();
+        if !has_enabled && !has_time && !has_providers && !has_times {
             return Err(AutoCheckinConfigError::new("没有需要更新的字段"));
         }
         if has_enabled {
@@ -915,7 +1141,7 @@ impl AutoCheckin {
                 &format!("定时签到总开关已{}", if on { "开启" } else { "关闭" }),
             );
         }
-        if has_time || has_providers {
+        if has_time || has_providers || has_times {
             let mut entry = Map::new();
             entry.insert(
                 "id".to_string(),
@@ -933,13 +1159,14 @@ impl AutoCheckin {
                 let Some(list) = value.as_array() else {
                     return Err(AutoCheckinConfigError::new("providers 必须是字符串数组"));
                 };
-                let picked: Vec<Value> = CHECKIN_PROVIDERS
+                let known = checkin_providers();
+                let picked: Vec<Value> = known
                     .iter()
-                    .filter(|id| list.iter().any(|item| item.as_str() == Some(*id)))
-                    .map(|id| Value::String(id.to_string()))
+                    .filter(|id| list.iter().any(|item| item.as_str() == Some(id.as_str())))
+                    .map(|id| Value::String(id.clone()))
                     .collect();
                 if picked.is_empty() {
-                    let names = CHECKIN_PROVIDERS
+                    let names = known
                         .iter()
                         .map(|id| provider_label(id))
                         .collect::<Vec<_>>()
@@ -949,6 +1176,11 @@ impl AutoCheckin {
                     )));
                 }
                 entry.insert("providers".to_string(), Value::Array(picked));
+            }
+            for key in ["providerTimes", "retryTime", "retryGapMinutes", "retryLimit"] {
+                if let Some(value) = payload.get(key) {
+                    entry.insert(key.to_string(), value.clone());
+                }
             }
             // 不带 enabled：条目自己的开关保持原样（这里只改时刻/范围）
             checkin_schedules::upsert(&Value::Object(entry))
