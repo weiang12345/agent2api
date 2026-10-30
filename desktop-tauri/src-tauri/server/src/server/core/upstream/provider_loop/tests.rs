@@ -189,17 +189,31 @@ fn stateful_quota_bookkeeping_ignores_non_quota_classes() {
 }
 
 #[test]
-fn codearts_daily_pool_envelope_cools_to_the_boundary_instead_of_ten_minutes() {
-    use crate::server::errors::GatewayError;
-
+fn codearts_daily_pool_reset_at_reaches_conversation_bookkeeping() {
     let (_dir, service, id) = temp_service();
-    // 生产库里那条真实文案（HTTP 200 的 SSE 里折出 403，首包门送进会话式分支）
-    let error = GatewayError::with_status(403, "上游报告 InferHub.4291.200：insufficient quota");
-    let class = adapter_for(ProviderKind::CodeArts).classify_conversation_error(&error);
+    // CodeArts 的日池判定已迁到插件；这里钉住编排层的关键契约：插件给出的
+    // 北京零点恢复时刻，不能在 `mark_conversation_limited` 这一步丢掉。
+    let now = logging::now_ms();
+    let at = crate::server::core::beijing::date_time_of_ms(now).expect("合法时间戳");
+    let mut reset_at = at
+        .with_hour(0).and_then(|value| value.with_minute(0))
+        .and_then(|value| value.with_second(0)).and_then(|value| value.with_nanosecond(0))
+        .expect("北京零点应当能构造出来")
+        .timestamp_millis();
+    if reset_at <= now {
+        reset_at += 24 * 60 * 60 * 1000;
+    }
+    let message = "上游报告 InferHub.4291.200：insufficient quota";
+    let class = UpstreamErrorClass::QuotaLimited {
+        reset_at: Some(reset_at),
+        message: message.to_string(),
+        upstream_code: Some(4291200),
+        status: 403,
+    };
     let UpstreamErrorClass::QuotaLimited { reset_at: Some(reset_at), .. } = &class else {
         panic!("福利池耗尽的文案应分类为带恢复时刻的 QuotaLimited，实际 {class:?}");
     };
-    mark_conversation_limited(&service, &id, &single("glm-5.3-flash"), &class, &error.message);
+    mark_conversation_limited(&service, &id, &single("glm-5.3-flash"), &class, message);
 
     let stored = rotate::account_limit_reset_at(&service, &id, "glm-5.3-flash");
     assert_eq!(stored, *reset_at, "落库的恢复时刻必须是适配器算出的日池重置点");
@@ -323,6 +337,7 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         mock_upstream(413, "application/json; charset=utf-8", APIG_TOO_LARGE_BODY).await;
     let mut budget = RetryBudget::new(3);
     let capture = crate::server::core::debug_traffic::TrafficCapture::begin("payload-too-large");
+    let telemetry = Arc::new(RequestTelemetry::new());
     // 适配器只提供「怎么判上游错误」这一半；413 的处置在**编排层**
     // （`transport::RetryBudget` + `fallback_retry_advice`），因此随便挑一个
     // 内置家即可。原先这里用 ZCode 的实例，它随实现搬到插件了 —— 换成本家
@@ -332,8 +347,9 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
         &transport,
         &mut budget,
         Some(&capture),
-        &RequestTelemetry::new(),
+        &telemetry,
         false,
+        None,
     )
     .await;
     task.abort();

@@ -46,7 +46,7 @@ dependencies = [
 [[package]]
 name = "agent2api-provider-protocol"
 version = "0.2.1"
-source = "git+https://github.com/ProvidersPlugin/Agent2Providers?tag=v3.3.0-beta.5.1#ba7a71a018dd7efe38bc287877021216031a8164"
+source = "git+https://github.com/weiang12345/Agent2Providers?tag=v3.3.0-beta.5.1-fork.2#635f7894e13261bb6d68fd367ec750d3d2259a6f"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "agent2api-server"
-version = "3.3.0-beta.5.1"
+version = "3.3.0-beta.5.1-fork.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1167,7 +1167,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6349,7 +6349,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workbuddy-proxy-desktop"
-version = "3.3.0-beta.5.1"
+version = "3.3.0-beta.5.1-fork.1"
 dependencies = [
  "aes",
  "aes-gcm",
