@@ -30,7 +30,7 @@ use crate::server::config::UpdateChannels;
 /// 这里保留一个可用值，是为了「索引读不到也还能更新」。
 ///
 /// `WORKBUDDY_UPDATE_REPO` 环境变量仍可覆盖（最高优先级，且不读索引）。
-pub const DEFAULT_REPO: &str = "weiang12345/agent2api";
+pub const DEFAULT_REPO: &str = crate::server::core::fork_profile::APP_REPOSITORY;
 
 /// 项目源码仓库（`owner/repo`）。
 ///
@@ -43,7 +43,7 @@ pub const DEFAULT_REPO: &str = "weiang12345/agent2api";
 /// 两者只有「换源码仓库」时才需要一起改（换构建仓库不该动它）。
 ///
 /// 网页端 / 手机端拿到的 `sourceRepository` 就是它（见 `build_check_result`）。
-pub const SOURCE_REPO: &str = "weiang12345/agent2api";
+pub const SOURCE_REPO: &str = crate::server::core::fork_profile::APP_REPOSITORY;
 
 /// GitHub API 根（Node 版 GITHUB_API）—— [`api_base`] 的默认值
 pub const GITHUB_API: &str = "https://api.github.com";

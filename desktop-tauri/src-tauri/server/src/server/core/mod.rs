@@ -90,6 +90,8 @@ pub mod debug_traffic;
 pub mod degrade;
 pub mod egress;
 pub mod endpoints;
+// 本 fork 的发布仓库与插件签名配置；上游合并时优先保留这一处差异。
+pub mod fork_profile;
 pub mod growth_scheduler;
 pub mod import_ccswitch;
 pub mod key_scope;

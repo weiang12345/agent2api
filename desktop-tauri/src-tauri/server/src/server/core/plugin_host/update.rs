@@ -453,7 +453,8 @@ async fn query_releases(
 }
 
 pub async fn latest(pack_id: &str, target: &str) -> Result<Option<PackAsset>, String> {
-    latest_in(FALLBACK_REPO, pack_id, target).await
+    let repo = crate::server::core::fork_profile::plugin_repository(pack_id, FALLBACK_REPO);
+    latest_in(repo, pack_id, target).await
 }
 
 pub async fn latest_in(

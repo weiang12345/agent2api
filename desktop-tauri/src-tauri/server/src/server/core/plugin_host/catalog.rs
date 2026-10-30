@@ -155,7 +155,7 @@ async fn fetch_catalog(channels: crate::server::config::UpdateChannels) -> Resul
     let mut plugins = Vec::new();
     for entry in entries {
         let detail = update::read_detail(&entry.manifest).await;
-        let repo = if entry.repo.is_empty() {
+        let indexed_repo = if entry.repo.is_empty() {
             detail
                 .as_ref()
                 .map(|detail| detail.repo.as_str())
@@ -163,6 +163,7 @@ async fn fetch_catalog(channels: crate::server::config::UpdateChannels) -> Resul
         } else {
             &entry.repo
         };
+        let repo = crate::server::core::fork_profile::plugin_repository(&entry.id, indexed_repo);
         let old = cached["plugins"]
             .as_array()
             .and_then(|items| items.iter().find(|item| item["id"] == entry.id));

@@ -71,6 +71,9 @@ pub use super::pack_view::{list_packs, resolve_ui_file, PackProviderSummary, Pac
 pub const OFFICIAL_PUBKEYS: &[(&str, &str)] = &[(
     "official-2026",
     "7cdac378ff9bf23b72ae1b686f19859b3c802c26eed13c699f7df39f027352d6",
+), (
+    crate::server::core::fork_profile::PLUGIN_SIGNING_KEY_ID,
+    crate::server::core::fork_profile::PLUGIN_SIGNING_PUBLIC_KEY,
 )];
 
 /// 验签结果。

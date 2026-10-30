@@ -68,7 +68,10 @@ pub async fn resolve() -> AppIndex {
 
 fn parse(value: &Value) -> Option<AppIndex> {
     if value.get("schema").and_then(Value::as_u64) != Some(1) { return None; }
-    let index: AppIndex = serde_json::from_value(value.get("app")?.clone()).ok()?;
+    let mut index: AppIndex = serde_json::from_value(value.get("app")?.clone()).ok()?;
+    // The shared index owns force-update policy, but it must not redirect this
+    // fork's installer checks back to the upstream release repository.
+    index.repo = crate::server::core::fork_profile::app_repository(&index.repo).to_string();
     if !is_repo_slug(&index.repo) { return None; }
     for rule in [&index.force_update.stable, &index.force_update.beta] {
         if rule.message.chars().count() > 2000 { return None; }
@@ -86,4 +89,26 @@ fn is_repo_slug(value: &str) -> bool {
     let mut parts = value.split('/');
     let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else { return false; };
     [owner, repo].iter().all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_index_cannot_redirect_fork_repository() {
+        let index = parse(&json!({
+            "schema": 1,
+            "app": {
+                "repo": "Agent2Builder/agent2api-releases",
+                "forceUpdate": { "stable": {}, "beta": {} }
+            }
+        }))
+        .expect("index should parse");
+
+        assert_eq!(
+            index.repo,
+            crate::server::core::fork_profile::APP_REPOSITORY
+        );
+    }
 }

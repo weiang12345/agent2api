@@ -110,6 +110,8 @@ async fn find_asset(id: &str) -> Result<update::PackAsset, String> {
         }
         Err(error) => logging::verbose("[Plugin]", &format!("插件索引读取失败，尝试内置官方配套源：{error}")),
     }
+    detail.repo =
+        crate::server::core::fork_profile::plugin_repository(id, &detail.repo).to_string();
     let minimum = minimum_version(id).ok_or_else(|| "这个插件不属于官方配套包".to_string())?;
     update::required_release(&detail.repo, id, &detail, minimum, &super::host_target()).await
 }
